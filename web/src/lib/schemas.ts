@@ -3,6 +3,43 @@
  * Shared across all POST endpoints to ensure consistent validation.
  */
 import { z } from "zod/v4";
+import { StrKey } from "@stellar/stellar-sdk";
+
+/**
+ * Zod schema for a valid Stellar asset code (1-12 alphanumeric characters).
+ */
+const stellarAssetCodeSchema = z.string().min(1).max(12).regex(/^[a-zA-Z0-9]+$/);
+
+/**
+ * Zod schema for a valid Stellar public key (G...) with StrKey checksum.
+ */
+const stellarPublicKeySchema = z.string().refine((key) => StrKey.isValidEd25519PublicKey(key), {
+  message: "Invalid Stellar public key",
+});
+
+/**
+ * Zod schema for a native XLM asset.
+ */
+const nativeAssetSchema = z.object({
+  type: z.literal("native"),
+});
+
+/**
+ * Zod schema for an issued Stellar asset.
+ */
+const issuedAssetSchema = z.object({
+  type: z.literal("issued"),
+  code: stellarAssetCodeSchema,
+  issuer: stellarPublicKeySchema,
+});
+
+/**
+ * Zod schema for a Stellar asset (native or issued).
+ */
+export const stellarAssetSchema = z.discriminatedUnion("type", [
+  nativeAssetSchema,
+  issuedAssetSchema,
+]);
 
 export const VALID_CATEGORIES = [
   "Marketing", "Development", "Research", "Design", "Finance",
@@ -38,7 +75,7 @@ export const createTalosSchema = z.object({
   agentName: z.string().max(100).nullable().optional(),
   initialPrice: z.number().nonnegative().optional().default(0),
   minPatronPulse: z.number().int().nonnegative().nullable().optional(),
-  stellarAssetCode: z.string().nullable().optional(),
+  stellarAssetCode: stellarAssetCodeSchema.nullable().optional(),
   tokenSymbol: z.string().max(20).nullable().optional(),
   // Optional commerce service
   serviceName: z.string().min(1).max(200).optional(),
@@ -185,9 +222,10 @@ export const regenerateKeySchema = z.object({
 // --- Sign Payment (Stellar x402) ---
 
 export const signPaymentSchema = z.object({
-  payee: z.string().min(1),               // Stellar public key of payee
+  payee: stellarPublicKeySchema,          // Stellar public key of payee
   amount: z.union([z.string(), z.number()]),
-  assetCode: z.string().optional().default("USDC"),
+  assetCode: stellarAssetCodeSchema.optional().default("USDC"),
+  assetIssuer: stellarPublicKeySchema.optional(),
 });
 
 // --- Buy Token ---
