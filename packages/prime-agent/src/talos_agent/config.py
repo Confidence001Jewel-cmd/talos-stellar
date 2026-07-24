@@ -93,6 +93,10 @@ class Settings(BaseSettings):
     dividend_distribution_interval: int = Field(default=3600, description="Seconds between dividend distribution checks")
     dividend_usdc_threshold: Decimal = Field(default=Decimal("100"), description="USDC threshold to trigger dividend distribution")
 
+    # Execution replay (Issue #235) — disabled by default
+    replay_enabled: bool = Field(default=False, description="Enable execution replay recording for incident analysis")
+    replay_redact_payloads: bool = Field(default=True, description="Redact sensitive values in replay event payloads")
+
     def __init__(self, **kwargs):
         overrides = _json_config_source()
         overrides.update(kwargs)

@@ -197,3 +197,98 @@ def status():
     console.print(f"[bold]Pending approvals:[/bold] {len(pending)}")
 
     db.close()
+
+
+@main.group()
+def replay():
+    """Manage and run deterministic execution replay sessions (Issue #235)."""
+
+
+@replay.command(name="list")
+@click.option("--talos-id", default=None, help="Filter by Talos ID")
+@click.option("--limit", default=20, show_default=True, help="Maximum number of sessions to show")
+def replay_list(talos_id: str | None, limit: int):
+    """List recent replay sessions."""
+    from talos_agent.db import LocalDB
+
+    ensure_app_dir()
+    db = LocalDB()
+
+    sessions = db.list_replay_sessions(talos_id=talos_id, limit=limit)
+    db.close()
+
+    if not sessions:
+        console.print("[yellow]No replay sessions found.[/yellow]")
+        return
+
+    console.print(f"[bold]{'Session ID':<38} {'Talos ID':<20} {'Status':<12} {'Started At'}[/bold]")
+    console.print("-" * 100)
+    for s in sessions:
+        console.print(
+            f"{s['session_id']:<38} {s['talos_id']:<20} {s['status']:<12} {s['started_at']}"
+        )
+
+
+@replay.command(name="show")
+@click.argument("session_id")
+def replay_show(session_id: str):
+    """Show full details of a replay session including events."""
+    from talos_agent.db import LocalDB
+    from talos_agent.replay import load_session_from_db, serialize_session
+
+    ensure_app_dir()
+    db = LocalDB()
+
+    session = load_session_from_db(session_id, db)
+    db.close()
+
+    if session is None:
+        console.print(f"[red]Session not found: {session_id}[/red]")
+        sys.exit(1)
+
+    console.print(serialize_session(session))
+
+
+@replay.command(name="run")
+@click.argument("session_id")
+@click.option("--output", default=None, help="Write divergence report to this file")
+def replay_run(session_id: str, output: str | None):
+    """Replay a recorded session with side-effect stubs and report divergence."""
+    from talos_agent.db import LocalDB
+    from talos_agent.replay import ReplayRunner, load_session_from_db
+
+    ensure_app_dir()
+    db = LocalDB()
+
+    session = load_session_from_db(session_id, db)
+    db.close()
+
+    if session is None:
+        console.print(f"[red]Session not found: {session_id}[/red]")
+        sys.exit(1)
+
+    runner = ReplayRunner(session)
+    result = runner.run_with_stubs()
+
+    if result.diverged:
+        console.print(f"[bold red]DIVERGED[/bold red] — {len(result.divergence_report)} issue(s):")
+        for line in result.divergence_report:
+            console.print(f"  [red]•[/red] {line}")
+    else:
+        console.print("[bold green]CLEAN[/bold green] — replay matched recorded session exactly.")
+
+    console.print(f"Replayed {len(result.replayed_events)} events.")
+
+    if output:
+        report = json.dumps(
+            {
+                "session_id": result.session_id,
+                "diverged": result.diverged,
+                "divergence_report": result.divergence_report,
+                "replayed_event_count": len(result.replayed_events),
+            },
+            indent=2,
+        )
+        import pathlib
+        pathlib.Path(output).write_text(report)
+        console.print(f"[green]Report written to {output}[/green]")
