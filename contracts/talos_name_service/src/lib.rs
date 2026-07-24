@@ -62,7 +62,7 @@ pub enum DataKey {
     TimelockConfig,
     TimelockProposal(u64),
     NextTimelockId,
-    LastTouchedName(String),
+    LastTouched(u32),
 }
 
 #[contracterror]
@@ -529,7 +529,7 @@ impl TalosNameService {
         let last_touched: u32 = e
             .storage()
             .persistent()
-            .get(&DataKey::LastTouchedName(name.clone()))
+            .get(&DataKey::LastTouched(talos_id))
             .unwrap_or(0);
 
         if ttl_manager::needs_touch(last_touched, current_ledger) {
@@ -541,7 +541,7 @@ impl TalosNameService {
             }
             e.storage()
                 .persistent()
-                .set(&DataKey::LastTouchedName(name), &current_ledger);
+                .set(&DataKey::LastTouched(talos_id), &current_ledger);
             ttl_manager::emit_ttl_touched(&e, "name_record", 2);
             true
         } else {
@@ -549,8 +549,8 @@ impl TalosNameService {
         }
     }
 
-    /// Batch-touch admin keys (admin only).  Simple read+rewrite to bump TTL.
-    pub fn touch_all_ttl(e: Env) -> u32 {
+    /// Batch-touch admin keys plus name records for talos IDs (admin only).
+    pub fn touch_all_ttl(e: Env, max_talos_id: u32) -> u32 {
         let admin: Address = e
             .storage()
             .persistent()
@@ -558,6 +558,7 @@ impl TalosNameService {
             .expect("Admin not configured");
         admin.require_auth();
 
+        let current_ledger = e.ledger().sequence();
         let mut touched = 0u32;
 
         if let Some(addr) = e.storage().persistent().get::<_, Address>(&DataKey::Admin) {
@@ -569,15 +570,54 @@ impl TalosNameService {
             touched += 1;
         }
 
+        for tid in 1..=max_talos_id {
+            if let Some(name) = e.storage().persistent().get::<_, String>(&DataKey::TalosName(tid)) {
+                let last_touched: u32 = e
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::LastTouched(tid))
+                    .unwrap_or(0);
+                if ttl_manager::needs_touch(last_touched, current_ledger) {
+                    let name_key = DataKey::NameRecord(name.clone());
+                    if let Some(rec_id) = e.storage().persistent().get::<_, u32>(&name_key) {
+                        e.storage().persistent().set(&name_key, &rec_id);
+                    }
+                    e.storage().persistent().set(&DataKey::TalosName(tid), &name);
+                    e.storage()
+                        .persistent()
+                        .set(&DataKey::LastTouched(tid), &current_ledger);
+                    touched += 1;
+                }
+            }
+        }
+
         ttl_manager::emit_ttl_batch(&e, touched, touched, 0);
         touched
     }
 
-    /// Query storage health.
-    pub fn get_storage_health(e: Env) -> (u32, u32, u32, u32, u32) {
-        let health = ttl_manager::KeyHealth::empty();
-        // Health check relies on touch-based tracking; returns sentinel values
-        // when no tracked keys exist (admin keys are touched implicitly on use).
+    /// Query storage health by scanning name records for tracked talos IDs.
+    ///
+    /// `max_talos_id` is the upper bound of talos IDs to scan (e.g. from the
+    /// registry's `next_talos_id`). Returns `(min_age, max_age, keys_below_warn,
+    /// keys_below_crit, total)`. Emits `ttl_warn` if any entry is at risk.
+    pub fn get_storage_health(e: Env, max_talos_id: u32) -> (u32, u32, u32, u32, u32) {
+        let mut health = ttl_manager::KeyHealth::empty();
+        let current_ledger = e.ledger().sequence();
+
+        for tid in 1..=max_talos_id {
+            if e.storage().persistent().has(&DataKey::TalosName(tid)) {
+                let last_touched: u32 = e
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::LastTouched(tid))
+                    .unwrap_or(0);
+                health.observe(ttl_manager::age_ledgers(last_touched, current_ledger));
+            }
+        }
+
+        if health.needs_immediate_attention() {
+            ttl_manager::emit_ttl_warning(&e, "name_record", health.keys_below_crit, health.max_age);
+        }
         if health.is_empty() {
             (0, 0, 0, 0, 0)
         } else {
@@ -1037,6 +1077,8 @@ mod tests {
         assert_eq!(topics.len() as u32, 2);
         let t0: Symbol = TryFromVal::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
         let t1: u32 = TryFromVal::try_from_val(&env, &topics.get(1).unwrap()).unwrap();
+        assert_eq!(t0, symbol_short!("name_reg"));
+        assert_eq!(t1, talos_id);
         let (got_name, got_owner): (String, Address) =
             TryFromVal::try_from_val(&env, data).unwrap();
         assert_eq!(got_name, name);
@@ -1090,7 +1132,7 @@ mod tests {
     }
     #[test]
     fn has_name_returns_false_for_unknown_talos_id() {
-        let (env, registry_contract, contract_id, _registry_client, client) = setup();
+        let (_env, _registry_contract, _contract_id, _registry_client, client) = setup();
 
         // talos_id = 999 does not exist
         assert!(!client.has_name(&999));
@@ -1109,7 +1151,7 @@ mod tests {
 
     #[test]
     fn name_service_timelock_schedule_execute_registry_update() {
-        let (env, registry_contract, contract_id, _registry_client, client) = setup();
+        let (env, _registry_contract, contract_id, _registry_client, client) = setup();
         let admin = Address::generate(&env);
         client.set_admin(&admin);
 
