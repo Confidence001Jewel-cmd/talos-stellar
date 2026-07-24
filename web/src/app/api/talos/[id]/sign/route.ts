@@ -16,7 +16,7 @@ export async function POST(
 
   try {
     // 1. Authenticate agent
-    const auth = await verifyAgentApiKey(request, id);
+    const auth = await verifyAgentApiKey(request, id, ["wallet:sign"]);
     if (!auth.ok) return auth.response;
 
     // 2. Get TALOS wallet info

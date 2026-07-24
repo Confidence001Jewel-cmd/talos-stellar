@@ -279,7 +279,7 @@ export async function PUT(
   const { id } = await params;
 
   try {
-    const auth = await verifyAgentApiKey(request, id);
+    const auth = await verifyAgentApiKey(request, id, ["commerce:write"]);
     if (!auth.ok) return auth.response;
 
     const parsed = await parseBody(request, registerServiceSchema);

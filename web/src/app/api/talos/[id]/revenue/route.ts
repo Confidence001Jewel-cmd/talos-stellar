@@ -55,7 +55,7 @@ export async function POST(
   const { id } = await params;
 
   try {
-    const auth = await verifyAgentApiKey(request, id);
+    const auth = await verifyAgentApiKey(request, id, ["revenue:write"]);
     if (!auth.ok) return auth.response;
 
     const body = await request.json();

@@ -66,7 +66,10 @@ export async function POST(
     const authHeader = request.headers.get("authorization");
     const isAgentAuth = authHeader?.startsWith("Bearer ");
 
-    if (!isAgentAuth) {
+    if (isAgentAuth) {
+      const auth = await verifyAgentApiKey(request, id, ["admin"]);
+      if (!auth.ok) return auth.response;
+    } else {
       if (!proposerPublicKey) {
         return Response.json({ error: "proposerPublicKey required for patron proposals" }, { status: 401 });
       }

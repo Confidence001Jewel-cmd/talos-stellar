@@ -341,6 +341,28 @@ export const tlsTokenPurchases = pgTable(
   ],
 );
 
+// ─── API Keys (Scoped & Hashed) ───────────────────────────────────
+
+export const tlsApiKeys = pgTable(
+  "tls_api_keys",
+  {
+    id: text("id").primaryKey().$defaultFn(() => createId()),
+    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "cascade" }),
+    name: text("name").notNull(), // e.g., "Primary", "Agent Runner"
+    keyHash: text("keyHash").notNull().unique(), // Hashed API key
+    scopes: text("scopes").array().notNull().default([]),
+    expiresAt: timestamp("expiresAt", { mode: "date", precision: 3 }),
+    lastUsedAt: timestamp("lastUsedAt", { mode: "date", precision: 3 }),
+    status: text("status").notNull().default("active"), // "active", "revoked"
+
+    createdAt: timestamp("createdAt", { mode: "date", precision: 3 }).notNull().defaultNow(),
+    updatedAt: timestamp("updatedAt", { mode: "date", precision: 3 }).notNull().$onUpdate(() => new Date()),
+  },
+  (t) => [
+    index("tls_api_keys_talosId_idx").on(t.talosId),
+  ],
+);
+
 // ─── API Key Audit Log ────────────────────────────────────────────
 
 export const tlsApiAuditLogs = pgTable(
@@ -358,6 +380,10 @@ export const tlsApiAuditLogs = pgTable(
 
     // Caller info
     ipAddress: text("ipAddress"),
+
+    // Denial information
+    denialReason: text("denialReason"),
+    scopesRequired: text("scopesRequired").array(),
 
     createdAt: timestamp("createdAt", { mode: "date", precision: 3 }).notNull().defaultNow(),
   },
