@@ -7,6 +7,10 @@ import {
   releaseConnection,
   recordDbQueries,
 } from "@/lib/sse-pool";
+import {
+  checkAndIncrementQuota,
+  quotaExceededResponse,
+} from "@/lib/quota";
 
 export { getSseMetrics } from "@/lib/sse-pool";
 
@@ -152,6 +156,27 @@ export async function GET(request: NextRequest) {
 
       // The client may have disconnected while fetchTalosIds() was in flight.
       if (isClosed) return;
+
+      // Check SSE connection quota for the first resolved TALOS (if any).
+      // This limits how many SSE connections a single agent's wallet can open
+      // within the configured window (default: 50/hour). We use fire-and-forget
+      // semantics here: if the quota DB is unreachable we fail open to avoid
+      // breaking the SSE stream for legitimate clients.
+      if (talosIds.length > 0) {
+        try {
+          const quotaResult = await checkAndIncrementQuota(db, talosIds[0], "sse_connections");
+          if (!quotaResult.ok) {
+            cleanup();
+            // We cannot easily return an HTTP response from inside the ReadableStream
+            // start() callback, so we signal the caller via a stream close + warning.
+            console.warn("[SSE] quota exceeded for talosId:", talosIds[0]);
+            return;
+          }
+        } catch (err) {
+          // Non-fatal — fail open if quota table is unreachable.
+          console.warn("[SSE] quota check failed (failing open):", err);
+        }
+      }
 
       // talosIds is now fixed for this connection's lifetime. If a wallet gains
       // or loses TALOS access mid-session, the browser must reconnect to pick up

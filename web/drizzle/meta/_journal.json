@@ -85,6 +85,20 @@
       "when": 1753383600000,
       "tag": "0011_add_jobs_idempotency_key",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1753470000000,
+      "tag": "0012_add_job_leases",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1753556400000,
+      "tag": "0013_add_quota_tables",
+      "breakpoints": true
     }
   ]
 }

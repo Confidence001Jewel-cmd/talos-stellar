@@ -3,6 +3,11 @@ import { db } from "@/db";
 import { tlsTalos, tlsRevenues } from "@/db/schema";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { verifyAgentApiKey } from "@/lib/auth";
+import {
+  checkAndIncrementQuota,
+  applyQuotaHeaders,
+  quotaExceededResponse,
+} from "@/lib/quota";
 
 // GET /api/talos/:id/revenue — Get revenue history
 export async function GET(
@@ -93,6 +98,9 @@ export async function POST(
     }
 
     // Record revenue in DB — all revenue stays in Agent Treasury
+    const quotaResult = await checkAndIncrementQuota(db, id, "revenue_writes");
+    if (!quotaResult.ok) return quotaExceededResponse(quotaResult);
+
     const [revenue] = await db
       .insert(tlsRevenues)
       .values({
@@ -104,7 +112,7 @@ export async function POST(
       })
       .returning();
 
-    return Response.json(revenue, { status: 201 });
+    return applyQuotaHeaders(Response.json(revenue, { status: 201 }), quotaResult);
   } catch {
     return Response.json({ error: "Internal server error" }, { status: 500 });
   }

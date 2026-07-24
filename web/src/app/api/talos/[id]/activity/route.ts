@@ -3,6 +3,11 @@ import { db } from "@/db";
 import { tlsTalos, tlsActivities } from "@/db/schema";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { verifyAgentApiKey } from "@/lib/auth";
+import {
+  checkAndIncrementQuota,
+  applyQuotaHeaders,
+  quotaExceededResponse,
+} from "@/lib/quota";
 
 // GET /api/talos/:id/activity — Get activities
 export async function GET(
@@ -84,6 +89,11 @@ export async function POST(
       );
     }
 
+    // Check quota BEFORE writing to DB so we never persist a record that
+    // would be rejected.  This also avoids orphaned rows when quota is exceeded.
+    const quotaResult = await checkAndIncrementQuota(db, id, "activity_writes");
+    if (!quotaResult.ok) return quotaExceededResponse(quotaResult);
+
     const [activity] = await db
       .insert(tlsActivities)
       .values({
@@ -95,7 +105,7 @@ export async function POST(
       })
       .returning();
 
-    return Response.json(activity, { status: 201 });
+    return applyQuotaHeaders(Response.json(activity, { status: 201 }), quotaResult);
   } catch {
     return Response.json({ error: "Internal server error" }, { status: 500 });
   }

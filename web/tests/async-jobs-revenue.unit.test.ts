@@ -53,6 +53,19 @@ const mockSelectChain = (result: any) => {
   return chain;
 };
 
+/**
+ * Build an insert mock that supports both .values().returning() (for upsert)
+ * and .values() alone (for side-effect-only inserts inside transactions).
+ */
+const mockInsertChain = (returningResult: any[] = []) => {
+  const chain: any = {
+    values: vi.fn().mockReturnThis(),
+    onConflictDoUpdate: vi.fn().mockReturnThis(),
+    returning: vi.fn().mockResolvedValue(returningResult),
+  };
+  return chain;
+};
+
 describe("Async Jobs Revenue Recording Unit Tests", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -82,14 +95,20 @@ describe("Async Jobs Revenue Recording Unit Tests", () => {
         serviceName: "research",
       };
 
-      // Mock select calls:
-      // 1. service select
-      // 2. talos select
-      // 3. duplicate job check (returns empty list, i.e., no duplicate)
+      // Mock select calls in order:
+      // 1. service select (tlsCommerceServices)
+      // 2. talos select   (tlsTalos)
+      // 3. quota config   (tlsQuotaConfigs — resolveQuotaConfig; returns empty → disabled fallback)
+      // 4. duplicate job check (tlsCommerceJobs — returns empty, no duplicate)
       mockDb.select
         .mockReturnValueOnce(mockSelectChain([mockService]))
         .mockReturnValueOnce(mockSelectChain([mockTalos]))
-        .mockReturnValueOnce(mockSelectChain([]));
+        .mockReturnValueOnce(mockSelectChain([]))   // quota config → safe fallback (disabled)
+        .mockReturnValueOnce(mockSelectChain([]));  // duplicate job check
+
+      // quota insert (upsert into tlsQuotaUsage) — returns a row with count=1
+      mockDb.insert
+        .mockReturnValueOnce(mockInsertChain([{ count: 1 }]));
 
       // Mock transaction
       const mockTxInsert = vi.fn().mockReturnValue({

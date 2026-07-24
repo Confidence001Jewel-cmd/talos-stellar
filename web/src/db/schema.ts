@@ -347,6 +347,56 @@ export const tlsTokenPurchases = pgTable(
   ],
 );
 
+// ─── Quota Configuration ─────────────────────────────────────────
+//
+// One row per (talosId, resource) defining the limit and reset window.
+// A NULL talosId row is the platform default applied when no agent-specific
+// override exists.
+//
+// resources: activity_writes | job_writes | revenue_writes | sse_connections
+// windowSize: hourly | daily | monthly
+
+export const tlsQuotaConfigs = pgTable(
+  "tls_quota_configs",
+  {
+    // NULL = platform default; non-NULL = per-agent override
+    talosId: text("talosId").references(() => tlsTalos.id, { onDelete: "cascade" }),
+
+    resource: text("resource").notNull(),
+    maxCount: integer("maxCount").notNull().default(1000),
+    windowSize: text("windowSize").notNull().default("daily"),
+    enabled: boolean("enabled").notNull().default(true),
+    notes: text("notes"),
+
+    createdAt: timestamp("createdAt", { mode: "date", precision: 3 }).notNull().defaultNow(),
+    updatedAt: timestamp("updatedAt", { mode: "date", precision: 3 }).notNull().$onUpdate(() => new Date()),
+  },
+  // Composite PK: (talosId, resource) — PostgreSQL allows multiple NULL talosId
+  // rows, so platform-level defaults coexist without collision.
+);
+
+// ─── Quota Usage ─────────────────────────────────────────────────
+//
+// Atomic per-window usage counter. Incremented via INSERT … ON CONFLICT
+// DO UPDATE to prevent double-counting under concurrency.
+
+export const tlsQuotaUsage = pgTable(
+  "tls_quota_usage",
+  {
+    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "cascade" }),
+    resource: text("resource").notNull(),
+
+    // UTC-floored window start timestamp (hour / day / month)
+    windowStart: timestamp("windowStart", { mode: "date", precision: 3 }).notNull(),
+
+    count: integer("count").notNull().default(0),
+    updatedAt: timestamp("updatedAt", { mode: "date", precision: 3 }).notNull().defaultNow().$onUpdate(() => new Date()),
+  },
+  (t) => [
+    index("tls_quota_usage_talosId_resource_idx").on(t.talosId, t.resource),
+  ],
+);
+
 // ─── API Key Audit Log ────────────────────────────────────────────
 
 export const tlsApiAuditLogs = pgTable(

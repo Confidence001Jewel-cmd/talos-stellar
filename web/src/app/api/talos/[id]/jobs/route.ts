@@ -4,6 +4,11 @@ import { tlsTalos, tlsCommerceServices, tlsCommerceJobs, tlsRevenues } from "@/d
 import { eq, and } from "drizzle-orm";
 import { fulfillInstant } from "@/lib/fulfillment";
 import { OPERATOR_PUBLIC_KEY, USDC_ISSUER } from "@/lib/stellar-config";
+import {
+  checkAndIncrementQuota,
+  applyQuotaHeaders,
+  quotaExceededResponse,
+} from "@/lib/quota";
 
 /**
  * POST /api/talos/:id/jobs
@@ -165,6 +170,10 @@ export async function POST(
     }
 
     // Submit + verify payment if signedXdr provided; otherwise use legacy txHash
+    // Check quota before doing expensive payment work.
+    const quotaResult = await checkAndIncrementQuota(db, id, "job_writes");
+    if (!quotaResult.ok) return quotaExceededResponse(quotaResult);
+
     let txHash: string;
     if (signedXdr) {
       const OPERATOR = OPERATOR_PUBLIC_KEY;
@@ -245,7 +254,7 @@ export async function POST(
       });
 
       const finalBody = { ...responseBody, jobId: job.id };
-      return Response.json(finalBody, { status: 201 });
+      return applyQuotaHeaders(Response.json(finalBody, { status: 201 }), quotaResult);
     }
 
     // ── Async: queue for agent to process ─────────────────────────────
@@ -284,7 +293,7 @@ export async function POST(
     });
 
     const finalBody = { ...responseBody, jobId: job.id };
-    return Response.json(finalBody, { status: 201 });
+    return applyQuotaHeaders(Response.json(finalBody, { status: 201 }), quotaResult);
   } catch (err: unknown) {
     const e = err as Record<string, unknown>;
     if (e?.code === "23505") {
