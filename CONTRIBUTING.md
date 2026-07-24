@@ -146,6 +146,7 @@ pnpm build
 pnpm lint
 pnpm test:unit
 pnpm test:e2e
+pnpm outbox:worker  # continuous outbox dispatcher — see web/OUTBOX.md
 ```
 
 Any PR that changes `web/drizzle/**` or `web/src/db/**` is validated by the `Web Migrations CI`

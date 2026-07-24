@@ -357,6 +357,59 @@ export const tlsTokenPurchases = pgTable(
   ],
 );
 
+// ─── Transactional Outbox (Domain Events) ──────────────────────────
+//
+// Written atomically (same db.transaction) alongside the domain mutation
+// that produces the event, so a row here can never diverge from the state
+// change it describes. Dispatch is a separate, lease-based step — see
+// src/lib/outbox/store.ts — using the same SELECT ... FOR UPDATE SKIP
+// LOCKED technique as the jobs queue so multiple instances can drain safely.
+//
+// Status lifecycle: pending → leased → dispatched
+//                                    ↘ pending (retry, runAt pushed out)
+//                                    ↘ dead_letter (retries exhausted)
+
+export const tlsOutboxEvents = pgTable(
+  "tls_outbox_events",
+  {
+    id: text("id").primaryKey().$defaultFn(() => createId()),
+
+    aggregateType: text("aggregateType").notNull(),   // e.g. "commerce_job"
+    aggregateId: text("aggregateId").notNull(),        // e.g. the job id
+    eventType: text("eventType").notNull(),             // e.g. "commerce_job.completed"
+    payload: jsonb("payload").notNull().default({}),
+
+    // pending | leased | dispatched | dead_letter
+    status: text("status").notNull().default("pending"),
+    runAt: timestamp("runAt", { mode: "date", precision: 3 }).notNull().defaultNow(),
+
+    leaseId: text("leaseId"),
+    leaseOwner: text("leaseOwner"),
+    leaseExpiresAt: timestamp("leaseExpiresAt", { mode: "date", precision: 3 }),
+
+    attempts: integer("attempts").notNull().default(0),
+    maxAttempts: integer("maxAttempts").notNull().default(8),
+
+    // Caller-supplied dedupe key, scoped per eventType. Nullable — optional.
+    dedupeKey: text("dedupeKey"),
+
+    lastError: text("lastError"),
+
+    createdAt: timestamp("createdAt", { mode: "date", precision: 3 }).notNull().defaultNow(),
+    updatedAt: timestamp("updatedAt", { mode: "date", precision: 3 }).notNull().$onUpdate(() => new Date()),
+    dispatchedAt: timestamp("dispatchedAt", { mode: "date", precision: 3 }),
+  },
+  (t) => [
+    index("tls_outbox_events_status_runAt_idx").on(t.status, t.runAt),
+    index("tls_outbox_events_eventType_status_idx").on(t.eventType, t.status),
+    index("tls_outbox_events_leaseExpiresAt_idx").on(t.leaseExpiresAt),
+    index("tls_outbox_events_dispatchedAt_idx").on(t.dispatchedAt),
+    uniqueIndex("tls_outbox_events_eventType_dedupeKey_unique")
+      .on(t.eventType, t.dedupeKey)
+      .where(sql`"dedupeKey" IS NOT NULL`),
+  ],
+);
+
 // ─── API Key Audit Log ────────────────────────────────────────────
 
 export const tlsApiAuditLogs = pgTable(

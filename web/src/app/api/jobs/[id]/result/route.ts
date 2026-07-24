@@ -4,6 +4,7 @@ import { withTransactionRetry } from "@/db/db-retry";
 import { tlsTalos, tlsCommerceJobs, tlsRevenues, tlsCommerceServices } from "@/db/schema";
 import { eq, and } from "drizzle-orm";
 import { logger } from "@/lib/logger";
+import { outboxConfig, writeOutboxEvent } from "@/lib/outbox";
 
 async function resolveCallerTalos(request: NextRequest): Promise<string | null> {
   const authHeader = request.headers.get("authorization");
@@ -121,10 +122,24 @@ export async function POST(
           txHash: job.txHash,
         });
 
-        return updatedJob;
-      },
-      { category: "JOB" }
-    );
+      // Atomic outbox write: this event can never be recorded without the
+      // job/revenue mutation above committing, or vice versa. Disabled by
+      // default (OUTBOX_ENABLED=false) — zero behavior change until an
+      // operator opts in. See web/OUTBOX.md.
+      if (outboxConfig.enabled) {
+        await writeOutboxEvent(tx, {
+          aggregateType: "commerce_job",
+          aggregateId: updatedJob.id,
+          eventType: "commerce_job.completed",
+          payload: { talosId: job.talosId, serviceName: job.serviceName, amount: job.amount },
+          dedupeKey: updatedJob.id,
+        });
+      }
+
+      return updatedJob;
+    },
+    { category: "JOB" }
+  );
 
     if (!updated) {
       return Response.json({

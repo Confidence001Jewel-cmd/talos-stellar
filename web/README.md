@@ -95,6 +95,10 @@ pnpm test:openapi
 
 CI runs the same snapshot test and fails if `/api/docs/openapi.json` differs from `tests/fixtures/openapi.snapshot.json`.
 
+## Transactional Outbox
+
+A durable, Postgres-backed outbox so a domain mutation and the event describing it can never diverge (atomic write, lease-based dispatch, retry/backoff, retention). Disabled by default (`OUTBOX_ENABLED=false`). See **[OUTBOX.md](./OUTBOX.md)**.
+
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 
 ## Learn More
