@@ -8,6 +8,8 @@
 
 #![no_std]
 
+pub mod allowlist;
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 extern crate std;
 
