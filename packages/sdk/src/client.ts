@@ -28,6 +28,14 @@ import type {
   ActivityPage,
   ActivityPageOptions,
 } from "./types.js";
+import {
+  generateIdempotencyKey,
+  validateIdempotencyKey,
+  isPayloadConflict,
+  IdempotencyConflictError,
+} from "./idempotency.js";
+
+export type { IdempotencyConflictError };
 
 export interface RetryPolicyOptions {
   maxAttempts?: number;
@@ -44,6 +52,32 @@ export interface TalosClientOptions {
   apiKey?: string;
   retryPolicy?: RetryPolicyOptions;
 }
+
+/**
+ * Per-call options for write methods (POST / PATCH).
+ *
+ * Supplying an `idempotencyKey` enables safe retry: the same key will be sent
+ * on every attempt, allowing the server to de-duplicate the request and return
+ * the cached response if the first attempt already committed.
+ *
+ * When `idempotencyKey` is present, the method is also added to the retry-
+ * eligible set for that call (in addition to the standard safe methods like
+ * GET/PUT/DELETE), so transient 429/5xx errors trigger automatic retries.
+ */
+export interface WriteOptions {
+  /**
+   * Optional idempotency key (UUID v4 recommended). Max 128 bytes.
+   * If omitted, the request is sent once with no idempotency guarantee.
+   *
+   * Use `generateIdempotencyKey()` to create a fresh key, or supply your own
+   * stable value to associate retries with a specific logical operation.
+   */
+  idempotencyKey?: string;
+  /** AbortSignal for cancellation. */
+  signal?: AbortSignal;
+}
+
+export { generateIdempotencyKey, validateIdempotencyKey };
 
 export class TalosClient {
   private baseUrl: string;
@@ -70,10 +104,11 @@ export class TalosClient {
 
   // ── Internal fetch helper ──────────────────────────────────
 
-  private shouldRetry(method: string, status: number): boolean {
+  private shouldRetry(method: string, status: number, retryMethodsOverride?: string[]): boolean {
+    const methods = retryMethodsOverride ?? this.retryPolicy.retryMethods;
     return (
       this.retryPolicy.retryStatusCodes.includes(status) &&
-      this.retryPolicy.retryMethods.includes(method)
+      methods.includes(method)
     );
   }
 
@@ -134,10 +169,13 @@ export class TalosClient {
 
   private async request<T>(
     path: string,
-    init?: RequestInit & { params?: Record<string, string | number | boolean> },
+    init?: RequestInit & {
+      params?: Record<string, string | number | boolean>;
+      idempotencyKey?: string;
+    },
   ): Promise<T> {
     let url = `${this.baseUrl}${path}`;
-    const { params, signal, ...requestInit } = init ?? {};
+    const { params, signal, idempotencyKey, ...requestInit } = init ?? {};
     const normalizedSignal = signal ?? undefined;
     if (params) {
       const filteredParams = Object.entries(params)
@@ -149,18 +187,42 @@ export class TalosClient {
 
     const method = (requestInit.method?.toString().toUpperCase() ?? "GET");
 
+    // Build the extra headers for this call
+    const extraHeaders: Record<string, string> = {};
+    if (idempotencyKey) {
+      const validKey = validateIdempotencyKey(idempotencyKey);
+      extraHeaders["Idempotency-Key"] = validKey;
+    }
+
+    // When an idempotency key is present, POST/PATCH become retry-eligible for
+    // this call because the server will de-duplicate if the first attempt committed.
+    const retryMethodsForCall =
+      idempotencyKey && !this.retryPolicy.retryMethods.includes(method)
+        ? [...this.retryPolicy.retryMethods, method]
+        : undefined;
+
     for (let attempt = 1; attempt <= this.retryPolicy.maxAttempts; attempt += 1) {
       const res = await fetch(url, {
         ...requestInit,
         ...(normalizedSignal ? { signal: normalizedSignal } : {}),
-        headers: { ...this.headers, ...requestInit.headers },
+        headers: { ...this.headers, ...requestInit.headers, ...extraHeaders },
       });
 
       if (res.ok) {
         return res.json() as Promise<T>;
       }
 
-      const shouldRetry = this.shouldRetry(method, res.status);
+      // 409 Conflict — check whether this is a payload conflict (caller error)
+      // or an in-flight duplicate (safe to surface as a regular API error).
+      if (res.status === 409 && idempotencyKey) {
+        const body = await res.text();
+        if (isPayloadConflict(body)) {
+          throw new IdempotencyConflictError(idempotencyKey, path, body);
+        }
+        throw new TalosAPIError(409, body, path);
+      }
+
+      const shouldRetry = this.shouldRetry(method, res.status, retryMethodsForCall);
       if (!shouldRetry || attempt === this.retryPolicy.maxAttempts) {
         const body = await res.text();
         throw new TalosAPIError(res.status, body, path);
@@ -210,10 +272,16 @@ export class TalosClient {
     return this.request<ActivityPage>("/api/activity", { params: query, signal });
   }
 
-  async reportActivity(talosId: string, params: ReportActivityParams): Promise<Activity> {
+  async reportActivity(
+    talosId: string,
+    params: ReportActivityParams,
+    options?: WriteOptions,
+  ): Promise<Activity> {
     return this.request(`/api/talos/${talosId}/activity`, {
       method: "POST",
       body: JSON.stringify(params),
+      idempotencyKey: options?.idempotencyKey,
+      signal: options?.signal,
     });
   }
 
@@ -223,10 +291,16 @@ export class TalosClient {
 
   // ── Revenue ────────────────────────────────────────────────
 
-  async reportRevenue(talosId: string, params: ReportRevenueParams): Promise<Revenue> {
+  async reportRevenue(
+    talosId: string,
+    params: ReportRevenueParams,
+    options?: WriteOptions,
+  ): Promise<Revenue> {
     return this.request(`/api/talos/${talosId}/revenue`, {
       method: "POST",
       body: JSON.stringify(params),
+      idempotencyKey: options?.idempotencyKey,
+      signal: options?.signal,
     });
   }
 
@@ -236,10 +310,16 @@ export class TalosClient {
 
   // ── Approvals ──────────────────────────────────────────────
 
-  async createApproval(talosId: string, params: CreateApprovalParams): Promise<Approval> {
+  async createApproval(
+    talosId: string,
+    params: CreateApprovalParams,
+    options?: WriteOptions,
+  ): Promise<Approval> {
     return this.request(`/api/talos/${talosId}/approvals`, {
       method: "POST",
       body: JSON.stringify(params),
+      idempotencyKey: options?.idempotencyKey,
+      signal: options?.signal,
     });
   }
 
@@ -279,25 +359,28 @@ export class TalosClient {
   async purchaseService(
     talosId: string,
     params: PurchaseServiceParams,
+    options?: WriteOptions,
   ): Promise<CommerceJob> {
     return this.request(`/api/talos/${talosId}/service`, {
       method: "POST",
       body: JSON.stringify({ payload: params.payload }),
       headers: { "X-PAYMENT": params.paymentHeader },
+      idempotencyKey: options?.idempotencyKey,
+      signal: options?.signal,
     });
   }
 
   /**
    * High-level helper to purchase a service, handling the x402 402 challenge flow.
    *
-   * @param talosId - The ID of the TALOS providing the service.
-   * @param buyerTalosId - The ID of the TALOS purchasing the service (for signing).
-   * @param payload - Optional payload for the service.
+   * Pass `options.idempotencyKey` to enable safe retry across the entire
+   * 402-challenge-and-retry cycle (the key is sent only on the final POST).
    */
   async purchaseServiceWithPayment(
     talosId: string,
     buyerTalosId: string,
     payload?: Record<string, unknown>,
+    options?: WriteOptions,
   ): Promise<CommerceJob> {
     let res: Response;
     const url = `${this.baseUrl}/api/talos/${talosId}/service`;
@@ -326,11 +409,11 @@ export class TalosClient {
         assetCode: challenge.token,
       });
 
-      // 4. Retry with X-PAYMENT header
+      // 4. Retry with X-PAYMENT header (and idempotency key if supplied)
       return this.purchaseService(talosId, {
         paymentHeader: signRes.paymentHeader,
         payload,
-      });
+      }, options);
     }
 
     if (!res.ok) {
@@ -364,10 +447,16 @@ export class TalosClient {
     });
   }
 
-  async transfer(talosId: string, params: TransferParams): Promise<TransferResponse> {
+  async transfer(
+    talosId: string,
+    params: TransferParams,
+    options?: WriteOptions,
+  ): Promise<TransferResponse> {
     return this.request(`/api/talos/${talosId}/transfer`, {
       method: "POST",
       body: JSON.stringify(params),
+      idempotencyKey: options?.idempotencyKey,
+      signal: options?.signal,
     });
   }
 
@@ -377,10 +466,23 @@ export class TalosClient {
     return this.request("/api/jobs/pending");
   }
 
-  async submitJobResult(jobId: string, result: unknown): Promise<CommerceJob> {
+  /**
+   * Submit the result of a fulfilled job.
+   *
+   * Pass `options.idempotencyKey` to enable safe retry: if the network drops
+   * after the server has already committed the result, the retry will receive
+   * a 201 from cache rather than creating a duplicate.
+   */
+  async submitJobResult(
+    jobId: string,
+    result: unknown,
+    options?: WriteOptions,
+  ): Promise<CommerceJob> {
     return this.request(`/api/jobs/${jobId}/result`, {
       method: "POST",
       body: JSON.stringify({ result }),
+      idempotencyKey: options?.idempotencyKey,
+      signal: options?.signal,
     });
   }
 
@@ -404,10 +506,15 @@ export class TalosClient {
     return this.requestPage("/api/playbooks", params);
   }
 
-  async createPlaybook(params: CreatePlaybookParams): Promise<Playbook> {
+  async createPlaybook(
+    params: CreatePlaybookParams,
+    options?: WriteOptions,
+  ): Promise<Playbook> {
     return this.request("/api/playbooks", {
       method: "POST",
       body: JSON.stringify(params),
+      idempotencyKey: options?.idempotencyKey,
+      signal: options?.signal,
     });
   }
 }

@@ -185,6 +185,104 @@ cargo test --target wasm32-unknown-unknown
 - For Python, prefer explicit types and validate changes with `uv run pytest`
 - For Rust, keep formatting standard with `cargo fmt` and validate with `cargo test`
 
+## Idempotency Keys
+
+The Talos protocol supports safe retry behaviour for SDK write calls via idempotency keys.
+Full design: [`docs/idempotency-design.md`](./docs/idempotency-design.md).
+
+### TypeScript SDK
+
+Generate a key and pass it in `WriteOptions` on any write call:
+
+```typescript
+import { TalosClient, generateIdempotencyKey } from "@talos-protocol/sdk";
+
+const client = new TalosClient({ baseUrl: "...", apiKey: "..." });
+const key = generateIdempotencyKey();
+
+// Retry safely — server returns cached 201 if the first attempt already committed
+const job = await client.reportActivity(talosId, params, { idempotencyKey: key });
+```
+
+Error handling:
+
+```typescript
+import { IdempotencyConflictError, TalosAPIError } from "@talos-protocol/sdk";
+
+try {
+  await client.reportActivity(talosId, params, { idempotencyKey: myKey });
+} catch (err) {
+  if (err instanceof IdempotencyConflictError) {
+    // Key was reused with a different payload — generate a new key for this request
+    console.error("Payload conflict:", err.conflictingKey);
+  } else if (err instanceof TalosAPIError && err.status === 409) {
+    // Request is in-flight — safe to retry with the same key after a short delay
+  }
+}
+```
+
+### Python SDK
+
+Keys are injected automatically on every write call. Opt out with `idempotency_key=None`:
+
+```python
+from talos_agent.idempotency import generate_idempotency_key
+
+# Auto-inject (default): a fresh UUID v4 is generated and sent on every call
+await client.report_activity(talos_id, type_="post", content="hello", channel="X")
+
+# Caller-supplied key (stable across retries of the same logical operation)
+key = generate_idempotency_key()
+await client.report_activity(talos_id, type_="post", content="hello", channel="X",
+                              idempotency_key=key)
+
+# Opt out entirely (fire-and-forget, no idempotency guarantee)
+await client.update_status(talos_id, online=True)  # always opts out by design
+```
+
+Conflict handling:
+
+```python
+from talos_agent.idempotency import IdempotencyConflictError
+
+try:
+    await client.report_revenue(talos_id, amount=5.0, source="commerce")
+except IdempotencyConflictError as e:
+    # Key reused with different payload — generate a new key
+    log.error("idempotency_conflict", key=e.key, path=e.path)
+```
+
+### Server response headers
+
+All idempotent write responses include:
+
+| Header | Value |
+|---|---|
+| `Idempotency-Key` | Echo of the key sent by the caller |
+| `X-Idempotent-Replayed` | `"true"` on cache hits, `"false"` on first commit |
+
+### Running the tests
+
+```bash
+# TypeScript SDK unit tests
+cd packages/sdk && pnpm test
+
+# TypeScript integration tests (web)
+cd web && pnpm test
+
+# Python unit tests
+cd packages/prime-agent && uv run pytest tests/test_idempotency.py -v
+```
+
+### Rollback
+
+Phase 1 (SDK instrumentation) is fully additive. To roll back:
+1. Revert `packages/sdk/src/idempotency.ts`, `packages/sdk/src/client.ts`.
+2. Revert `packages/prime-agent/src/talos_agent/idempotency.py` and the `_post` / `_patch`
+   changes in `api_client.py`.
+3. The DB columns (`idempotencyKey`, `idempotencyResponse`) and the partial unique index can
+   be left in place — they are nullable and harmless without the application logic.
+
 ## Pull Request Workflow
 
 1. Create a branch from the latest `main`
