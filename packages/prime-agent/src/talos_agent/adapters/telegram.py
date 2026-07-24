@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 from talos_agent.adapters.base import BaseSocialAdapter, ChannelCapabilities, PublishResult
+from talos_agent.config import resolve_setting_secret
 
 if TYPE_CHECKING:
     from talos_agent.config import Settings
@@ -22,10 +23,16 @@ class TelegramAdapter(BaseSocialAdapter):
     def __init__(self, settings: "Settings") -> None:
         self._settings = settings
         telegram_config = getattr(settings, "channel_configs", {}) or {}
-        config_token = telegram_config.get("telegram", {}).get("bot_token")
+        config_token = telegram_config.get("telegram", {}).get("bot_token", "")
         config_chat_id = telegram_config.get("telegram", {}).get("chat_id")
-        self._bot_token = config_token or getattr(settings, "telegram_bot_token", "")
+        self._legacy_bot_token = config_token or getattr(settings, "telegram_bot_token", "")
         self._chat_id = config_chat_id or getattr(settings, "telegram_chat_id", "")
+
+    @property
+    def _bot_token(self) -> str:
+        return resolve_setting_secret(
+            self._settings, "telegram_bot_token", self._legacy_bot_token
+        )
 
     def get_capabilities(self) -> ChannelCapabilities:
         return ChannelCapabilities(

@@ -377,7 +377,23 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
     from talos_agent.api_client import TalosAPIClient
     from talos_agent.db import LocalDB, get_db_path
 
-    db = LocalDB(path=get_db_path(settings.talos_api_key[:16] if agent_slot > 0 else None))
+    db = LocalDB(
+        path=get_db_path(settings.talos_api_key[:16] if agent_slot > 0 else None),
+        timeout_ms=settings.secret_db_timeout_ms,
+    )
+    if settings.secret_rotation_enabled:
+        from talos_agent.secret_store import SecretStore, decode_keyring
+
+        secret_store = SecretStore(
+            db,
+            keyring=decode_keyring(settings.secret_keyring),
+            active_key_id=settings.secret_active_key_id,
+            scope=settings.secret_scope,
+            max_value_bytes=settings.secret_max_bytes,
+            dual_read=settings.secret_dual_read,
+            legacy_fallback=settings.secret_legacy_fallback,
+        )
+        settings.bind_secret_store(secret_store)
     api = TalosAPIClient(settings)
 
     # Download Talos config
@@ -408,7 +424,8 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
 
     # Start browser session
     console.print("[bold]Starting browser session...[/bold]")
-    browser = await BrowserSession.start(model_api_key=settings.llm_api_key)
+    browser_model_key = settings.llm_api_key
+    browser = await BrowserSession.start(model_api_key=browser_model_key)
     console.print("[green]Browser ready.[/green]")
 
     # Build tools
@@ -426,8 +443,45 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
 
     async def ensure_browser_healthy() -> bool:
         """Checks browser health, attempts automatic recovery, and updates tools reference."""
-        nonlocal browser, tools, browser_restart_attempts, is_degraded
-        
+        nonlocal browser, tools, browser_model_key, browser_restart_attempts, is_degraded
+
+        current_model_key = settings.llm_api_key
+        if current_model_key != browser_model_key:
+            # Start the replacement before swapping references. A failed
+            # credential never tears down the still-working browser session.
+            try:
+                replacement = await BrowserSession.start(model_api_key=current_model_key)
+                replacement_tools = build_all_tools(
+                    api=api,
+                    db=db,
+                    browser=replacement,
+                    settings=settings,
+                )
+                previous = browser
+                browser = replacement
+                tools = replacement_tools
+                browser_model_key = current_model_key
+                browser_restart_attempts = 0
+                is_degraded = False
+                log.info(
+                    "secret_consumer_reloaded",
+                    consumer="browser",
+                    secret_name="llm_api_key",
+                    outcome="success",
+                )
+                try:
+                    await asyncio.wait_for(previous.close(), timeout=5)
+                except Exception:
+                    pass
+            except Exception as exc:
+                log.warning(
+                    "secret_consumer_reload_failed",
+                    consumer="browser",
+                    secret_name="llm_api_key",
+                    outcome="failure",
+                    error_type=type(exc).__name__,
+                )
+
         if is_degraded:
             return False
 
@@ -454,7 +508,8 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
                     except Exception:
                         pass
                 
-                browser = await BrowserSession.start(model_api_key=settings.llm_api_key)
+                browser_model_key = settings.llm_api_key
+                browser = await BrowserSession.start(model_api_key=browser_model_key)
                 tools = build_all_tools(api=api, db=db, browser=browser, settings=settings)
                 
                 console.print(f"[bold green]Browser reconnection event logged successfully on attempt {browser_restart_attempts}.[/bold green]")

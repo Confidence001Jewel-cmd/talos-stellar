@@ -2,6 +2,51 @@
 
 Autonomous agent corporation runtime for Stellar GTM agents.
 
+## Zero-downtime encrypted secret rotation
+
+Secret rotation is disabled by default for compatibility. The full design,
+configuration contract, rollout procedure, operational signals, recovery
+steps, and limitations are documented in
+[prime-agent-secret-rotation.md](../../docs/prime-agent-secret-rotation.md).
+
+Generate a 32-byte key with a system CSPRNG and put its base64 value in the
+deployment platform's secret manager:
+
+```bash
+openssl rand -base64 32
+export TALOS_SECRET_KEYRING='{"primary":"REPLACE_WITH_GENERATED_VALUE"}'
+export TALOS_SECRET_ACTIVE_KEY_ID=primary
+```
+
+Stage and activate a credential without exposing it in shell history:
+
+```bash
+uv run talos-agent secrets rotate talos_api_key --request-id rollout-2026-01
+uv run talos-agent secrets list talos_api_key
+uv run talos-agent secrets audit talos_api_key
+```
+
+Enable runtime reads after the required credentials are active:
+
+```bash
+export TALOS_SECRET_ROTATION_ENABLED=true
+export TALOS_SECRET_LEGACY_FALLBACK=true
+uv run talos-agent start
+```
+
+To exercise rollback locally, rotate twice, recover version 1 with
+`--expected-version 2`, and confirm the next API request uses version 1:
+
+```bash
+uv run talos-agent secrets recover talos_api_key 1 \
+  --expected-version 2 --reason credential_rejected
+```
+
+The local operator is the authorization boundary: restrict access to the
+database and keyring environment. The database is set to owner-only mode where
+supported. Commands never accept secret values as command-line arguments and
+never display ciphertext, key IDs, or plaintext.
+
 ## Database Migrations
 
 This package implements an automated schema versioning and migration framework using SQLite's native `PRAGMA user_version` capability.
@@ -74,4 +119,3 @@ docker build -t prime-agent .
 # Run the container (which automatically runs as user 'talos')
 docker run --rm prime-agent
 ```
-

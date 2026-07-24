@@ -6,7 +6,7 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Any, Callable, get_type_hints
 
-from talos_agent.config import Settings
+from talos_agent.config import Settings, resolve_setting_secret
 
 
 @dataclass
@@ -152,7 +152,10 @@ def build_all_tools(
 
     adapter_registry = AdapterRegistry()
     adapter_registry.register(XAdapter(browser, settings))
-    if settings.discord_webhook_url or settings.discord_bot_token:
+    if (
+        resolve_setting_secret(settings, "discord_webhook_url")
+        or resolve_setting_secret(settings, "discord_bot_token")
+    ):
         adapter_registry.register(DiscordAdapter(settings))
 
     # Inject dependencies into tool modules

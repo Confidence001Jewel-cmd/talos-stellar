@@ -231,7 +231,9 @@ class XProbe:
         a = self._adapter
         settings = getattr(a, "_settings", None)
         has_username = bool(getattr(settings, "x_username", ""))
-        has_password = bool(getattr(settings, "x_password", ""))
+        from talos_agent.config import resolve_setting_secret
+
+        has_password = bool(resolve_setting_secret(settings, "x_password"))
         has_creds = has_username and has_password
 
         browser: object | None = getattr(a, "_browser", None)

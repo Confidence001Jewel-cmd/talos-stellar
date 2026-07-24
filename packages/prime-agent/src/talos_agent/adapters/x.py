@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from rich.console import Console
 
 from talos_agent.adapters.base import BaseSocialAdapter, ChannelCapabilities, PublishResult
+from talos_agent.config import resolve_setting_secret
 
 if TYPE_CHECKING:
     from talos_agent.browser.session import BrowserSession
@@ -63,7 +64,8 @@ class XAdapter(BaseSocialAdapter):
         if self._logged_in:
             return
 
-        if not self._settings.x_username or not self._settings.x_password:
+        password = resolve_setting_secret(self._settings, "x_password")
+        if not self._settings.x_username or not password:
             console.print("[yellow]X credentials not configured — skipping login.[/yellow]")
             return
 
@@ -115,7 +117,7 @@ class XAdapter(BaseSocialAdapter):
             await asyncio.sleep(4)
 
         await self._browser.act(
-            f"Click on the password input field and type: {self._settings.x_password}"
+            f"Click on the password input field and type: {password}"
         )
         await asyncio.sleep(1)
         await self._browser.act("Click the Log in button")

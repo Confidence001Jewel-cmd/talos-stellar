@@ -17,24 +17,34 @@ class TalosAPIClient:
         self._client = httpx.AsyncClient(
             base_url=self._base,
             headers={
-                "Authorization": f"Bearer {settings.talos_api_key}",
                 "Content-Type": "application/json",
             },
             timeout=30.0,
         )
+        self._settings = settings
+
+    def _request_headers(self, supplied: dict[str, str] | None = None) -> dict[str, str]:
+        """Capture one credential for the complete retry lifecycle of a request."""
+        headers = {"Authorization": f"Bearer {self._settings.secret_value('talos_api_key')}"}
+        headers.update(supplied or {})
+        return headers
 
     # ── Retry-wrapped HTTP verbs ──────────────────────────
 
     async def _get(self, url: str, **kwargs: Any) -> httpx.Response:
+        kwargs["headers"] = self._request_headers(kwargs.get("headers"))
         return await request_with_retry(lambda: self._client.get(url, **kwargs))
 
     async def _post(self, url: str, **kwargs: Any) -> httpx.Response:
+        kwargs["headers"] = self._request_headers(kwargs.get("headers"))
         return await request_with_retry(lambda: self._client.post(url, **kwargs))
 
     async def _put(self, url: str, **kwargs: Any) -> httpx.Response:
+        kwargs["headers"] = self._request_headers(kwargs.get("headers"))
         return await request_with_retry(lambda: self._client.put(url, **kwargs))
 
     async def _patch(self, url: str, **kwargs: Any) -> httpx.Response:
+        kwargs["headers"] = self._request_headers(kwargs.get("headers"))
         return await request_with_retry(lambda: self._client.patch(url, **kwargs))
 
     # ── Talos Config ──────────────────────────────────────
@@ -313,7 +323,7 @@ class TalosAPIClient:
 
     async def get_distribution_preview(self, talos_id: str) -> dict | None:
         """Preview dividend distribution without executing."""
-        r = await self._client.get(f"/api/talos/{talos_id}/revenue/distribute")
+        r = await self._get(f"/api/talos/{talos_id}/revenue/distribute")
         if r.status_code == 200:
             return r.json()
         return None
@@ -322,7 +332,7 @@ class TalosAPIClient:
         self, talos_id: str, *, requester_public_key: str
     ) -> dict | None:
         """Execute dividend distribution to patrons."""
-        r = await self._client.post(
+        r = await self._post(
             f"/api/talos/{talos_id}/revenue/distribute",
             json={"requesterPublicKey": requester_public_key},
         )

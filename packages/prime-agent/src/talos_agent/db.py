@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -211,17 +212,71 @@ CREATE TABLE IF NOT EXISTS retry_state (
 );
         """,
     ),
+    (
+        7,
+        """
+CREATE TABLE IF NOT EXISTS secret_versions (
+    scope           TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    version         INTEGER NOT NULL,
+    ciphertext      TEXT NOT NULL,
+    key_id          TEXT NOT NULL,
+    status          TEXT NOT NULL CHECK (status IN ('staged', 'active', 'superseded', 'revoked')),
+    request_id      TEXT NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    activated_at    TEXT,
+    revoked_at      TEXT,
+    PRIMARY KEY (scope, name, version),
+    UNIQUE (scope, name, request_id)
+);
+
+CREATE TABLE IF NOT EXISTS secret_heads (
+    scope             TEXT NOT NULL,
+    name              TEXT NOT NULL,
+    active_version    INTEGER NOT NULL,
+    previous_version  INTEGER,
+    generation        INTEGER NOT NULL DEFAULT 1,
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (scope, name)
+);
+
+CREATE TABLE IF NOT EXISTS secret_audit_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id    TEXT NOT NULL UNIQUE,
+    scope       TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    version     INTEGER,
+    event_type  TEXT NOT NULL,
+    outcome     TEXT NOT NULL,
+    actor       TEXT NOT NULL,
+    reason      TEXT,
+    metadata    TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_secret_versions_status
+    ON secret_versions(scope, name, status);
+CREATE INDEX IF NOT EXISTS idx_secret_audit_lookup
+    ON secret_audit_events(scope, name, id);
+        """,
+    ),
 ]
 
 
 class LocalDB:
-    def __init__(self, path: Path = DB_PATH):
+    def __init__(self, path: Path = DB_PATH, *, timeout_ms: int = 5000):
         self._path = path
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(path))
+        self._conn = sqlite3.connect(str(path), timeout=max(timeout_ms, 1) / 1000)
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute(f"PRAGMA busy_timeout = {max(timeout_ms, 1)}")
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._run_migrations()
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            # Some platforms/filesystems do not expose POSIX permissions.
+            pass
 
     def _run_migrations(self) -> None:
         """Run all pending migrations in a single transaction."""

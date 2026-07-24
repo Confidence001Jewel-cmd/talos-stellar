@@ -10,6 +10,7 @@ import httpx
 from rich.console import Console
 
 from talos_agent.adapters.base import BaseSocialAdapter, ChannelCapabilities, PublishResult
+from talos_agent.config import resolve_setting_secret
 
 if TYPE_CHECKING:
     from talos_agent.config import Settings
@@ -41,11 +42,23 @@ class DiscordAdapter(BaseSocialAdapter):
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._webhook_url: str = settings.discord_webhook_url
-        self._bot_token: str = settings.discord_bot_token
+        self._legacy_webhook_url: str = settings.discord_webhook_url
+        self._legacy_bot_token: str = settings.discord_bot_token
         self._channel_id: str = settings.discord_channel_id
         self._guild_id: str = settings.discord_guild_id
         self._cached_bot_id: str | None = None
+
+    @property
+    def _webhook_url(self) -> str:
+        return resolve_setting_secret(
+            self._settings, "discord_webhook_url", self._legacy_webhook_url
+        )
+
+    @property
+    def _bot_token(self) -> str:
+        return resolve_setting_secret(
+            self._settings, "discord_bot_token", self._legacy_bot_token
+        )
 
     # ── Capabilities ─────────────────────────────────────────
 

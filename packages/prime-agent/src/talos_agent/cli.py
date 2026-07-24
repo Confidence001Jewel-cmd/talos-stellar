@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
 import json
 import os
+from pathlib import Path
 import sys
+import uuid
 
 import click
 from rich.console import Console
@@ -28,8 +31,6 @@ def main():
 @click.option("--env-file", default=".env", help="Path to .env file")
 def start(talos_id: str | None, env_file: str):
     """Start the Prime Agent for a Talos."""
-    from pathlib import Path
-
     ensure_app_dir()
 
     # Load .env into os.environ so child processes (Stagehand SEA) inherit them
@@ -99,6 +100,11 @@ def start(talos_id: str | None, env_file: str):
 @click.option("--openai-key", prompt="OpenAI API Key", help="OpenAI API key")
 def config(api_key: str, openai_key: str):
     """Configure agent credentials (saved to ~/.talos-agent/config.json)."""
+    if Settings().secret_rotation_enabled:
+        raise click.ClickException(
+            "plaintext config writes are disabled while secret rotation is enabled; "
+            "use `talos-agent secrets rotate`"
+        )
     ensure_app_dir()
     cfg_path = APP_DIR / "config.json"
 
@@ -197,3 +203,198 @@ def status():
     console.print(f"[bold]Pending approvals:[/bold] {len(pending)}")
 
     db.close()
+
+
+@main.group()
+@click.option(
+    "--db-path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Secret database path (defaults to the prime-agent database)",
+)
+@click.pass_context
+def secrets(ctx: click.Context, db_path: Path | None):
+    """Manage encrypted, versioned runtime secrets."""
+    from talos_agent.db import DB_PATH, LocalDB
+    from talos_agent.secret_store import SecretStore, decode_keyring
+
+    settings = Settings()
+    try:
+        db = LocalDB(
+            path=db_path or DB_PATH,
+            timeout_ms=settings.secret_db_timeout_ms,
+        )
+        store = SecretStore(
+            db,
+            keyring=decode_keyring(settings.secret_keyring),
+            active_key_id=settings.secret_active_key_id,
+            scope=settings.secret_scope,
+            max_value_bytes=settings.secret_max_bytes,
+            dual_read=settings.secret_dual_read,
+            legacy_fallback=settings.secret_legacy_fallback,
+        )
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    ctx.obj = {"db": db, "store": store}
+    ctx.call_on_close(db.close)
+
+
+@secrets.command("stage")
+@click.argument("name")
+@click.option("--request-id", default=None, help="Idempotency key (generated if omitted)")
+@click.option("--actor", default="operator", show_default=True)
+@click.option("--reason", default=None, help="Lowercase audit reason code")
+@click.pass_obj
+def stage_secret(obj: dict, name: str, request_id: str | None, actor: str, reason: str | None):
+    """Prompt for and stage an encrypted value without activating it."""
+    value = click.prompt("Secret value", hide_input=True, confirmation_prompt=True)
+    try:
+        version = obj["store"].stage(
+            name,
+            value,
+            request_id=request_id or str(uuid.uuid4()),
+            actor=actor,
+            reason=reason,
+        )
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    console.print_json(data=asdict(version))
+
+
+@secrets.command("activate")
+@click.argument("name")
+@click.argument("version", type=click.IntRange(min=1))
+@click.option("--expected-version", type=click.IntRange(min=1), default=None)
+@click.option("--actor", default="operator", show_default=True)
+@click.option("--reason", default=None, help="Lowercase audit reason code")
+@click.pass_obj
+def activate_secret(
+    obj: dict,
+    name: str,
+    version: int,
+    expected_version: int | None,
+    actor: str,
+    reason: str | None,
+):
+    """Atomically activate a staged version using compare-and-swap."""
+    store = obj["store"]
+    expected = expected_version if expected_version is not None else store.current_version(name)
+    try:
+        result = store.activate(
+            name,
+            version,
+            expected_active_version=expected,
+            actor=actor,
+            reason=reason,
+        )
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    console.print_json(data=asdict(result))
+
+
+@secrets.command("rotate")
+@click.argument("name")
+@click.option("--request-id", default=None, help="Idempotency key (generated if omitted)")
+@click.option("--expected-version", type=click.IntRange(min=1), default=None)
+@click.option("--actor", default="operator", show_default=True)
+@click.option("--reason", default="routine_rotation", show_default=True)
+@click.pass_obj
+def rotate_secret(
+    obj: dict,
+    name: str,
+    request_id: str | None,
+    expected_version: int | None,
+    actor: str,
+    reason: str,
+):
+    """Prompt for, stage, and atomically activate a new encrypted version."""
+    store = obj["store"]
+    expected = expected_version if expected_version is not None else store.current_version(name)
+    value = click.prompt("New secret value", hide_input=True, confirmation_prompt=True)
+    try:
+        staged = store.stage(
+            name,
+            value,
+            request_id=request_id or str(uuid.uuid4()),
+            actor=actor,
+            reason=reason,
+        )
+        active = store.activate(
+            name,
+            staged.version,
+            expected_active_version=expected,
+            actor=actor,
+            reason=reason,
+        )
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    console.print_json(data=asdict(active))
+
+
+@secrets.command("recover")
+@click.argument("name")
+@click.argument("version", type=click.IntRange(min=1))
+@click.option("--expected-version", type=click.IntRange(min=1), required=True)
+@click.option("--actor", default="operator", show_default=True)
+@click.option("--reason", default="credential_rejected", show_default=True)
+@click.pass_obj
+def recover_secret(
+    obj: dict,
+    name: str,
+    version: int,
+    expected_version: int,
+    actor: str,
+    reason: str,
+):
+    """Recover a prior non-revoked version with an atomic CAS."""
+    try:
+        result = obj["store"].recover(
+            name,
+            version,
+            expected_active_version=expected_version,
+            actor=actor,
+            reason=reason,
+        )
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    console.print_json(data=asdict(result))
+
+
+@secrets.command("revoke")
+@click.argument("name")
+@click.argument("version", type=click.IntRange(min=1))
+@click.option("--actor", default="operator", show_default=True)
+@click.option("--reason", default="rotation_complete", show_default=True)
+@click.pass_obj
+def revoke_secret(obj: dict, name: str, version: int, actor: str, reason: str):
+    """Permanently exclude a non-active version from runtime reads."""
+    try:
+        result = obj["store"].revoke(name, version, actor=actor, reason=reason)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    console.print_json(data=asdict(result))
+
+
+@secrets.command("list")
+@click.argument("name")
+@click.pass_obj
+def list_secrets(obj: dict, name: str):
+    """List lifecycle metadata. Ciphertext and key IDs are never displayed."""
+    try:
+        versions = obj["store"].list_versions(name)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    console.print_json(data=[asdict(version) for version in versions])
+
+
+@secrets.command("audit")
+@click.argument("name")
+@click.option("--limit", type=click.IntRange(min=1, max=500), default=50)
+@click.pass_obj
+def audit_secrets(obj: dict, name: str, limit: int):
+    """Show bounded secret lifecycle audit events."""
+    try:
+        events = obj["store"].audit_events(name, limit)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    console.print_json(data=events)

@@ -178,6 +178,10 @@ cargo test --target wasm32-unknown-unknown
 - Do not commit secrets, keys, or generated `.env` files
 - For TypeScript and React, run `pnpm lint` and the relevant `pnpm test:*` command before opening a PR
 - For Python, prefer explicit types and validate changes with `uv run pytest`
+- For encrypted agent credentials, also run `uv run pytest
+  tests/test_secret_store.py tests/test_secret_rotation_integration.py` and
+  follow [the rotation runbook](./docs/prime-agent-secret-rotation.md) for
+  migration and rollback verification.
 - For Rust, keep formatting standard with `cargo fmt` and validate with `cargo test`
 
 ## Pull Request Workflow
