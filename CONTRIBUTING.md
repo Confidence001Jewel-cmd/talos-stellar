@@ -146,6 +146,7 @@ pnpm build
 pnpm lint
 pnpm test:unit
 pnpm test:e2e
+pnpm jobs:worker    # continuous background-job worker — see web/JOBS.md
 ```
 
 Any PR that changes `web/drizzle/**` or `web/src/db/**` is validated by the `Web Migrations CI`

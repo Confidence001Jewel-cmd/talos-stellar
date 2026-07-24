@@ -95,6 +95,10 @@ pnpm test:openapi
 
 CI runs the same snapshot test and fails if `/api/docs/openapi.json` differs from `tests/fixtures/openapi.snapshot.json`.
 
+## Background Jobs
+
+A durable, Postgres-backed job queue for slow/retryable web-side work (leasing, heartbeats, cancellation, retry classes, dead-letter, admin inspection). Disabled by default (`JOBS_ENABLED=false`) — opt-in, backward-compatible rollout. See **[JOBS.md](./JOBS.md)** for configuration, operational signals, local verification, and rollback.
+
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 
 ## Learn More

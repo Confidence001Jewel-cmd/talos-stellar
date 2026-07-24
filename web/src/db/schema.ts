@@ -357,6 +357,77 @@ export const tlsTokenPurchases = pgTable(
   ],
 );
 
+// ─── Background Jobs (Durable Execution Queue) ────────────────────
+//
+// Postgres-backed durable job queue for slow/retryable web-side work.
+// Leasing uses `SELECT ... FOR UPDATE SKIP LOCKED` (see src/lib/jobs/store.ts)
+// so multiple app instances can safely pull from the same queue without a
+// broker. Status lifecycle:
+//
+//   pending → leased → completed
+//                    ↘ pending (transient failure, runAt pushed out)
+//                    ↘ dead_letter (retries exhausted / fatal error)
+//   pending|leased → cancelled (cooperative — handler observes cancelRequested)
+//
+// A lease is a (leaseId, leaseExpiresAt) pair. Workers extend it via
+// heartbeat while processing; if a worker dies mid-job the lease simply
+// expires and the reaper returns the row to pending (or dead_letter once
+// maxAttempts is exhausted) — no separate crash-recovery path needed.
+
+export const tlsJobs = pgTable(
+  "tls_jobs",
+  {
+    id: text("id").primaryKey().$defaultFn(() => createId()),
+
+    // Job type — maps to a handler registered in src/lib/jobs/registry.ts
+    queue: text("queue").notNull(),
+    payload: jsonb("payload").notNull().default({}),
+
+    // pending | leased | completed | dead_letter | cancelled
+    status: text("status").notNull().default("pending"),
+    priority: integer("priority").notNull().default(0),
+
+    // Earliest time this job is eligible to be leased (supports delayed retry)
+    runAt: timestamp("runAt", { mode: "date", precision: 3 }).notNull().defaultNow(),
+
+    // Lease ownership — leaseId is a random token so a reaped-and-relaunched
+    // lease can never be mistaken for the original by a slow worker.
+    leaseId: text("leaseId"),
+    leaseOwner: text("leaseOwner"),
+    leaseExpiresAt: timestamp("leaseExpiresAt", { mode: "date", precision: 3 }),
+    heartbeatAt: timestamp("heartbeatAt", { mode: "date", precision: 3 }),
+
+    attempts: integer("attempts").notNull().default(0),
+    maxAttempts: integer("maxAttempts").notNull().default(8),
+
+    // transient | rate_limited | fatal — see src/lib/jobs/retry.ts
+    retryClass: text("retryClass").notNull().default("transient"),
+
+    // Cooperative cancellation — handler polls this via the heartbeat() call
+    cancelRequested: boolean("cancelRequested").notNull().default(false),
+
+    // Caller-supplied dedupe key, scoped per queue. Nullable — most jobs don't need one.
+    idempotencyKey: text("idempotencyKey"),
+
+    // Sanitized, truncated error message from the most recent failed attempt.
+    // Never store raw payloads/secrets here — see src/lib/jobs/metrics.ts.
+    lastError: text("lastError"),
+    result: jsonb("result"),
+
+    createdAt: timestamp("createdAt", { mode: "date", precision: 3 }).notNull().defaultNow(),
+    updatedAt: timestamp("updatedAt", { mode: "date", precision: 3 }).notNull().$onUpdate(() => new Date()),
+    completedAt: timestamp("completedAt", { mode: "date", precision: 3 }),
+  },
+  (t) => [
+    index("tls_jobs_status_runAt_idx").on(t.status, t.runAt),
+    index("tls_jobs_queue_status_idx").on(t.queue, t.status),
+    index("tls_jobs_leaseExpiresAt_idx").on(t.leaseExpiresAt),
+    uniqueIndex("tls_jobs_queue_idempotencyKey_unique")
+      .on(t.queue, t.idempotencyKey)
+      .where(sql`"idempotencyKey" IS NOT NULL`),
+  ],
+);
+
 // ─── API Key Audit Log ────────────────────────────────────────────
 
 export const tlsApiAuditLogs = pgTable(

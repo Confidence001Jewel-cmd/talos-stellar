@@ -3,6 +3,8 @@ import { timingSafeEqual } from "crypto";
 import { db } from "@/db";
 import { tlsTalos, tlsApiAuditLogs } from "@/db/schema";
 import { eq } from "drizzle-orm";
+import { enqueue, jobsConfig } from "@/lib/jobs";
+import { AUDIT_LOG_WRITE_QUEUE } from "@/lib/jobs/handlers/audit-log";
 
 /**
  * Verify API key from Authorization header against the TALOS's stored key.
@@ -65,7 +67,16 @@ export async function verifyAgentApiKey(
   return { ok: true, talos };
 }
 
-/** Persist one audit log entry. Called fire-and-forget — must not throw. */
+/**
+ * Persist one audit log entry. Called fire-and-forget — must not throw.
+ *
+ * When JOBS_ENABLED=true, this durably enqueues the write instead of
+ * inserting directly: a transient DB error is retried with backoff by the
+ * job worker rather than silently dropping the audit entry, which is what
+ * the plain insert below does today (the caller's `.catch(() => {})`
+ * swallows the failure). Default is unchanged — direct insert — so this is
+ * purely additive until an operator opts in.
+ */
 async function writeAuditLog(
   talosId: string,
   request: NextRequest,
@@ -77,12 +88,18 @@ async function writeAuditLog(
     null;
 
   const url = new URL(request.url);
-
-  await db.insert(tlsApiAuditLogs).values({
+  const entry = {
     talosId,
     method: request.method,
     path: url.pathname,
     statusCode,
     ipAddress: ip,
-  });
+  };
+
+  if (jobsConfig.enabled) {
+    await enqueue(AUDIT_LOG_WRITE_QUEUE, entry);
+    return;
+  }
+
+  await db.insert(tlsApiAuditLogs).values(entry);
 }

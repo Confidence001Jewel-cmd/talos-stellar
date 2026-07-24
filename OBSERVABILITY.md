@@ -45,6 +45,16 @@ log.info("event_name", key="value")
 
 Every agent cycle binds a `cycle_id` UUID to the log context via `structlog.contextvars`.
 
+### Background jobs
+The durable job queue (`web/src/lib/jobs`) emits one structured log line per
+state transition — `job_enqueued`, `job_leased`, `job_heartbeat`,
+`job_completed`, `job_retry_scheduled`, `job_dead_letter`, `job_cancelled`,
+`job_lease_reaped` — with `jobId`, `queue`, `attempts`, and `durationMs`.
+These never include the job's `payload`/`result` or a raw error object,
+only a truncated error message. See `web/JOBS.md` for configuration,
+retry/dead-letter semantics, and how to inspect the queue via
+`/api/admin/jobs`.
+
 ## Request Correlation
 
 ### X-Request-Id header
@@ -75,6 +85,7 @@ List endpoints now support cursor-based pagination:
 | `GET /api/talos/:id/activity` | ✅ |
 | `GET /api/jobs/pending` | ✅ |
 | `GET /api/activity` | ✅ (pre-existing) |
+| `GET /api/admin/jobs` | ✅ (see `web/JOBS.md`) |
 
 ### Usage
 ```

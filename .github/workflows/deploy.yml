@@ -48,6 +48,12 @@ jobs:
       STELLAR_OPERATOR_SECRET_KEY: SXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
       NEXT_PUBLIC_TALOS_REGISTRY_CONTRACT: CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
       NEXT_PUBLIC_TALOS_NAME_SERVICE_CONTRACT: CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+      # Background jobs (web/JOBS.md) — enabled in CI so tests/jobs-e2e.test.ts
+      # exercises the real enqueue -> lease -> complete round trip, not just
+      # the disabled-by-default no-op path.
+      JOBS_ENABLED: "true"
+      ADMIN_API_KEY: ci-test-admin-key
+      INTERNAL_JOBS_SECRET: ci-test-internal-jobs-secret
 
     steps:
       - uses: actions/checkout@v4
