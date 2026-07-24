@@ -9,6 +9,15 @@ const pool = new Pool({
 
 const db = drizzle(pool);
 
-await migrate(db, { migrationsFolder: "./drizzle" });
+async function main() {
+  await migrate(db, { migrationsFolder: "./drizzle" });
+}
 
-await pool.end();
+main()
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  })
+  .finally(async () => {
+    await pool.end();
+  });
