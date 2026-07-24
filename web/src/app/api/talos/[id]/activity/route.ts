@@ -3,6 +3,8 @@ import { db } from "@/db";
 import { tlsTalos, tlsActivities } from "@/db/schema";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { verifyAgentApiKey } from "@/lib/auth";
+import { withDriftDetection } from "@/lib/drift";
+import "@/lib/drift-schemas";
 
 // GET /api/talos/:id/activity — Get activities
 export async function GET(
@@ -47,7 +49,7 @@ export async function GET(
 }
 
 // POST /api/talos/:id/activity — Report activity (from Local Agent)
-export async function POST(
+async function _POST(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {

@@ -5,6 +5,8 @@ import { and, desc, eq, lt, or, sql } from "drizzle-orm";
 import { randomBytes } from "crypto";
 import { createAgentKeypair, fundTestnetAccount, verifyStellarSignature } from "@/lib/stellar";
 import { createTalosSchema, parseBody } from "@/lib/schemas";
+import { withDriftDetection } from "@/lib/drift";
+import "@/lib/drift-schemas";
 
 // GET /api/talos — List TALOS entries with cursor-based pagination
 export async function GET(request: NextRequest) {
@@ -92,7 +94,7 @@ export async function GET(request: NextRequest) {
 }
 
 // POST /api/talos — Create a new TALOS (Genesis)
-export async function POST(request: NextRequest) {
+async function _POST(request: NextRequest) {
   try {
     const parsed = await parseBody(request, createTalosSchema);
     if (parsed.error) return parsed.error;
@@ -243,3 +245,7 @@ export async function POST(request: NextRequest) {
     return Response.json({ error: message }, { status: 500 });
   }
 }
+
+// Re-export POST wrapped with drift detection.
+// The original async function above is kept intact so it can be tested directly.
+export const POST = withDriftDetection("POST /api/talos", _POST);

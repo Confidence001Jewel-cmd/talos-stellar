@@ -12,6 +12,7 @@
     "test:e2e": "vitest run tests/api-e2e.test.ts",
     "test:openapi": "vitest run tests/openapi-snapshot.test.ts",
     "openapi:snapshot": "tsx scripts/write-openapi-snapshot.ts",
+    "schemas:generate": "tsx scripts/generate-schemas.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:push": "drizzle-kit push",
@@ -49,6 +50,7 @@
     "tailwindcss": "^4",
     "tsx": "^4.21.0",
     "typescript": "^5",
-    "vitest": "^4.1.2"
+    "vitest": "^4.1.2",
+    "zod-to-json-schema": "3.24.5"
   }
 }
