@@ -16,7 +16,7 @@ use std::string::ToString;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Env, IntoVal, String, Symbol,
+    Env, IntoVal, String, Symbol, Vec,
 };
 
 // ── Data Types ──────────────────────────────────────────────────────
@@ -54,6 +54,40 @@ pub struct TimelockConfig {
     pub grace_period: u64,
 }
 
+/// A narrowly-scoped write path that can be independently paused.
+///
+/// Reads (`resolve_name`, `name_of`, `is_name_available`, `has_name`) are
+/// never gated by any pause domain. Admin entry-points (`set_registry_contract`,
+/// timelock management) are intentionally not pausable — they already carry
+/// their own admin-auth (and optional timelock) protection.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PauseDomain {
+    NameRegistration,
+}
+
+/// Persisted record of an active pause on a single [`PauseDomain`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseState {
+    pub paused_by: Address,
+    pub paused_at: u64,
+    /// Unix timestamp after which the pause automatically lifts.
+    /// `0` means indefinite — only settable by the admin, never by a guardian.
+    pub expires_at: u64,
+}
+
+/// Computed, read-friendly view of a domain's pause status.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseInfo {
+    pub active: bool,
+    pub paused_by: Option<Address>,
+    pub paused_at: Option<u64>,
+    /// `None` when not paused, or when paused indefinitely by the admin.
+    pub expires_at: Option<u64>,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -64,6 +98,10 @@ pub enum DataKey {
     TimelockConfig,
     TimelockProposal(u64),
     NextTimelockId,
+    /// Active pause record for a domain, if any. Absence means unpaused.
+    PauseState(PauseDomain),
+    /// Bounded list of guardian addresses authorized to trigger (but not lift) pauses.
+    Guardians,
 }
 
 #[contracterror]
@@ -72,6 +110,11 @@ pub enum ContractError {
     AlreadyInitialized = 1,
     UnauthorizedCaller = 2,
     TimelockEnabled = 3,
+    DomainPaused = 4,
+    NotAdminOrGuardian = 5,
+    DomainLockedByAdmin = 6,
+    InvalidPauseDuration = 7,
+    GuardianLimitReached = 8,
 }
 
 // ── Events ──────────────────────────────────────────────────────────
@@ -83,6 +126,10 @@ pub enum ContractError {
 //   tl_exec  : (symbol, proposal_id: u64) → (action: AdminAction, executor: Address)
 //   tl_cnl   : (symbol, proposal_id: u64) → (action: AdminAction, canceller: Address)
 //   tl_cfg   : (symbol,)               → (old_min_delay: u64, new_min_delay: u64, grace_period: u64)
+//   pause_on  : (symbol, domain: PauseDomain) → (actor: Address, expires_at: u64)
+//   pause_off : (symbol, domain: PauseDomain) → (actor: Address,)
+//   guard_add : (symbol,)                     → (guardian: Address,)
+//   guard_rem : (symbol,)                     → (guardian: Address,)
 
 fn emit_name_registered(env: &Env, talos_id: u32, name: String, owner: Address) {
     let topics = (symbol_short!("name_reg"), talos_id);
@@ -136,8 +183,63 @@ fn emit_timelock_config_changed(
         .publish(topics, (old_min_delay, new_min_delay, grace_period));
 }
 
+fn emit_pause_set(env: &Env, domain: &PauseDomain, actor: &Address, expires_at: u64) {
+    let topics = (symbol_short!("pause_on"), domain.clone());
+    env.events().publish(topics, (actor.clone(), expires_at));
+}
+
+fn emit_pause_cleared(env: &Env, domain: &PauseDomain, actor: &Address) {
+    let topics = (symbol_short!("pause_off"), domain.clone());
+    env.events().publish(topics, (actor.clone(),));
+}
+
+fn emit_guardian_added(env: &Env, guardian: Address) {
+    let topics = (symbol_short!("guard_add"),);
+    env.events().publish(topics, (guardian,));
+}
+
+fn emit_guardian_removed(env: &Env, guardian: Address) {
+    let topics = (symbol_short!("guard_rem"),);
+    env.events().publish(topics, (guardian,));
+}
+
+// ── Emergency Pause Helpers ────────────────────────────────────────
+
+fn get_guardians(e: &Env) -> Vec<Address> {
+    e.storage()
+        .persistent()
+        .get(&DataKey::Guardians)
+        .unwrap_or(Vec::new(e))
+}
+
+fn is_guardian_internal(e: &Env, addr: &Address) -> bool {
+    get_guardians(e).iter().any(|g| g == *addr)
+}
+
+/// Evaluate whether `domain` is currently paused, lazily treating an expired
+/// (non-indefinite) pause record as inactive without mutating storage.
+fn is_domain_paused(e: &Env, domain: &PauseDomain) -> bool {
+    match e
+        .storage()
+        .persistent()
+        .get::<_, PauseState>(&DataKey::PauseState(domain.clone()))
+    {
+        None => false,
+        Some(state) => state.expires_at == 0 || e.ledger().timestamp() < state.expires_at,
+    }
+}
+
+fn require_not_paused(e: &Env, domain: PauseDomain) {
+    if is_domain_paused(e, &domain) {
+        panic_with_error!(e, ContractError::DomainPaused);
+    }
+}
+
 const DEFAULT_GRACE_PERIOD: u64 = 604_800; // 7 days in seconds
 const MAX_MIN_DELAY: u64 = 2_592_000; // 30 days in seconds
+const MAX_GUARDIAN_PAUSE_SECS: u64 = 604_800; // 7 days — bounds guardian blast radius
+const MAX_ADMIN_PAUSE_SECS: u64 = 2_592_000; // 30 days; 0 (indefinite) is also allowed for admin
+const MAX_GUARDIANS: u32 = 10; // bounds unbounded storage growth
 
 // ── Validation ──────────────────────────────────────────────────────
 fn validate_name(name: &String) -> bool {
@@ -185,7 +287,7 @@ fn validate_name(name: &String) -> bool {
 /// This constant is embedded in the WASM binary at compile time and is
 /// therefore immutable once deployed; it cannot be altered by any admin
 /// call, storage write, or cross-contract invocation.
-pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 1, 0);
+pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 2, 0);
 
 #[contract]
 pub struct TalosNameService;
@@ -217,6 +319,8 @@ impl TalosNameService {
     /// * `talos_id` - The Talos ID to associate with the name
     /// * `name` - Human-readable name (3-32 chars, lowercase alphanumeric + hyphens)
     pub fn register_name(e: Env, owner: Address, talos_id: u32, name: String) {
+        require_not_paused(&e, PauseDomain::NameRegistration);
+
         owner.require_auth();
 
         if !validate_name(&name) {
@@ -488,6 +592,193 @@ impl TalosNameService {
             .get(&DataKey::TimelockProposal(proposal_id))
     }
 
+    // ── Emergency Pause Controls ──────────────────────────────────────
+
+    /// Pause a single write-path domain, blocking it while leaving all
+    /// reads fully functional. See `TalosRegistry::pause` for full semantics
+    /// (duration rules, idempotency, admin-lock protection) — identical here.
+    ///
+    /// # Panics
+    /// - `Admin not configured` — if `set_admin` has not been called.
+    /// - `ContractError::NotAdminOrGuardian` — unauthorized caller.
+    /// - `ContractError::DomainLockedByAdmin` — a guardian attempted to
+    ///   overwrite an admin-established pause.
+    /// - `ContractError::InvalidPauseDuration` — duration out of bounds.
+    pub fn pause(e: Env, caller: Address, domain: PauseDomain, duration: u64) {
+        caller.require_auth();
+
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Admin not configured");
+
+        let is_admin_caller = caller == admin;
+        if !is_admin_caller && !is_guardian_internal(&e, &caller) {
+            panic_with_error!(&e, ContractError::NotAdminOrGuardian);
+        }
+
+        let key = DataKey::PauseState(domain.clone());
+
+        if !is_admin_caller {
+            if let Some(existing) = e.storage().persistent().get::<_, PauseState>(&key) {
+                if existing.paused_by == admin {
+                    panic_with_error!(&e, ContractError::DomainLockedByAdmin);
+                }
+            }
+        }
+
+        let now = e.ledger().timestamp();
+        let expires_at = if is_admin_caller {
+            if duration == 0 {
+                0
+            } else {
+                if duration > MAX_ADMIN_PAUSE_SECS {
+                    panic_with_error!(&e, ContractError::InvalidPauseDuration);
+                }
+                now.saturating_add(duration)
+            }
+        } else {
+            if duration == 0 || duration > MAX_GUARDIAN_PAUSE_SECS {
+                panic_with_error!(&e, ContractError::InvalidPauseDuration);
+            }
+            now.saturating_add(duration)
+        };
+
+        e.storage().persistent().set(
+            &key,
+            &PauseState {
+                paused_by: caller.clone(),
+                paused_at: now,
+                expires_at,
+            },
+        );
+
+        emit_pause_set(&e, &domain, &caller, expires_at);
+    }
+
+    /// Lift an active pause on `domain`. Idempotent no-op if not paused.
+    ///
+    /// # Authorization
+    /// Only the current admin may unpause, regardless of who set the pause.
+    pub fn unpause(e: Env, domain: PauseDomain) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Admin not configured");
+        admin.require_auth();
+
+        let key = DataKey::PauseState(domain.clone());
+        if e.storage().persistent().get::<_, PauseState>(&key).is_none() {
+            return;
+        }
+
+        e.storage().persistent().remove(&key);
+        emit_pause_cleared(&e, &domain, &admin);
+    }
+
+    /// Returns `true` if `domain` is currently paused (and not yet expired).
+    pub fn is_paused(e: Env, domain: PauseDomain) -> bool {
+        is_domain_paused(&e, &domain)
+    }
+
+    /// Full observability view of a domain's pause status.
+    pub fn pause_info(e: Env, domain: PauseDomain) -> PauseInfo {
+        match e
+            .storage()
+            .persistent()
+            .get::<_, PauseState>(&DataKey::PauseState(domain.clone()))
+        {
+            None => PauseInfo {
+                active: false,
+                paused_by: None,
+                paused_at: None,
+                expires_at: None,
+            },
+            Some(state) => {
+                let active = state.expires_at == 0 || e.ledger().timestamp() < state.expires_at;
+                PauseInfo {
+                    active,
+                    paused_by: Some(state.paused_by),
+                    paused_at: Some(state.paused_at),
+                    expires_at: if state.expires_at == 0 {
+                        None
+                    } else {
+                        Some(state.expires_at)
+                    },
+                }
+            }
+        }
+    }
+
+    /// Register a guardian address authorized to trigger (but never lift)
+    /// bounded-duration pauses. Idempotent; bounded to `MAX_GUARDIANS`.
+    ///
+    /// # Authorization
+    /// Requires current admin authorization.
+    pub fn add_guardian(e: Env, guardian: Address) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Admin not configured");
+        admin.require_auth();
+
+        let mut guardians = get_guardians(&e);
+        if guardians.iter().any(|g| g == guardian) {
+            return;
+        }
+        if guardians.len() >= MAX_GUARDIANS {
+            panic_with_error!(&e, ContractError::GuardianLimitReached);
+        }
+
+        guardians.push_back(guardian.clone());
+        e.storage().persistent().set(&DataKey::Guardians, &guardians);
+        emit_guardian_added(&e, guardian);
+    }
+
+    /// Revoke a guardian's pause authority. Idempotent.
+    ///
+    /// # Authorization
+    /// Requires current admin authorization.
+    pub fn remove_guardian(e: Env, guardian: Address) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Admin not configured");
+        admin.require_auth();
+
+        let guardians = get_guardians(&e);
+        let mut remaining = Vec::new(&e);
+        let mut found = false;
+        for g in guardians.iter() {
+            if g == guardian {
+                found = true;
+                continue;
+            }
+            remaining.push_back(g);
+        }
+
+        if !found {
+            return;
+        }
+
+        e.storage().persistent().set(&DataKey::Guardians, &remaining);
+        emit_guardian_removed(&e, guardian);
+    }
+
+    /// Check whether `addr` currently holds guardian pause authority.
+    pub fn is_guardian(e: Env, addr: Address) -> bool {
+        is_guardian_internal(&e, &addr)
+    }
+
+    /// List all currently registered guardians (bounded to `MAX_GUARDIANS`).
+    pub fn list_guardians(e: Env) -> Vec<Address> {
+        get_guardians(&e)
+    }
+
     /// Resolve a name to a Talos ID.
     /// Returns None if the name doesn't exist.
     pub fn resolve_name(e: Env, name: String) -> Option<u32> {
@@ -660,7 +951,7 @@ mod tests {
     #[test]
     fn version_returns_compile_time_constant() {
         let (_env, _registry_contract, _contract_id, _registry_client, client) = setup();
-        assert_eq!(client.version(), (1u32, 1u32, 0u32));
+        assert_eq!(client.version(), (1u32, 2u32, 0u32));
     }
 
     #[test]
@@ -1161,5 +1452,413 @@ mod tests {
         let prop = client.get_timelock_proposal(&proposal_id).unwrap();
         assert_eq!(prop.status, ProposalStatus::Cancelled);
         assert!(client.try_execute_action(&proposal_id).is_err());
+    }
+
+    // ── Emergency Pause: helpers ───────────────────────────────────────
+
+    fn mock_pause(
+        env: &Env,
+        client: &TalosNameServiceClient,
+        contract_id: &Address,
+        caller: &Address,
+        domain: &PauseDomain,
+        duration: u64,
+    ) {
+        client
+            .mock_auths(&[MockAuth {
+                address: caller,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "pause",
+                    args: (caller.clone(), domain.clone(), duration).into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .pause(caller, domain, &duration);
+    }
+
+    /// Returns `true` if the mocked `pause` call succeeded, `false` if it errored.
+    fn try_mock_pause(
+        env: &Env,
+        client: &TalosNameServiceClient,
+        contract_id: &Address,
+        caller: &Address,
+        domain: &PauseDomain,
+        duration: u64,
+    ) -> bool {
+        client
+            .mock_auths(&[MockAuth {
+                address: caller,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "pause",
+                    args: (caller.clone(), domain.clone(), duration).into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_pause(caller, domain, &duration)
+            .is_ok()
+    }
+
+    fn mock_unpause(
+        env: &Env,
+        client: &TalosNameServiceClient,
+        contract_id: &Address,
+        admin: &Address,
+        domain: &PauseDomain,
+    ) {
+        client
+            .mock_auths(&[MockAuth {
+                address: admin,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "unpause",
+                    args: (domain.clone(),).into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .unpause(domain);
+    }
+
+    fn mock_add_guardian(
+        env: &Env,
+        client: &TalosNameServiceClient,
+        contract_id: &Address,
+        admin: &Address,
+        guardian: &Address,
+    ) {
+        client
+            .mock_auths(&[MockAuth {
+                address: admin,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "add_guardian",
+                    args: (guardian.clone(),).into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .add_guardian(guardian);
+    }
+
+    #[test]
+    fn paused_name_registration_blocks_register_name_but_not_reads() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let name = s(&env, "marketbot");
+        client.set_admin(&admin);
+
+        let talos_id = create_talos_with_auth(
+            &env,
+            &registry_client,
+            &registry_contract,
+            &owner,
+            &protocol_wallet,
+        );
+
+        mock_pause(
+            &env,
+            &client,
+            &contract_id,
+            &admin,
+            &PauseDomain::NameRegistration,
+            0,
+        );
+
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &owner,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "register_name",
+                    args: (owner.clone(), talos_id, name.clone()).into_val(&env),
+                    sub_invokes: &[MockAuthInvoke {
+                        contract: &registry_contract,
+                        fn_name: "creator_of",
+                        args: (talos_id,).into_val(&env),
+                        sub_invokes: &[],
+                    }],
+                },
+            }])
+            .try_register_name(&owner, &talos_id, &name);
+        assert!(result.is_err());
+
+        // Reads are unaffected.
+        assert!(client.is_name_available(&name));
+        assert!(!client.has_name(&talos_id));
+
+        mock_unpause(
+            &env,
+            &client,
+            &contract_id,
+            &admin,
+            &PauseDomain::NameRegistration,
+        );
+        register_name_with_auth(
+            &env,
+            &client,
+            &contract_id,
+            &registry_contract,
+            &owner,
+            talos_id,
+            &name,
+        );
+        assert!(!client.is_name_available(&name));
+    }
+
+    #[test]
+    fn guardian_can_pause_within_bounds_but_cannot_unpause() {
+        let (env, _registry_contract, contract_id, _registry_client, client) = setup();
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        client.set_admin(&admin);
+        mock_add_guardian(&env, &client, &contract_id, &admin, &guardian);
+
+        mock_pause(
+            &env,
+            &client,
+            &contract_id,
+            &guardian,
+            &PauseDomain::NameRegistration,
+            3600,
+        );
+        assert!(client.is_paused(&PauseDomain::NameRegistration));
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &guardian,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "unpause",
+                    args: (PauseDomain::NameRegistration,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_unpause(&PauseDomain::NameRegistration);
+        assert!(res.is_err());
+
+        mock_unpause(
+            &env,
+            &client,
+            &contract_id,
+            &admin,
+            &PauseDomain::NameRegistration,
+        );
+        assert!(!client.is_paused(&PauseDomain::NameRegistration));
+    }
+
+    #[test]
+    fn guardian_pause_duration_must_be_bounded() {
+        let (env, _registry_contract, contract_id, _registry_client, client) = setup();
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        client.set_admin(&admin);
+        mock_add_guardian(&env, &client, &contract_id, &admin, &guardian);
+
+        assert!(!try_mock_pause(
+            &env,
+            &client,
+            &contract_id,
+            &guardian,
+            &PauseDomain::NameRegistration,
+            0,
+        ));
+        assert!(!try_mock_pause(
+            &env,
+            &client,
+            &contract_id,
+            &guardian,
+            &PauseDomain::NameRegistration,
+            MAX_GUARDIAN_PAUSE_SECS + 1,
+        ));
+        assert!(try_mock_pause(
+            &env,
+            &client,
+            &contract_id,
+            &guardian,
+            &PauseDomain::NameRegistration,
+            3600,
+        ));
+    }
+
+    #[test]
+    fn guardian_cannot_override_admin_lock_on_name_service() {
+        let (env, _registry_contract, contract_id, _registry_client, client) = setup();
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        client.set_admin(&admin);
+        mock_add_guardian(&env, &client, &contract_id, &admin, &guardian);
+
+        mock_pause(
+            &env,
+            &client,
+            &contract_id,
+            &admin,
+            &PauseDomain::NameRegistration,
+            0,
+        );
+
+        assert!(!try_mock_pause(
+            &env,
+            &client,
+            &contract_id,
+            &guardian,
+            &PauseDomain::NameRegistration,
+            3600,
+        ));
+    }
+
+    #[test]
+    fn non_admin_non_guardian_cannot_pause_name_service() {
+        let (env, _registry_contract, contract_id, _registry_client, client) = setup();
+        let admin = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        client.set_admin(&admin);
+
+        assert!(!try_mock_pause(
+            &env,
+            &client,
+            &contract_id,
+            &stranger,
+            &PauseDomain::NameRegistration,
+            3600,
+        ));
+    }
+
+    #[test]
+    fn name_service_pause_auto_expires() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let name = s(&env, "vega");
+        client.set_admin(&admin);
+        mock_add_guardian(&env, &client, &contract_id, &admin, &guardian);
+
+        let talos_id = create_talos_with_auth(
+            &env,
+            &registry_client,
+            &registry_contract,
+            &owner,
+            &protocol_wallet,
+        );
+
+        mock_pause(
+            &env,
+            &client,
+            &contract_id,
+            &guardian,
+            &PauseDomain::NameRegistration,
+            3600,
+        );
+        assert!(client.is_paused(&PauseDomain::NameRegistration));
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 3601;
+        });
+        assert!(!client.is_paused(&PauseDomain::NameRegistration));
+
+        register_name_with_auth(
+            &env,
+            &client,
+            &contract_id,
+            &registry_contract,
+            &owner,
+            talos_id,
+            &name,
+        );
+        assert!(!client.is_name_available(&name));
+    }
+
+    #[test]
+    fn unpause_without_active_pause_is_a_deterministic_noop() {
+        let (env, _registry_contract, contract_id, _registry_client, client) = setup();
+        let admin = Address::generate(&env);
+        client.set_admin(&admin);
+
+        mock_unpause(&env, &client, &contract_id, &admin, &PauseDomain::NameRegistration);
+        mock_pause(&env, &client, &contract_id, &admin, &PauseDomain::NameRegistration, 0);
+        mock_unpause(&env, &client, &contract_id, &admin, &PauseDomain::NameRegistration);
+        mock_unpause(&env, &client, &contract_id, &admin, &PauseDomain::NameRegistration);
+        assert!(!client.is_paused(&PauseDomain::NameRegistration));
+    }
+
+    #[test]
+    fn add_and_remove_guardian_are_idempotent_and_admin_only() {
+        let (env, _registry_contract, contract_id, _registry_client, client) = setup();
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        client.set_admin(&admin);
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &stranger,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "add_guardian",
+                    args: (guardian.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_add_guardian(&guardian);
+        assert!(res.is_err());
+
+        mock_add_guardian(&env, &client, &contract_id, &admin, &guardian);
+        mock_add_guardian(&env, &client, &contract_id, &admin, &guardian);
+        assert!(client.is_guardian(&guardian));
+        assert_eq!(client.list_guardians().len(), 1);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "remove_guardian",
+                    args: (guardian.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .remove_guardian(&guardian);
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "remove_guardian",
+                    args: (guardian.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .remove_guardian(&guardian);
+        assert!(!client.is_guardian(&guardian));
+    }
+
+    #[test]
+    fn pause_and_unpause_emit_events_on_name_service() {
+        let (env, _registry_contract, contract_id, _registry_client, client) = setup();
+        let admin = Address::generate(&env);
+        client.set_admin(&admin);
+
+        mock_pause(&env, &client, &contract_id, &admin, &PauseDomain::NameRegistration, 0);
+        let all_events = env.events().all();
+        let events: std::vec::Vec<_> = all_events.iter().filter(|e| e.0 == contract_id).collect();
+        let (_, topics, data) = events.last().unwrap().clone();
+        let sym: Symbol = TryFromVal::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(sym, symbol_short!("pause_on"));
+        let (actor, expires_at): (Address, u64) = TryFromVal::try_from_val(&env, &data).unwrap();
+        assert_eq!(actor, admin);
+        assert_eq!(expires_at, 0);
+
+        mock_unpause(&env, &client, &contract_id, &admin, &PauseDomain::NameRegistration);
+        let all_events = env.events().all();
+        let events: std::vec::Vec<_> = all_events.iter().filter(|e| e.0 == contract_id).collect();
+        let (_, topics, data) = events.last().unwrap().clone();
+        let sym: Symbol = TryFromVal::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(sym, symbol_short!("pause_off"));
+        let (actor,): (Address,) = TryFromVal::try_from_val(&env, &data).unwrap();
+        assert_eq!(actor, admin);
     }
 }

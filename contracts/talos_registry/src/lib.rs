@@ -11,7 +11,9 @@
 #[cfg(all(test, not(target_arch = "wasm32")))]
 extern crate std;
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec,
+};
 
 // ── Data Types ──────────────────────────────────────────────────────
 
@@ -90,6 +92,46 @@ pub struct TimelockConfig {
     pub grace_period: u64,
 }
 
+/// A narrowly-scoped write path that can be independently paused.
+///
+/// Reads are never gated by any pause domain — `get_talos`, `is_active`,
+/// `next_talos_id`, etc. always reflect current state regardless of pause
+/// status. Administrative entry-points (`set_protocol_fee`, admin transfer,
+/// timelock management) are intentionally **not** pausable: they already
+/// carry their own admin-auth (and optional timelock) protection, and
+/// making them pausable would risk an admin permanently locking itself out.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PauseDomain {
+    TalosCreation,
+    PatronUpdates,
+    KernelUpdates,
+    PulseUpdates,
+    Deactivation,
+}
+
+/// Persisted record of an active pause on a single [`PauseDomain`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseState {
+    pub paused_by: Address,
+    pub paused_at: u64,
+    /// Unix timestamp after which the pause automatically lifts.
+    /// `0` means indefinite — only settable by the admin, never by a guardian.
+    pub expires_at: u64,
+}
+
+/// Computed, read-friendly view of a domain's pause status.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseInfo {
+    pub active: bool,
+    pub paused_by: Option<Address>,
+    pub paused_at: Option<u64>,
+    /// `None` when not paused, or when paused indefinitely by the admin.
+    pub expires_at: Option<u64>,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -104,6 +146,10 @@ pub enum DataKey {
     TimelockConfig,
     TimelockProposal(u64),
     NextTimelockId,
+    /// Active pause record for a domain, if any. Absence means unpaused.
+    PauseState(PauseDomain),
+    /// Bounded list of guardian addresses authorized to trigger (but not lift) pauses.
+    Guardians,
 }
 
 // ── Events ──────────────────────────────────────────────────────────
@@ -119,6 +165,10 @@ pub enum DataKey {
 //   tl_exec : (symbol, proposal_id: u64)   → (action: AdminAction, executor: Address)
 //   tl_cnl  : (symbol, proposal_id: u64)   → (action: AdminAction, canceller: Address)
 //   tl_cfg  : (symbol,)                    → (old_min_delay: u64, new_min_delay: u64, grace_period: u64)
+//   pause_on  : (symbol, domain: PauseDomain) → (actor: Address, expires_at: u64)
+//   pause_off : (symbol, domain: PauseDomain) → (actor: Address,)
+//   guard_add : (symbol,)                     → (guardian: Address,)
+//   guard_rem : (symbol,)                     → (guardian: Address,)
 
 fn emit_talos_created(env: &Env, talos_id: u32, creator: Address, name: String, category: String) {
     let topics = (symbol_short!("tls_crt"), creator);
@@ -205,6 +255,28 @@ fn emit_timelock_config_changed(
         .publish(topics, (old_min_delay, new_min_delay, grace_period));
 }
 
+/// Emitted when a domain is paused (or an existing pause is refreshed/extended).
+fn emit_pause_set(env: &Env, domain: &PauseDomain, actor: &Address, expires_at: u64) {
+    let topics = (symbol_short!("pause_on"), domain.clone());
+    env.events().publish(topics, (actor.clone(), expires_at));
+}
+
+/// Emitted when an admin lifts an active pause on a domain.
+fn emit_pause_cleared(env: &Env, domain: &PauseDomain, actor: &Address) {
+    let topics = (symbol_short!("pause_off"), domain.clone());
+    env.events().publish(topics, (actor.clone(),));
+}
+
+fn emit_guardian_added(env: &Env, guardian: Address) {
+    let topics = (symbol_short!("guard_add"),);
+    env.events().publish(topics, (guardian,));
+}
+
+fn emit_guardian_removed(env: &Env, guardian: Address) {
+    let topics = (symbol_short!("guard_rem"),);
+    env.events().publish(topics, (guardian,));
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 fn validate_patron_shares(patron: &Patron) {
@@ -214,12 +286,47 @@ fn validate_patron_shares(patron: &Patron) {
     }
 }
 
+// ── Emergency Pause Helpers ────────────────────────────────────────
+
+fn get_guardians(e: &Env) -> Vec<Address> {
+    e.storage()
+        .persistent()
+        .get(&DataKey::Guardians)
+        .unwrap_or(Vec::new(e))
+}
+
+fn is_guardian_internal(e: &Env, addr: &Address) -> bool {
+    get_guardians(e).iter().any(|g| g == *addr)
+}
+
+/// Evaluate whether `domain` is currently paused, lazily treating an expired
+/// (non-indefinite) pause record as inactive without mutating storage.
+fn is_domain_paused(e: &Env, domain: &PauseDomain) -> bool {
+    match e
+        .storage()
+        .persistent()
+        .get::<_, PauseState>(&DataKey::PauseState(domain.clone()))
+    {
+        None => false,
+        Some(state) => state.expires_at == 0 || e.ledger().timestamp() < state.expires_at,
+    }
+}
+
+fn require_not_paused(e: &Env, domain: PauseDomain) {
+    if is_domain_paused(e, &domain) {
+        panic!("Write path paused");
+    }
+}
+
 // ── Constants ───────────────────────────────────────────────────────
 
 const PROTOCOL_FEE_BPS: u32 = 300; // 3%
 const MAX_PROTOCOL_FEE_BPS: u32 = 10_000; // 100%
 const DEFAULT_GRACE_PERIOD: u64 = 604_800; // 7 days in seconds
 const MAX_MIN_DELAY: u64 = 2_592_000; // 30 days in seconds
+const MAX_GUARDIAN_PAUSE_SECS: u64 = 604_800; // 7 days — bounds guardian blast radius
+const MAX_ADMIN_PAUSE_SECS: u64 = 2_592_000; // 30 days; 0 (indefinite) is also allowed for admin
+const MAX_GUARDIANS: u32 = 10; // bounds unbounded storage growth
 
 /// Compile-time interface version of TalosRegistry.
 ///
@@ -233,7 +340,7 @@ const MAX_MIN_DELAY: u64 = 2_592_000; // 30 days in seconds
 /// This constant is embedded in the WASM binary at compile time and is
 /// therefore immutable once deployed; it cannot be altered by any admin
 /// call, storage write, or cross-contract invocation.
-pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 1, 0);
+pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 2, 0);
 
 // ── Contract ────────────────────────────────────────────────────────
 
@@ -265,6 +372,8 @@ impl TalosRegistry {
         pulse: Pulse,
         protocol_wallet: Address,
     ) -> u32 {
+        require_not_paused(&e, PauseDomain::TalosCreation);
+
         // Require creator authorization
         patron.creator_addr.require_auth();
 
@@ -360,6 +469,8 @@ impl TalosRegistry {
 
     /// Update patron shares for a Talos.
     pub fn update_patron(e: Env, talos_id: u32, patron: Patron) {
+        require_not_paused(&e, PauseDomain::PatronUpdates);
+
         let mut talos: Talos = e
             .storage()
             .persistent()
@@ -382,6 +493,8 @@ impl TalosRegistry {
 
     /// Update kernel policy for a Talos.
     pub fn update_kernel(e: Env, talos_id: u32, kernel: Kernel) {
+        require_not_paused(&e, PauseDomain::KernelUpdates);
+
         let mut talos: Talos = e
             .storage()
             .persistent()
@@ -399,6 +512,8 @@ impl TalosRegistry {
 
     /// Update pulse token config for a Talos.
     pub fn update_pulse(e: Env, talos_id: u32, pulse: Pulse) {
+        require_not_paused(&e, PauseDomain::PulseUpdates);
+
         let mut talos: Talos = e
             .storage()
             .persistent()
@@ -416,6 +531,8 @@ impl TalosRegistry {
 
     /// Deactivate a Talos.
     pub fn deactivate_talos(e: Env, talos_id: u32) {
+        require_not_paused(&e, PauseDomain::Deactivation);
+
         let mut talos: Talos = e
             .storage()
             .persistent()
@@ -787,6 +904,227 @@ impl TalosRegistry {
         e.storage().persistent().get(&DataKey::PendingAdmin)
     }
 
+    // ── Emergency Pause Controls ──────────────────────────────────────
+
+    /// Pause a single write-path domain, blocking it while leaving all
+    /// reads and every other domain fully functional.
+    ///
+    /// # Authorization
+    /// `caller` must be either the current admin (`ProtocolWallet`) or a
+    /// registered guardian, and must sign the transaction.
+    ///
+    /// # Duration semantics
+    /// - Admin: `duration = 0` pauses indefinitely (only the admin can lift
+    ///   it later via `unpause`). A non-zero `duration` must not exceed
+    ///   [`MAX_ADMIN_PAUSE_SECS`].
+    /// - Guardian: `duration` must be non-zero and at most
+    ///   [`MAX_GUARDIAN_PAUSE_SECS`] — guardians can never impose an
+    ///   indefinite pause, bounding the damage a compromised guardian key
+    ///   can do.
+    ///
+    /// Calling `pause` again on an already-paused domain refreshes
+    /// (overwrites) the existing record — this is intentionally idempotent
+    /// so a retried or duplicated transaction is safe. The one exception:
+    /// a guardian may never overwrite a pause that the admin established
+    /// (see `Panics`), preventing a guardian from weakening an admin lock.
+    ///
+    /// # Panics
+    /// - `"Contract not initialized"` — if `initialize` has not been called.
+    /// - `"Caller is not admin or guardian"` — unauthorized caller.
+    /// - `"Domain locked by admin; guardians cannot modify"` — a guardian
+    ///   attempted to overwrite an admin-established pause.
+    /// - `"Duration exceeds admin maximum"` / `"Guardian pause duration out of bounds"`.
+    pub fn pause(e: Env, caller: Address, domain: PauseDomain, duration: u64) {
+        caller.require_auth();
+
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::ProtocolWallet)
+            .expect("Contract not initialized");
+
+        let is_admin_caller = caller == admin;
+        if !is_admin_caller && !is_guardian_internal(&e, &caller) {
+            panic!("Caller is not admin or guardian");
+        }
+
+        let key = DataKey::PauseState(domain.clone());
+
+        if !is_admin_caller {
+            if let Some(existing) = e.storage().persistent().get::<_, PauseState>(&key) {
+                if existing.paused_by == admin {
+                    panic!("Domain locked by admin; guardians cannot modify");
+                }
+            }
+        }
+
+        let now = e.ledger().timestamp();
+        let expires_at = if is_admin_caller {
+            if duration == 0 {
+                0
+            } else {
+                if duration > MAX_ADMIN_PAUSE_SECS {
+                    panic!("Duration exceeds admin maximum");
+                }
+                now.saturating_add(duration)
+            }
+        } else {
+            if duration == 0 || duration > MAX_GUARDIAN_PAUSE_SECS {
+                panic!("Guardian pause duration out of bounds");
+            }
+            now.saturating_add(duration)
+        };
+
+        e.storage().persistent().set(
+            &key,
+            &PauseState {
+                paused_by: caller.clone(),
+                paused_at: now,
+                expires_at,
+            },
+        );
+
+        emit_pause_set(&e, &domain, &caller, expires_at);
+    }
+
+    /// Lift an active pause on `domain`.
+    ///
+    /// Idempotent: if the domain has no active pause record (never paused,
+    /// already lifted, or already expired), this is a deterministic no-op —
+    /// it does not panic, so duplicate or retried `unpause` calls are safe.
+    ///
+    /// # Authorization
+    /// Only the current admin (`ProtocolWallet`) may unpause, regardless of
+    /// whether the pause was originally set by the admin or a guardian.
+    ///
+    /// # Panics
+    /// - `"Contract not initialized"` — if `initialize` has not been called.
+    pub fn unpause(e: Env, domain: PauseDomain) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::ProtocolWallet)
+            .expect("Contract not initialized");
+        admin.require_auth();
+
+        let key = DataKey::PauseState(domain.clone());
+        if e.storage().persistent().get::<_, PauseState>(&key).is_none() {
+            return;
+        }
+
+        e.storage().persistent().remove(&key);
+        emit_pause_cleared(&e, &domain, &admin);
+    }
+
+    /// Returns `true` if `domain` is currently paused (and its pause has not
+    /// yet expired). Never requires authorization — this is a read.
+    pub fn is_paused(e: Env, domain: PauseDomain) -> bool {
+        is_domain_paused(&e, &domain)
+    }
+
+    /// Full observability view of a domain's pause status: who paused it,
+    /// when, and when it expires (or `None` for indefinite/unpaused).
+    pub fn pause_info(e: Env, domain: PauseDomain) -> PauseInfo {
+        match e
+            .storage()
+            .persistent()
+            .get::<_, PauseState>(&DataKey::PauseState(domain.clone()))
+        {
+            None => PauseInfo {
+                active: false,
+                paused_by: None,
+                paused_at: None,
+                expires_at: None,
+            },
+            Some(state) => {
+                let active = state.expires_at == 0 || e.ledger().timestamp() < state.expires_at;
+                PauseInfo {
+                    active,
+                    paused_by: Some(state.paused_by),
+                    paused_at: Some(state.paused_at),
+                    expires_at: if state.expires_at == 0 {
+                        None
+                    } else {
+                        Some(state.expires_at)
+                    },
+                }
+            }
+        }
+    }
+
+    /// Register a guardian address authorized to trigger (but never lift)
+    /// bounded-duration pauses. Bounded to [`MAX_GUARDIANS`] entries.
+    ///
+    /// Idempotent: adding an already-registered guardian is a no-op.
+    ///
+    /// # Authorization
+    /// Requires current admin (`ProtocolWallet`) authorization.
+    pub fn add_guardian(e: Env, guardian: Address) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::ProtocolWallet)
+            .expect("Contract not initialized");
+        admin.require_auth();
+
+        let mut guardians = get_guardians(&e);
+        if guardians.iter().any(|g| g == guardian) {
+            return;
+        }
+        if guardians.len() >= MAX_GUARDIANS {
+            panic!("Guardian limit reached");
+        }
+
+        guardians.push_back(guardian.clone());
+        e.storage().persistent().set(&DataKey::Guardians, &guardians);
+        emit_guardian_added(&e, guardian);
+    }
+
+    /// Revoke a guardian's pause authority.
+    ///
+    /// Idempotent: removing an address that is not a guardian is a no-op.
+    /// Does not affect any pause the guardian already set — use `unpause`
+    /// (admin-only) to lift it explicitly.
+    ///
+    /// # Authorization
+    /// Requires current admin (`ProtocolWallet`) authorization.
+    pub fn remove_guardian(e: Env, guardian: Address) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::ProtocolWallet)
+            .expect("Contract not initialized");
+        admin.require_auth();
+
+        let guardians = get_guardians(&e);
+        let mut remaining = Vec::new(&e);
+        let mut found = false;
+        for g in guardians.iter() {
+            if g == guardian {
+                found = true;
+                continue;
+            }
+            remaining.push_back(g);
+        }
+
+        if !found {
+            return;
+        }
+
+        e.storage().persistent().set(&DataKey::Guardians, &remaining);
+        emit_guardian_removed(&e, guardian);
+    }
+
+    /// Check whether `addr` currently holds guardian pause authority.
+    pub fn is_guardian(e: Env, addr: Address) -> bool {
+        is_guardian_internal(&e, &addr)
+    }
+
+    /// List all currently registered guardians (bounded to `MAX_GUARDIANS`).
+    pub fn list_guardians(e: Env) -> Vec<Address> {
+        get_guardians(&e)
+    }
+
     /// Return the contract's interface version as `(major, minor, patch)`.
     ///
     /// The value is a compile-time constant baked into the WASM binary.
@@ -916,7 +1254,7 @@ mod tests {
     fn version_returns_compile_time_constant() {
         let (env, contract_id) = setup();
         let client = TalosRegistryClient::new(&env, &contract_id);
-        assert_eq!(client.version(), (1u32, 1u32, 0u32));
+        assert_eq!(client.version(), (1u32, 2u32, 0u32));
     }
 
     #[test]
@@ -2060,5 +2398,636 @@ mod tests {
             }])
             .try_propose_admin(&new_admin);
         assert!(res_prop.is_err());
+    }
+
+    // ── Emergency Pause: helpers ───────────────────────────────────────
+
+    fn mock_pause(
+        env: &Env,
+        client: &TalosRegistryClient,
+        contract_id: &Address,
+        caller: &Address,
+        domain: &PauseDomain,
+        duration: u64,
+    ) {
+        client
+            .mock_auths(&[MockAuth {
+                address: caller,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "pause",
+                    args: (caller.clone(), domain.clone(), duration).into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .pause(caller, domain, &duration);
+    }
+
+    /// Returns `true` if the mocked `pause` call succeeded, `false` if it errored.
+    fn try_mock_pause(
+        env: &Env,
+        client: &TalosRegistryClient,
+        contract_id: &Address,
+        caller: &Address,
+        domain: &PauseDomain,
+        duration: u64,
+    ) -> bool {
+        client
+            .mock_auths(&[MockAuth {
+                address: caller,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "pause",
+                    args: (caller.clone(), domain.clone(), duration).into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_pause(caller, domain, &duration)
+            .is_ok()
+    }
+
+    fn mock_unpause(
+        env: &Env,
+        client: &TalosRegistryClient,
+        contract_id: &Address,
+        admin: &Address,
+        domain: &PauseDomain,
+    ) {
+        client
+            .mock_auths(&[MockAuth {
+                address: admin,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "unpause",
+                    args: (domain.clone(),).into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .unpause(domain);
+    }
+
+    fn mock_add_guardian(
+        env: &Env,
+        client: &TalosRegistryClient,
+        contract_id: &Address,
+        admin: &Address,
+        guardian: &Address,
+    ) {
+        client
+            .mock_auths(&[MockAuth {
+                address: admin,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "add_guardian",
+                    args: (guardian.clone(),).into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .add_guardian(guardian);
+    }
+
+    // ── Emergency Pause: scoping ────────────────────────────────────────
+
+    #[test]
+    fn pause_blocks_only_the_targeted_domain() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        client.initialize(&admin);
+
+        let id = create_talos_with_auth(&env, &client, &contract_id, &creator, &admin);
+
+        mock_pause(
+            &env,
+            &client,
+            &contract_id,
+            &admin,
+            &PauseDomain::TalosCreation,
+            0,
+        );
+
+        // Talos creation is blocked...
+        let ok = try_mock_pause(&env, &client, &contract_id, &admin, &PauseDomain::TalosCreation, 0);
+        assert!(ok); // re-pausing (refresh) is allowed
+        assert!(client.is_paused(&PauseDomain::TalosCreation));
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &creator,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_talos",
+                    args: (
+                        s(&env, "Second"),
+                        s(&env, "Marketing"),
+                        s(&env, "desc"),
+                        patron(&env, &creator),
+                        kernel(),
+                        pulse(&env),
+                        admin.clone(),
+                    )
+                        .into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_create_talos(
+                &s(&env, "Second"),
+                &s(&env, "Marketing"),
+                &s(&env, "desc"),
+                &patron(&env, &creator),
+                &kernel(),
+                &pulse(&env),
+                &admin,
+            )
+            .is_err());
+
+        // ...but every other write path and all reads remain functional.
+        assert!(!client.is_paused(&PauseDomain::PatronUpdates));
+        let updated_patron = Patron {
+            creator_share: 50,
+            investor_share: 30,
+            treasury_share: 20,
+            creator_addr: creator.clone(),
+            investor_addr: Address::generate(&env),
+            treasury_addr: Address::generate(&env),
+        };
+        client
+            .mock_auths(&[MockAuth {
+                address: &creator,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "update_patron",
+                    args: (id, updated_patron.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .update_patron(&id, &updated_patron);
+
+        assert!(client.get_talos(&id).is_some());
+        assert!(client.is_active(&id));
+    }
+
+    #[test]
+    fn reads_are_never_gated_by_pause() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        client.initialize(&admin);
+        let id = create_talos_with_auth(&env, &client, &contract_id, &creator, &admin);
+
+        for domain in [
+            PauseDomain::TalosCreation,
+            PauseDomain::PatronUpdates,
+            PauseDomain::KernelUpdates,
+            PauseDomain::PulseUpdates,
+            PauseDomain::Deactivation,
+        ] {
+            mock_pause(&env, &client, &contract_id, &admin, &domain, 0);
+        }
+
+        assert!(client.get_talos(&id).is_some());
+        assert!(client.is_active(&id));
+        assert_eq!(client.creator_of(&id), Some(creator));
+        assert_eq!(client.next_talos_id(), 2);
+    }
+
+    // ── Emergency Pause: roles & duration bounds ────────────────────────
+
+    #[test]
+    fn admin_can_pause_indefinitely_with_zero_duration() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        mock_pause(&env, &client, &contract_id, &admin, &PauseDomain::TalosCreation, 0);
+
+        let info = client.pause_info(&PauseDomain::TalosCreation);
+        assert!(info.active);
+        assert_eq!(info.expires_at, None);
+        assert_eq!(info.paused_by, Some(admin));
+    }
+
+    #[test]
+    fn admin_pause_duration_exceeding_max_is_rejected() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let ok = try_mock_pause(
+            &env,
+            &client,
+            &contract_id,
+            &admin,
+            &PauseDomain::TalosCreation,
+            MAX_ADMIN_PAUSE_SECS + 1,
+        );
+        assert!(!ok);
+    }
+
+    #[test]
+    fn guardian_can_pause_within_bounded_duration() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        client.initialize(&admin);
+        mock_add_guardian(&env, &client, &contract_id, &admin, &guardian);
+
+        mock_pause(
+            &env,
+            &client,
+            &contract_id,
+            &guardian,
+            &PauseDomain::TalosCreation,
+            3600,
+        );
+
+        let info = client.pause_info(&PauseDomain::TalosCreation);
+        assert!(info.active);
+        assert_eq!(info.paused_by, Some(guardian));
+        assert!(info.expires_at.is_some());
+    }
+
+    #[test]
+    fn guardian_pause_with_zero_duration_is_rejected() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        client.initialize(&admin);
+        mock_add_guardian(&env, &client, &contract_id, &admin, &guardian);
+
+        // duration = 0 would mean "indefinite" — guardians may never set that.
+        let ok = try_mock_pause(
+            &env,
+            &client,
+            &contract_id,
+            &guardian,
+            &PauseDomain::TalosCreation,
+            0,
+        );
+        assert!(!ok);
+    }
+
+    #[test]
+    fn guardian_pause_exceeding_max_duration_is_rejected() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        client.initialize(&admin);
+        mock_add_guardian(&env, &client, &contract_id, &admin, &guardian);
+
+        let ok = try_mock_pause(
+            &env,
+            &client,
+            &contract_id,
+            &guardian,
+            &PauseDomain::TalosCreation,
+            MAX_GUARDIAN_PAUSE_SECS + 1,
+        );
+        assert!(!ok);
+    }
+
+    #[test]
+    fn non_admin_non_guardian_cannot_pause() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        client.initialize(&admin);
+
+        let ok = try_mock_pause(
+            &env,
+            &client,
+            &contract_id,
+            &stranger,
+            &PauseDomain::TalosCreation,
+            3600,
+        );
+        assert!(!ok);
+    }
+
+    #[test]
+    fn pause_requires_caller_auth() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        // No mock_auths supplied → auth check must fail.
+        let res = client.try_pause(&admin, &PauseDomain::TalosCreation, &0);
+        assert!(res.is_err());
+    }
+
+    // ── Emergency Pause: guardian containment ───────────────────────────
+
+    #[test]
+    fn guardian_cannot_override_admin_established_pause() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        client.initialize(&admin);
+        mock_add_guardian(&env, &client, &contract_id, &admin, &guardian);
+
+        mock_pause(&env, &client, &contract_id, &admin, &PauseDomain::TalosCreation, 0);
+
+        let ok = try_mock_pause(
+            &env,
+            &client,
+            &contract_id,
+            &guardian,
+            &PauseDomain::TalosCreation,
+            3600,
+        );
+        assert!(!ok);
+
+        // The admin's indefinite pause is untouched.
+        let info = client.pause_info(&PauseDomain::TalosCreation);
+        assert_eq!(info.paused_by, Some(admin));
+        assert_eq!(info.expires_at, None);
+    }
+
+    #[test]
+    fn admin_can_override_guardian_pause() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        client.initialize(&admin);
+        mock_add_guardian(&env, &client, &contract_id, &admin, &guardian);
+
+        mock_pause(
+            &env,
+            &client,
+            &contract_id,
+            &guardian,
+            &PauseDomain::TalosCreation,
+            3600,
+        );
+        mock_pause(&env, &client, &contract_id, &admin, &PauseDomain::TalosCreation, 0);
+
+        let info = client.pause_info(&PauseDomain::TalosCreation);
+        assert_eq!(info.paused_by, Some(admin));
+        assert_eq!(info.expires_at, None);
+    }
+
+    #[test]
+    fn only_admin_can_unpause_a_guardian_set_pause() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        client.initialize(&admin);
+        mock_add_guardian(&env, &client, &contract_id, &admin, &guardian);
+
+        mock_pause(
+            &env,
+            &client,
+            &contract_id,
+            &guardian,
+            &PauseDomain::TalosCreation,
+            3600,
+        );
+
+        // Guardian cannot unpause its own pause.
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &guardian,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "unpause",
+                    args: (PauseDomain::TalosCreation,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_unpause(&PauseDomain::TalosCreation);
+        assert!(res.is_err());
+
+        // Admin can.
+        mock_unpause(&env, &client, &contract_id, &admin, &PauseDomain::TalosCreation);
+        assert!(!client.is_paused(&PauseDomain::TalosCreation));
+    }
+
+    // ── Emergency Pause: expiration & idempotency ───────────────────────
+
+    #[test]
+    fn guardian_pause_auto_expires() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        let creator = Address::generate(&env);
+        client.initialize(&admin);
+        mock_add_guardian(&env, &client, &contract_id, &admin, &guardian);
+
+        mock_pause(
+            &env,
+            &client,
+            &contract_id,
+            &guardian,
+            &PauseDomain::TalosCreation,
+            3600,
+        );
+        assert!(client.is_paused(&PauseDomain::TalosCreation));
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 3601;
+        });
+
+        assert!(!client.is_paused(&PauseDomain::TalosCreation));
+
+        // The domain is writable again without any explicit unpause call.
+        create_talos_with_auth(&env, &client, &contract_id, &creator, &admin);
+    }
+
+    #[test]
+    fn unpause_on_a_domain_with_no_active_pause_is_a_deterministic_noop() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        // Never paused — must not panic.
+        mock_unpause(&env, &client, &contract_id, &admin, &PauseDomain::TalosCreation);
+
+        // Pause, unpause, then unpause again (duplicate/retried call) — still must not panic.
+        mock_pause(&env, &client, &contract_id, &admin, &PauseDomain::TalosCreation, 0);
+        mock_unpause(&env, &client, &contract_id, &admin, &PauseDomain::TalosCreation);
+        mock_unpause(&env, &client, &contract_id, &admin, &PauseDomain::TalosCreation);
+
+        assert!(!client.is_paused(&PauseDomain::TalosCreation));
+    }
+
+    // ── Emergency Pause: guardian roster management ─────────────────────
+
+    #[test]
+    fn add_guardian_is_idempotent_and_admin_only() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        client.initialize(&admin);
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &stranger,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "add_guardian",
+                    args: (guardian.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_add_guardian(&guardian);
+        assert!(res.is_err());
+
+        mock_add_guardian(&env, &client, &contract_id, &admin, &guardian);
+        assert!(client.is_guardian(&guardian));
+        assert_eq!(client.list_guardians().len(), 1);
+
+        // Re-adding is a no-op, not an error, and does not duplicate the entry.
+        mock_add_guardian(&env, &client, &contract_id, &admin, &guardian);
+        assert_eq!(client.list_guardians().len(), 1);
+    }
+
+    #[test]
+    fn remove_guardian_is_idempotent_and_admin_only() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        client.initialize(&admin);
+        mock_add_guardian(&env, &client, &contract_id, &admin, &guardian);
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &guardian,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "remove_guardian",
+                    args: (guardian.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_remove_guardian(&guardian);
+        assert!(res.is_err());
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "remove_guardian",
+                    args: (guardian.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .remove_guardian(&guardian);
+        assert!(!client.is_guardian(&guardian));
+
+        // Removing again is a deterministic no-op.
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "remove_guardian",
+                    args: (guardian.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .remove_guardian(&guardian);
+    }
+
+    #[test]
+    fn guardian_roster_is_bounded() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        for _ in 0..MAX_GUARDIANS {
+            let g = Address::generate(&env);
+            mock_add_guardian(&env, &client, &contract_id, &admin, &g);
+        }
+
+        let one_too_many = Address::generate(&env);
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "add_guardian",
+                    args: (one_too_many.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_add_guardian(&one_too_many);
+        assert!(res.is_err());
+        assert_eq!(client.list_guardians().len(), MAX_GUARDIANS);
+    }
+
+    // ── Emergency Pause: events ──────────────────────────────────────────
+
+    #[test]
+    fn pause_and_unpause_emit_events() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        mock_pause(&env, &client, &contract_id, &admin, &PauseDomain::TalosCreation, 0);
+        let events = env.events().all();
+        let (_, topics, data) = events.get(events.len() - 1).unwrap();
+        assert_topic_symbol(&env, &topics, 0, symbol_short!("pause_on"));
+        let (actor, expires_at): (Address, u64) = TryFromVal::try_from_val(&env, &data).unwrap();
+        assert_eq!(actor, admin);
+        assert_eq!(expires_at, 0);
+
+        mock_unpause(&env, &client, &contract_id, &admin, &PauseDomain::TalosCreation);
+        let events = env.events().all();
+        let (_, topics, data) = events.get(events.len() - 1).unwrap();
+        assert_topic_symbol(&env, &topics, 0, symbol_short!("pause_off"));
+        let (actor,): (Address,) = TryFromVal::try_from_val(&env, &data).unwrap();
+        assert_eq!(actor, admin);
+    }
+
+    #[test]
+    fn guardian_management_emits_events() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        client.initialize(&admin);
+
+        mock_add_guardian(&env, &client, &contract_id, &admin, &guardian);
+        let events = env.events().all();
+        let (_, topics, data) = events.get(events.len() - 1).unwrap();
+        assert_topic_symbol(&env, &topics, 0, symbol_short!("guard_add"));
+        let (got,): (Address,) = TryFromVal::try_from_val(&env, &data).unwrap();
+        assert_eq!(got, guardian);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "remove_guardian",
+                    args: (guardian.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .remove_guardian(&guardian);
+        let events = env.events().all();
+        let (_, topics, data) = events.get(events.len() - 1).unwrap();
+        assert_topic_symbol(&env, &topics, 0, symbol_short!("guard_rem"));
+        let (got,): (Address,) = TryFromVal::try_from_val(&env, &data).unwrap();
+        assert_eq!(got, guardian);
     }
 }

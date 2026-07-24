@@ -14,8 +14,9 @@ Stellar-based smart contracts for the Talos Protocol, built with Rust and the So
   - 3% protocol fee to protocol wallet on creation
   - **Two-step admin transfer** (`propose_admin` / `accept_admin` / `cancel_admin_transfer`)
   - **Admin timelocks** (`schedule_action` / `execute_action` / `cancel_action` / `set_timelock_config`)
-  - **Interface version query** (`version()` — immutable, compile-time constant `(1, 1, 0)`)
-  - Events: `tls_crt`, `pat_upd`, `fee_chg`, `adm_prp`, `adm_acc`, `adm_cnl`, `tl_sch`, `tl_exec`, `tl_cnl`, `tl_cfg`
+  - **Scoped emergency pause controls** (`pause` / `unpause` / `add_guardian` / `remove_guardian`) — see [Emergency Pause Controls](#emergency-pause-controls)
+  - **Interface version query** (`version()` — immutable, compile-time constant `(1, 2, 0)`)
+  - Events: `tls_crt`, `pat_upd`, `fee_chg`, `adm_prp`, `adm_acc`, `adm_cnl`, `tl_sch`, `tl_exec`, `tl_cnl`, `tl_cfg`, `pause_on`, `pause_off`, `guard_add`, `guard_rem`
 
 ### 2. TalosNameService
 - **Purpose**: Human-readable name registration for Talos IDs
@@ -24,8 +25,9 @@ Stellar-based smart contracts for the Talos Protocol, built with Rust and the So
   - Validation: 3-32 chars, lowercase alphanumeric + hyphens, no consecutive hyphens
   - Admin-controlled registry contract pointer (`set_registry_contract`)
   - **Admin timelocks** (`schedule_action` / `execute_action` / `cancel_action` / `set_timelock_config`)
-  - **Interface version query** (`version()` — immutable, compile-time constant `(1, 1, 0)`)
-  - Events: `name_reg`, `tl_sch`, `tl_exec`, `tl_cnl`, `tl_cfg`
+  - **Scoped emergency pause controls** (`pause` / `unpause` / `add_guardian` / `remove_guardian`) — see [Emergency Pause Controls](#emergency-pause-controls)
+  - **Interface version query** (`version()` — immutable, compile-time constant `(1, 2, 0)`)
+  - Events: `name_reg`, `tl_sch`, `tl_exec`, `tl_cnl`, `tl_cfg`, `pause_on`, `pause_off`, `guard_add`, `guard_rem`
 
 ### 3. TalosGovernance
 - **Purpose**: Token-weighted governance for Talos Protocol
@@ -266,6 +268,9 @@ stellar contract invoke \
 | "Timelock enabled: action must be scheduled" | min_delay > 0 | Use `schedule_action` then `execute_action` |
 | "Timelock delay not met" | Executed before ETA | Wait for `eta` ledger timestamp |
 | "Proposal expired" | Executed after grace window | Re-schedule; old proposal is permanently expired |
+| "Domain is paused" / `ContractError::DomainPaused` | A guardian or the admin paused that write path | Wait for the pause to expire, or have the admin call `unpause` |
+| "Caller is not admin or guardian" | Non-authorized address called `pause` | Have the admin add the caller via `add_guardian`, or use the admin key |
+| "Domain locked by admin; guardians cannot modify" | A guardian tried to override an admin-set pause | Only the admin can change or lift it — call `unpause` with the admin key |
 
 ## Invoke Examples
 
@@ -340,6 +345,10 @@ Both contracts emit typed Soroban events on every meaningful state change. Off-c
 | `tl_exec` | `(symbol_short!("tl_exec"), proposal_id: u64)` | `(action: AdminAction, executor: Address)` | `execute_action` success |
 | `tl_cnl`  | `(symbol_short!("tl_cnl"), proposal_id: u64)` | `(action: AdminAction, canceller: Address)` | `cancel_action` success |
 | `tl_cfg`  | `(symbol_short!("tl_cfg"),)` | `(old_min_delay: u64, new_min_delay: u64, grace_period: u64)` | `set_timelock_config` success |
+| `pause_on`  | `(symbol_short!("pause_on"), domain: PauseDomain)` | `(actor: Address, expires_at: u64)` | `pause` success (`expires_at = 0` means indefinite) |
+| `pause_off` | `(symbol_short!("pause_off"), domain: PauseDomain)` | `(actor: Address,)` | `unpause` success (never emitted for a no-op unpause) |
+| `guard_add` | `(symbol_short!("guard_add"),)` | `(guardian: Address,)` | `add_guardian` success |
+| `guard_rem` | `(symbol_short!("guard_rem"),)` | `(guardian: Address,)` | `remove_guardian` success |
 
 **Filtering examples**
 
@@ -641,12 +650,170 @@ stellar contract invoke \
 4. **Timelocks are per-contract, not cross-contract**: A Registry timelock and a Name Service timelock are fully independent. There is no coordinated multi-contract proposal mechanism.
 5. **Proposal IDs are sequential per contract**: IDs are 1-indexed u64 counters. They are never reused or removed from storage.
 
+## Emergency Pause Controls
+
+`TalosRegistry` and `TalosNameService` both implement a narrowly-scoped emergency pause mechanism for containing a compromised or buggy write path without disabling reads, and without permanently centralizing control in a single always-on kill switch.
+
+### Design goals
+
+| Goal | How it is met |
+|------|--------------|
+| Narrow blast radius | Each **pause domain** gates exactly one write path (e.g. `TalosCreation`). Pausing one domain never affects any other domain or any read entry-point. |
+| Fast containment | `pause` requires no timelock — it is deliberately the *fastest* lever in the contract, usable the moment a problem is discovered. |
+| Bounded guardian risk | A **guardian** role can trigger a pause but can never lift one, and can never set an indefinite pause — the maximum a compromised guardian key can do is force a temporary (≤ 7 day), auto-expiring, single-domain outage. |
+| No permanent centralization | Guardian pauses always expire on their own even if nobody calls `unpause`. Only the admin may set an indefinite pause (`duration = 0`), and only the admin may lift any pause. |
+| Admin lock is not overridable by guardians | If the admin pauses a domain, a guardian cannot refresh, shorten, or otherwise modify that pause — only the admin can change or lift it. |
+| Reads always work | `get_talos`, `is_active`, `resolve_name`, `is_name_available`, etc. never consult pause state. Dashboards, indexers, and off-chain agents keep functioning during a pause. |
+| Backward-compatible default | No domain is paused until `pause` is explicitly called. Existing deployed instances that never call `pause` behave exactly as before this feature shipped. |
+| Idempotent, retry-safe | Re-pausing an already-paused domain refreshes it deterministically instead of failing. Calling `unpause` on a domain with no active pause is a silent no-op, not a panic — safe for duplicate or retried transactions. |
+| Observability | Every state transition emits an event (`pause_on` / `pause_off` / `guard_add` / `guard_rem`) carrying the actor and new expiry, and `pause_info` exposes the same data for on-demand polling. |
+
+### Roles
+
+| Role | Can pause | Can unpause | Duration rules | Managed by |
+|------|-----------|-------------|-----------------|------------|
+| **Admin** (`ProtocolWallet` / `Admin`) | Any domain | Any domain, regardless of who paused it | `duration = 0` → indefinite; non-zero must be ≤ 30 days | N/A (the protocol admin) |
+| **Guardian** | Any domain *not already admin-paused* | Never | Must be non-zero and ≤ 7 days — indefinite pauses are impossible for a guardian | `add_guardian` / `remove_guardian` (admin-only, bounded to 10 guardians) |
+| Anyone else | No | No | — | — |
+
+Guardians exist so an on-call responder (a bot, a multisig signer, an ops key with narrower trust than the protocol admin) can contain a live incident in one transaction without waiting on the admin key, while structurally bounding what that narrower-trust key can do: it cannot lock the protocol forever, and it cannot lift a pause the admin has already escalated.
+
+### Pause domains
+
+#### TalosRegistry
+
+| Domain | Gates |
+|--------|-------|
+| `TalosCreation` | `create_talos` |
+| `PatronUpdates` | `update_patron` |
+| `KernelUpdates` | `update_kernel` |
+| `PulseUpdates` | `update_pulse` |
+| `Deactivation` | `deactivate_talos` |
+
+#### TalosNameService
+
+| Domain | Gates |
+|--------|-------|
+| `NameRegistration` | `register_name` |
+
+Administrative entry-points (`set_protocol_fee`, admin transfer, `set_registry_contract`, all timelock management, and pause/guardian management itself) are **intentionally never pausable**. They already carry their own admin-auth (and optionally timelock) protection, and making the escape hatch itself pausable would risk a state where the protocol can no longer be unpaused at all.
+
+### State model
+
+```
+                     pause(caller, domain, duration)
+                                  │
+                                  ▼
+   (no record) ──────────────► PauseState { paused_by, paused_at, expires_at }
+        ▲                                │
+        │                                │ expires_at == 0 → indefinite (admin only)
+        │        unpause(domain)         │ expires_at  > 0 → lifts automatically once
+        └────────── (admin-only) ────────┘                    now >= expires_at (no write needed)
+```
+
+`is_paused(domain)` (and every gated entry-point internally) evaluates expiry lazily against `ledger().timestamp()` — an expired guardian pause needs no explicit `unpause` call to stop blocking writes.
+
+### Entry-points
+
+*(identical shape on both contracts; `TalosNameService` sources the admin from `Admin` instead of `ProtocolWallet`)*
+
+| Entry-point | Auth | Description |
+|-------------|------|-------------|
+| `pause(caller, domain, duration)` | Admin or guardian (`caller` must sign) | Pauses `domain`. See [Roles](#roles) for duration bounds. Idempotent refresh; guardians cannot overwrite an admin-set pause. |
+| `unpause(domain)` | Admin | Lifts an active pause. No-op (does not panic) if the domain has no active pause record. |
+| `is_paused(domain)` | None (read-only) | `true` if `domain` is currently paused and not yet expired. |
+| `pause_info(domain)` | None (read-only) | Full status: `active`, `paused_by`, `paused_at`, `expires_at` (`None` = not paused, or paused indefinitely). |
+| `add_guardian(guardian)` | Admin | Registers a guardian. Idempotent; bounded to 10 guardians. |
+| `remove_guardian(guardian)` | Admin | Revokes a guardian. Idempotent. Does not affect any pause that guardian already set. |
+| `is_guardian(addr)` | None (read-only) | `true` if `addr` currently holds guardian authority. |
+| `list_guardians()` | None (read-only) | Returns all registered guardians. |
+
+### Storage
+
+| Key | Type | Lifecycle |
+|-----|------|-----------|
+| `PauseState(domain)` | `PauseState { paused_by, paused_at, expires_at }` | Written by `pause`. Removed by `unpause`. Lazily treated as inactive once `expires_at` passes, without a storage write. |
+| `Guardians` | `Vec<Address>` | Written by `add_guardian` / `remove_guardian`. Bounded to 10 entries — absent means no guardians registered. |
+
+Both keys are new additions to each contract's `DataKey` enum. Existing deployed instances that have never called `pause` or `add_guardian` simply have no entries for these keys — `is_paused` returns `false` and `list_guardians` returns an empty vector, so no migration is required and no existing behavior changes until an operator opts in.
+
+### Operational runbook
+
+#### Containing an incident (guardian, fast path)
+
+```bash
+# A guardian bounds the outage to at most 1 hour on a single write path.
+stellar contract invoke \
+  --id "$REGISTRY_CONTRACT" \
+  --source guardian-key \
+  --network testnet \
+  -- \
+  pause \
+  --caller GGUARDIAN... \
+  --domain '{"TalosCreation": {}}' \
+  --duration 3600
+
+# Confirm:
+stellar contract invoke --id "$REGISTRY_CONTRACT" --network testnet -- \
+  pause_info --domain '{"TalosCreation": {}}'
+```
+
+#### Escalating to an indefinite admin lock
+
+```bash
+stellar contract invoke \
+  --id "$REGISTRY_CONTRACT" \
+  --source admin-key \
+  --network testnet \
+  -- \
+  pause \
+  --caller GADMIN... \
+  --domain '{"TalosCreation": {}}' \
+  --duration 0
+```
+
+#### Rollback — lifting a pause once the fix is deployed or the incident is resolved
+
+```bash
+stellar contract invoke \
+  --id "$REGISTRY_CONTRACT" \
+  --source admin-key \
+  --network testnet \
+  -- \
+  unpause \
+  --domain '{"TalosCreation": {}}'
+
+# Idempotent — safe to call again even if it was already lifted or had expired.
+```
+
+If the admin key itself is unavailable, no action is required for a guardian-initiated pause: it lifts on its own within at most 7 days by construction. There is deliberately no way to make a pause permanently unrecoverable short of losing the admin key entirely — the same trust assumption the rest of the contract's admin surface already relies on.
+
+#### Managing guardians
+
+```bash
+stellar contract invoke --id "$REGISTRY_CONTRACT" --source admin-key --network testnet -- \
+  add_guardian --guardian GGUARDIAN...
+
+stellar contract invoke --id "$REGISTRY_CONTRACT" --source admin-key --network testnet -- \
+  remove_guardian --guardian GGUARDIAN...
+
+stellar contract invoke --id "$REGISTRY_CONTRACT" --network testnet -- \
+  list_guardians
+```
+
+### Known limitations
+
+1. **Pause state is per-contract, not cross-contract**: pausing `TalosRegistry::TalosCreation` has no effect on `TalosNameService::NameRegistration`, and vice versa — mirrors the existing per-contract scope of admin timelocks.
+2. **Guardian removal does not retroactively lift an active pause**: revoking a guardian stops them from pausing again, but a pause they already set continues to run until it expires or the admin calls `unpause`.
+3. **`add_guardian` / `remove_guardian` are not timelocked**: like `set_timelock_config`, guardian roster changes take effect immediately by design, since they are part of the emergency-response surface itself.
+4. **Guardian list is bounded to 10 entries**: a well-intentioned operator adding more must first remove an existing guardian; this is a deliberate bound on unbounded storage growth, not a governance mechanism.
+
 ## Interface Versioning
 
 Both `TalosRegistry` and `TalosNameService` expose a `version()` entry-point that returns the contract's interface version as `(major: u32, minor: u32, patch: u32)`.
 
-Current version: **`(1, 1, 0)`**  
-_(minor bumped from `1.0.0` when timelock entry-points were added in this release)_
+Current version: **`(1, 2, 0)`**  
+_(minor bumped from `1.1.0` when the scoped emergency pause entry-points were added in this release)_
 
 ```bash
 # Query TalosRegistry version
@@ -743,6 +910,7 @@ The test suites live in each contract's `#[cfg(test)] mod tests` block and cover
 - Two-step admin transfer (propose → accept → cancel paths)
 - Event emission for every state transition
 - Interface version consistency
+- Emergency pause: per-domain scoping (pausing one domain never blocks another, reads always succeed), admin vs. guardian authorization and duration bounds, guardian-cannot-override-admin-lock and admin-can-override-guardian invariants, auto-expiry without an explicit `unpause`, idempotent `pause`/`unpause`/`add_guardian`/`remove_guardian` under duplicate calls, and guardian roster bounds
 
 ## License
 
