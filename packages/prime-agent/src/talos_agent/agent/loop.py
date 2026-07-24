@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import TYPE_CHECKING
 
 from openai import AsyncOpenAI
+from opentelemetry.trace import SpanKind
 from rich.console import Console
 
+from talos_agent import metrics
 from talos_agent.agent.context import AgentContext
 from talos_agent.agent.prompt import build_system_prompt
 from talos_agent.http import call_with_retry
+from talos_agent.tracing import traced_span
 
 if TYPE_CHECKING:
     from talos_agent.config import Settings
@@ -65,14 +69,36 @@ async def agent_loop(
 
         console.print(f"[dim]Agent iteration {iteration + 1}...[/dim]")
 
-        response = await call_with_retry(
-            lambda: client.chat.completions.create(
-                model=settings.llm_model,
-                messages=messages,
-                tools=tool_schemas if tool_schemas else None,
-                tool_choice="auto" if tool_schemas else None,
+        llm_start = time.monotonic()
+        llm_outcome = "success"
+        try:
+            with traced_span(
+                "llm.chat_completion",
+                {
+                    "llm.model": settings.llm_model,
+                    "llm.iteration": iteration + 1,
+                    "llm.tool_count": len(tool_schemas),
+                },
+                kind=SpanKind.CLIENT,
+            ) as llm_span:
+                response = await call_with_retry(
+                    lambda: client.chat.completions.create(
+                        model=settings.llm_model,
+                        messages=messages,
+                        tools=tool_schemas if tool_schemas else None,
+                        tool_choice="auto" if tool_schemas else None,
+                    )
+                )
+                finish_reason = response.choices[0].finish_reason
+                if finish_reason:
+                    llm_span.set_attribute("llm.finish_reason", finish_reason)
+        except Exception:
+            llm_outcome = "error"
+            raise
+        finally:
+            metrics.record_llm_call(
+                settings.llm_model, llm_outcome, time.monotonic() - llm_start
             )
-        )
 
         msg = response.choices[0].message
 

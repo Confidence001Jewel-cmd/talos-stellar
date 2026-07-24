@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { tlsTalos, tlsRevenues } from "@/db/schema";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { verifyAgentApiKey } from "@/lib/auth";
+import { withTraceContext } from "@/lib/tracing";
 
 // GET /api/talos/:id/revenue — Get revenue history
 export async function GET(
@@ -48,7 +49,7 @@ export async function GET(
 
 // POST /api/talos/:id/revenue — Report revenue (from Local Agent)
 // All revenue stays in Agent Treasury. No distribution to external wallets.
-export async function POST(
+async function handlePost(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
@@ -109,3 +110,5 @@ export async function POST(
     return Response.json({ error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const POST = withTraceContext(handlePost);

@@ -3,9 +3,10 @@ import { db } from "@/db";
 import { tlsTalos, tlsCommerceServices } from "@/db/schema";
 import { and, desc, eq, ilike, lt, ne, or } from "drizzle-orm";
 import { parseLimit } from "@/lib/parse-limit";
+import { withTraceContext } from "@/lib/tracing";
 
 // GET /api/services — Discover available services across all TALOS agents
-export async function GET(request: NextRequest) {
+async function handleGet(request: NextRequest) {
   try {
     const { searchParams } = request.nextUrl;
     const category = searchParams.get("category");
@@ -92,3 +93,5 @@ export async function GET(request: NextRequest) {
     return Response.json({ error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const GET = withTraceContext(handleGet);

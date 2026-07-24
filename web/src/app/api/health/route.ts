@@ -9,6 +9,5 @@
  *   GET /api/health/ready  — readiness (DB + Stellar checks)
  */
 
-// Turbopack requires `runtime` to be a direct export — re-exports are rejected.
-export const runtime = "nodejs";
 export { GET } from "./ready/route";
+export const runtime = "nodejs";

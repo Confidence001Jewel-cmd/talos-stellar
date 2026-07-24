@@ -3,9 +3,10 @@ import { db } from "@/db";
 import { tlsTalos, tlsApprovals, tlsPatrons } from "@/db/schema";
 import { and, eq, sql } from "drizzle-orm";
 import { recordApprovalOnChain, verifyStellarSignature } from "@/lib/stellar";
+import { withTraceContext } from "@/lib/tracing";
 
 // PATCH /api/talos/:id/approvals/:approvalId — Approve/reject
-export async function PATCH(
+async function handlePatch(
   request: NextRequest,
   { params }: { params: Promise<{ id: string; approvalId: string }> }
 ) {
@@ -111,3 +112,5 @@ export async function PATCH(
     return Response.json({ error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const PATCH = withTraceContext(handlePatch);

@@ -5,10 +5,11 @@ import { eq } from "drizzle-orm";
 import { verifyAgentApiKey } from "@/lib/auth";
 import { signX402Payment } from "@/lib/stellar-x402";
 import { signPaymentSchema, parseBody } from "@/lib/schemas";
+import { withTraceContext } from "@/lib/tracing";
 
 // POST /api/talos/:id/sign — Signing proxy for Stellar x402 payments
 // Agent sends payment details, Web signs via Stellar ED25519, returns payment token
-export async function POST(
+async function handlePost(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
@@ -93,3 +94,5 @@ export async function POST(
     return Response.json({ error: "Signing failed" }, { status: 500 });
   }
 }
+
+export const POST = withTraceContext(handlePost);

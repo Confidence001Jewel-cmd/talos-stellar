@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
+from talos_agent import metrics
 from talos_agent.config import Settings
-from talos_agent.http import request_with_retry
+from talos_agent.http import RetryableHTTPError, request_with_retry
+from talos_agent.tracing import inject_trace_headers, traced_span
+from opentelemetry.trace import SpanKind
 
 
 class TalosAPIClient:
@@ -23,19 +28,67 @@ class TalosAPIClient:
             timeout=30.0,
         )
 
-    # ── Retry-wrapped HTTP verbs ──────────────────────────
+    # ── Retry-wrapped, traced HTTP verbs ──────────────────
+
+    async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        """Single choke point for all Web API calls: span + trace-header
+        injection + retry-count/status metrics, on top of the existing
+        request_with_retry backoff. Every public method below funnels
+        through this instead of calling httpx directly.
+        """
+        path = urlsplit(url).path or url
+        start = time.monotonic()
+        retry_count = 0
+
+        with traced_span(
+            f"web_api.{method} {path}",
+            {"http.request.method": method, "url.path": path},
+            kind=SpanKind.CLIENT,
+        ) as span:
+            # Inject only after the span above is current, so the
+            # traceparent we send actually points at *this* span.
+            headers = dict(kwargs.pop("headers", None) or {})
+            inject_trace_headers(headers)
+            kwargs["headers"] = headers
+
+            send = getattr(self._client, method.lower())
+            response: httpx.Response | None = None
+            status_code = 0
+            try:
+
+                async def _do_send() -> httpx.Response:
+                    nonlocal retry_count
+                    if retry_count > 0:
+                        span.add_event("http.retry", {"http.retry.count": retry_count})
+                    retry_count += 1
+                    return await send(url, **kwargs)
+
+                response = await request_with_retry(_do_send)
+                status_code = response.status_code
+                span.set_attribute("http.response.status_code", status_code)
+                span.set_attribute("http.retry.count", max(0, retry_count - 1))
+                return response
+            except RetryableHTTPError as exc:
+                status_code = exc.status_code
+                span.set_attribute("http.response.status_code", status_code)
+                span.set_attribute("http.retry.count", max(0, retry_count - 1))
+                raise
+            finally:
+                metrics.record_http_call(
+                    status_code, max(0, retry_count - 1), time.monotonic() - start
+                )
 
     async def _get(self, url: str, **kwargs: Any) -> httpx.Response:
-        return await request_with_retry(lambda: self._client.get(url, **kwargs))
+        return await self._request("GET", url, **kwargs)
 
     async def _post(self, url: str, **kwargs: Any) -> httpx.Response:
-        return await request_with_retry(lambda: self._client.post(url, **kwargs))
+        return await self._request("POST", url, **kwargs)
 
     async def _put(self, url: str, **kwargs: Any) -> httpx.Response:
-        return await request_with_retry(lambda: self._client.put(url, **kwargs))
+        return await self._request("PUT", url, **kwargs)
 
     async def _patch(self, url: str, **kwargs: Any) -> httpx.Response:
-        return await request_with_retry(lambda: self._client.patch(url, **kwargs))
+        return await self._request("PATCH", url, **kwargs)
 
     # ── Talos Config ──────────────────────────────────────
 
@@ -346,7 +399,15 @@ class TalosAPIClient:
 
     async def get_distribution_preview(self, talos_id: str) -> dict | None:
         """Preview dividend distribution without executing."""
-        r = await self._client.get(f"/api/talos/{talos_id}/revenue/distribute")
+        path = f"/api/talos/{talos_id}/revenue/distribute"
+        with traced_span(
+            f"web_api.GET {path}",
+            {"http.request.method": "GET", "url.path": path},
+            kind=SpanKind.CLIENT,
+        ) as span:
+            headers = inject_trace_headers({})
+            r = await self._client.get(path, headers=headers)
+            span.set_attribute("http.response.status_code", r.status_code)
         if r.status_code == 200:
             return r.json()
         return None
@@ -354,11 +415,25 @@ class TalosAPIClient:
     async def distribute_dividends(
         self, talos_id: str, *, requester_public_key: str
     ) -> dict | None:
-        """Execute dividend distribution to patrons."""
-        r = await self._client.post(
-            f"/api/talos/{talos_id}/revenue/distribute",
-            json={"requesterPublicKey": requester_public_key},
-        )
+        """Execute dividend distribution to patrons.
+
+        Deliberately not routed through the retrying ``_post`` helper — this
+        is a money-moving write, and retrying it on a lost 5xx response
+        could double-distribute if the first attempt actually succeeded
+        server-side. Traced (for latency/failure visibility) but not
+        retried, same as before this change.
+        """
+        path = f"/api/talos/{talos_id}/revenue/distribute"
+        with traced_span(
+            f"web_api.POST {path}",
+            {"http.request.method": "POST", "url.path": path},
+            kind=SpanKind.CLIENT,
+        ) as span:
+            headers = inject_trace_headers({})
+            r = await self._client.post(
+                path, json={"requesterPublicKey": requester_public_key}, headers=headers
+            )
+            span.set_attribute("http.response.status_code", r.status_code)
         if r.status_code in (200, 201):
             return r.json()
         try:

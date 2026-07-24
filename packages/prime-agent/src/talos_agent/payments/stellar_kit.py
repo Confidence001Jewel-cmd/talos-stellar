@@ -11,9 +11,11 @@ import os
 from typing import Any
 
 import httpx
+from opentelemetry.trace import SpanKind
 from rich.console import Console
 
 from talos_agent.http import request_with_retry
+from talos_agent.tracing import traced_span
 
 _HORIZON_URL = os.getenv("STELLAR_HORIZON_URL", "https://horizon-testnet.stellar.org")
 
@@ -43,43 +45,55 @@ class StellarKit:
 
     async def get_balance(self, account_id: str = "") -> dict[str, Any]:
         """Query XLM balance via Horizon (public API)."""
-        try:
-            talos = await self._api.get_talos(self._api._talos_id)
-            acct = account_id or (talos.get("stellarAccountId", "") if talos else "")
-            if not acct:
-                return {"error": "No Stellar account configured"}
-            # Horizon is public — no auth needed
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                r = await request_with_retry(
-                    lambda: client.get(f"{_HORIZON_URL}/accounts/{acct}")
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    balance = data.get("balances", [])
-                    xlm_balance = next((b for b in balance if b.get("asset_type") == "native"), None)
-                    if xlm_balance:
-                        return {"balance_xlm": float(xlm_balance["balance"]), "account": acct}
-                    return {"balance_xlm": 0, "account": acct}
-            return {"error": "Horizon query failed"}
-        except Exception as e:
-            return {"error": f"Balance query failed: {e}"}
+        with traced_span(
+            "stellar.horizon.get_account",
+            {"stellar.operation": "get_account", "stellar.asset": "native"},
+            kind=SpanKind.CLIENT,
+        ) as span:
+            try:
+                talos = await self._api.get_talos(self._api._talos_id)
+                acct = account_id or (talos.get("stellarAccountId", "") if talos else "")
+                if not acct:
+                    return {"error": "No Stellar account configured"}
+                # Horizon is public — no auth needed
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    r = await request_with_retry(
+                        lambda: client.get(f"{_HORIZON_URL}/accounts/{acct}")
+                    )
+                    span.set_attribute("http.response.status_code", r.status_code)
+                    if r.status_code == 200:
+                        data = r.json()
+                        balance = data.get("balances", [])
+                        xlm_balance = next((b for b in balance if b.get("asset_type") == "native"), None)
+                        if xlm_balance:
+                            return {"balance_xlm": float(xlm_balance["balance"]), "account": acct}
+                        return {"balance_xlm": 0, "account": acct}
+                return {"error": "Horizon query failed"}
+            except Exception as e:
+                return {"error": f"Balance query failed: {e}"}
 
     async def get_token_balance(self, account_id: str, token_id: str) -> dict[str, Any]:
         """Query Stellar asset balance via Horizon."""
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                r = await request_with_retry(
-                    lambda: client.get(f"{_HORIZON_URL}/accounts/{account_id}")
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    balances = data.get("balances", [])
-                    token_balance = next((b for b in balances if b.get("asset_code") == token_id), None)
-                    balance = float(token_balance["balance"]) if token_balance else 0
-                    return {"balance": balance, "token_id": token_id, "account": account_id}
-            return {"error": "Horizon query failed"}
-        except Exception as e:
-            return {"error": f"Token balance query failed: {e}"}
+        with traced_span(
+            "stellar.horizon.get_account",
+            {"stellar.operation": "get_account", "stellar.asset": token_id},
+            kind=SpanKind.CLIENT,
+        ) as span:
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    r = await request_with_retry(
+                        lambda: client.get(f"{_HORIZON_URL}/accounts/{account_id}")
+                    )
+                    span.set_attribute("http.response.status_code", r.status_code)
+                    if r.status_code == 200:
+                        data = r.json()
+                        balances = data.get("balances", [])
+                        token_balance = next((b for b in balances if b.get("asset_code") == token_id), None)
+                        balance = float(token_balance["balance"]) if token_balance else 0
+                        return {"balance": balance, "token_id": token_id, "account": account_id}
+                return {"error": "Horizon query failed"}
+            except Exception as e:
+                return {"error": f"Token balance query failed: {e}"}
 
     async def transfer_xlm(self, to_account: str, amount: float) -> dict[str, Any]:
         """Request XLM transfer via Web API (Web handles signing)."""

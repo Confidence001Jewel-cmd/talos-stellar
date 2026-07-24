@@ -1,6 +1,8 @@
+import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { tlsTalos } from "@/db/schema";
 import { eq } from "drizzle-orm";
+import { withTraceContext } from "@/lib/tracing";
 
 function maskApiKey(key: string | null): string | null {
   if (!key || key.length < 12) return null;
@@ -8,8 +10,8 @@ function maskApiKey(key: string | null): string | null {
 }
 
 // GET /api/talos/:id — TALOS detail + configuration
-export async function GET(
-  _request: Request,
+async function handleGet(
+  _request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
@@ -36,3 +38,5 @@ export async function GET(
     return Response.json({ error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const GET = withTraceContext(handleGet);

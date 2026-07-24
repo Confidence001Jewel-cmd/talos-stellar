@@ -10,9 +10,10 @@ import {
   verifyTransferSignature,
   type TransferSignedPayload,
 } from "@/lib/transfer-signature";
+import { withTraceContext } from "@/lib/tracing";
 
 // POST /api/talos/:id/transfer — Execute a signed USDC transfer on Stellar
-export async function POST(
+async function handlePost(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
@@ -137,3 +138,5 @@ export async function POST(
     return Response.json({ error: "Transfer failed" }, { status: 500 });
   }
 }
+
+export const POST = withTraceContext(handlePost);

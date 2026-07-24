@@ -7,22 +7,53 @@ import logging
 import os
 import random
 import signal
+import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 import structlog
+from opentelemetry.trace import SpanKind
 from rich.console import Console
 
 if TYPE_CHECKING:
     from talos_agent.config import Settings
 
+from talos_agent import metrics
 from talos_agent.observability import log, setup as setup_observability
+from talos_agent.tracing import shutdown_tracing, traced_span
 
 console = Console()
 logger = logging.getLogger(__name__)
 
 SHUTDOWN_GRACE_PERIOD = 10  # seconds before force-exit on second signal
+
+
+@contextmanager
+def _traced_task_run(task_name: str, talos_config: dict | None = None, **extra_attrs):
+    """One root span + one cycle-duration metric per scheduled task run.
+
+    Each call is an independent trace — see docs/TRACING.md#async-boundaries
+    for why these aren't nested under one long-lived trace.
+    """
+    attrs: dict = {"agent.task": task_name, **extra_attrs}
+    if talos_config:
+        if talos_config.get("id"):
+            attrs["talos.id"] = talos_config["id"]
+        if talos_config.get("name"):
+            attrs["talos.name"] = talos_config["name"]
+
+    start = time.monotonic()
+    outcome = "success"
+    try:
+        with traced_span(f"agent.{task_name}", attrs, kind=SpanKind.INTERNAL):
+            yield
+    except Exception:
+        outcome = "error"
+        raise
+    finally:
+        metrics.record_cycle(task_name, outcome, time.monotonic() - start)
 
 async def run_dividend_distribution(
     *,
@@ -591,27 +622,28 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
                         if policy_middleware.hot_reload():
                             console.print("[cyan]Policy engine: policies reloaded (file change detected).[/cyan]")
 
-                    if not await ensure_browser_healthy():
-                        console.print(
-                            "[red]Skipping agent cycle: browser session is down and unrecoverable.[/red]"
-                        )
-                    else:
-                        log.info(
-                            "agent_cycle_start",
-                            talos=talos_config.get("name"),
-                            cycle_id=cycle_id,
-                        )
-                        context = AgentContext.from_db(db, talos_config)
-                        await agent_loop(
-                            settings=settings,
-                            tools=tools,
-                            talos_config=talos_config,
-                            context=context,
-                            db=db,
-                            shutdown_event=shutdown_event,
-                        )
-                        db.update_schedule("agent_cycle")
-                        log.info("agent_cycle_complete", cycle_id=cycle_id)
+                    with _traced_task_run("agent_cycle", talos_config, **{"agent.cycle_id": cycle_id}):
+                        if not await ensure_browser_healthy():
+                            console.print(
+                                "[red]Skipping agent cycle: browser session is down and unrecoverable.[/red]"
+                            )
+                        else:
+                            log.info(
+                                "agent_cycle_start",
+                                talos=talos_config.get("name"),
+                                cycle_id=cycle_id,
+                            )
+                            context = AgentContext.from_db(db, talos_config)
+                            await agent_loop(
+                                settings=settings,
+                                tools=tools,
+                                talos_config=talos_config,
+                                context=context,
+                                db=db,
+                                shutdown_event=shutdown_event,
+                            )
+                            db.update_schedule("agent_cycle")
+                            log.info("agent_cycle_complete", cycle_id=cycle_id)
                 except Exception as e:
                     console.print(f"[red]Agent cycle error: {e}[/red]")
                     log.error("agent_cycle_error", error=str(e), cycle_id=cycle_id)
@@ -634,24 +666,25 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
         backoff = DurableBackoff(task_name="polling", db=db, base_delay=settings.polling_interval)
         while not shutdown_event.is_set():
             try:
-                approvals = await api.get_approvals(settings.talos_id, status="pending")
-                for a in approvals:
-                    cached = db.get_pending_approvals()
-                    cached_ids = {c["approval_id"] for c in cached}
-                    if a["id"] not in cached_ids:
-                        db.cache_approval(
-                            a["id"],
-                            a["type"],
-                            a["title"],
-                            a.get("description"),
-                            a.get("amount"),
-                        )
+                with _traced_task_run("polling", talos_config):
+                    approvals = await api.get_approvals(settings.talos_id, status="pending")
+                    for a in approvals:
+                        cached = db.get_pending_approvals()
+                        cached_ids = {c["approval_id"] for c in cached}
+                        if a["id"] not in cached_ids:
+                            db.cache_approval(
+                                a["id"],
+                                a["type"],
+                                a["title"],
+                                a.get("description"),
+                                a.get("amount"),
+                            )
 
-                jobs = await api.get_pending_jobs()
-                for job in jobs:
-                    db.add_commerce_job(
-                        job["id"], job["talosId"], job.get("serviceName", ""), job.get("payload")
-                    )
+                    jobs = await api.get_pending_jobs()
+                    for job in jobs:
+                        db.add_commerce_job(
+                            job["id"], job["talosId"], job.get("serviceName", ""), job.get("payload")
+                        )
 
                 backoff.success()
             except Exception as e:
@@ -669,7 +702,8 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
         backoff = DurableBackoff(task_name="heartbeat", db=db, base_delay=settings.heartbeat_interval)
         while not shutdown_event.is_set():
             try:
-                await api.update_status(settings.talos_id, online=True)
+                with _traced_task_run("heartbeat", talos_config):
+                    await api.update_status(settings.talos_id, online=True)
                 backoff.success()
             except Exception as e:
                 logger.debug(f"Heartbeat error: {e}")
@@ -687,11 +721,12 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
         backoff = DurableBackoff(task_name="job_heartbeat", db=db, base_delay=settings.job_heartbeat_interval)
         while not shutdown_event.is_set():
             try:
-                claimed = get_claimed_jobs_copy()
-                for job_id, fencing_token in claimed.items():
-                    result = await api.heartbeat_job(job_id, fencing_token)
-                    if not result:
-                        logger.warning("job_lease_heartbeat_failed", job_id=job_id)
+                with _traced_task_run("job_heartbeat", talos_config):
+                    claimed = get_claimed_jobs_copy()
+                    for job_id, fencing_token in claimed.items():
+                        result = await api.heartbeat_job(job_id, fencing_token)
+                        if not result:
+                            logger.warning("job_lease_heartbeat_failed", job_id=job_id)
                 backoff.success()
             except Exception as e:
                 logger.debug(f"Job heartbeat error: {e}")
@@ -708,16 +743,17 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
         backoff = DurableBackoff(task_name="activity_flush", db=db, base_delay=30)
         while not shutdown_event.is_set():
             try:
-                pending = db.get_pending_activities()
-                if pending:
-                    for act in pending:
-                        await api.report_activity(
-                            settings.talos_id,
-                            type_=act["type"],
-                            content=act["content"],
-                            channel=act["channel"],
-                        )
-                    db.mark_activities_sent([a["id"] for a in pending])
+                with _traced_task_run("activity_flush", talos_config):
+                    pending = db.get_pending_activities()
+                    if pending:
+                        for act in pending:
+                            await api.report_activity(
+                                settings.talos_id,
+                                type_=act["type"],
+                                content=act["content"],
+                                channel=act["channel"],
+                            )
+                        db.mark_activities_sent([a["id"] for a in pending])
                 backoff.success()
             except Exception as e:
                 logger.debug(f"Activity flush error: {e}")
@@ -748,22 +784,23 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
                     console.print("[red]Skipping learning cycle: browser session is down and unrecoverable.[/red]")
                 else:
                     try:
-                        context = AgentContext.from_db(db, talos_config)
+                        with _traced_task_run("learning_cycle", talos_config):
+                            context = AgentContext.from_db(db, talos_config)
 
-                        if context.unmeasured_count > 0 or context.performance_summary.get("total_posts", 0) >= 5:
-                            console.print("[bold magenta]Starting learning cycle...[/bold magenta]")
-                            learning_prompt = build_learning_prompt(talos_config, context)
-                            await agent_loop(
-                                settings=settings,
-                                tools=tools,
-                                talos_config=talos_config,
-                                context=context,
-                                db=db,
-                                system_prompt_override=learning_prompt,
-                                shutdown_event=shutdown_event,
-                            )
-                            db.update_schedule("learning_cycle")
-                            console.print("[bold magenta]Learning cycle complete.[/bold magenta]")
+                            if context.unmeasured_count > 0 or context.performance_summary.get("total_posts", 0) >= 5:
+                                console.print("[bold magenta]Starting learning cycle...[/bold magenta]")
+                                learning_prompt = build_learning_prompt(talos_config, context)
+                                await agent_loop(
+                                    settings=settings,
+                                    tools=tools,
+                                    talos_config=talos_config,
+                                    context=context,
+                                    db=db,
+                                    system_prompt_override=learning_prompt,
+                                    shutdown_event=shutdown_event,
+                                )
+                                db.update_schedule("learning_cycle")
+                                console.print("[bold magenta]Learning cycle complete.[/bold magenta]")
                     except Exception as e:
                         console.print(f"[red]Learning cycle error: {e}[/red]")
             try:
@@ -802,14 +839,15 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
                             pass
                         continue
 
-                result = await run_dividend_distribution(
-                    talos_id=settings.talos_id,
-                    talos_config=talos_config,
-                    settings=settings,
-                    stellar=stellar,
-                    api=api,
-                    db=db,
-                )
+                with _traced_task_run("dividend_distribution", talos_config):
+                    result = await run_dividend_distribution(
+                        talos_id=settings.talos_id,
+                        talos_config=talos_config,
+                        settings=settings,
+                        stellar=stellar,
+                        api=api,
+                        db=db,
+                    )
 
                 _RESULT_MESSAGES = {
                     "no_wallet": ("[dim yellow]", "No wallet public key configured — skipping dividend distribution"),
@@ -854,12 +892,13 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
                 if shutdown_event.is_set():
                     break
                 try:
-                    result = await run_loan_repayment(
-                        settings=settings,
-                        stellar_kit=stellar_kit,
-                        api=api,
-                        db=db,
-                    )
+                    with _traced_task_run("loan_repayment", talos_config):
+                        result = await run_loan_repayment(
+                            settings=settings,
+                            stellar_kit=stellar_kit,
+                            api=api,
+                            db=db,
+                        )
                     console.print(
                         f"[bold cyan]Loan repayment cycle complete: {result}[/bold cyan]"
                     )
@@ -941,6 +980,10 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
             pass
         await api.close()
         db.close()
+        # Flush any spans/metrics buffered by the batch processors before exit
+        # so a graceful shutdown doesn't drop the last few seconds of data.
+        shutdown_tracing()
+        metrics.shutdown_metrics()
         console.print("[bold]Agent stopped.[/bold]")
 
 
