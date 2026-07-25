@@ -114,6 +114,56 @@ class Settings(BaseSettings):
         validation_alias="TALOS_SECRET_DB_TIMEOUT_MS",
     )
 
+    # Third-party adapter capability sandbox (opt-in rollout).
+    adapter_sandbox_enabled: bool = Field(
+        default=False, validation_alias="TALOS_ADAPTER_SANDBOX_ENABLED"
+    )
+    adapter_capability_manifests: str = Field(
+        default="", validation_alias="TALOS_ADAPTER_CAPABILITY_MANIFESTS"
+    )
+    adapter_timeout_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=120,
+        validation_alias="TALOS_ADAPTER_TIMEOUT_SECONDS",
+    )
+    adapter_max_concurrency: int = Field(
+        default=2,
+        ge=1,
+        le=16,
+        validation_alias="TALOS_ADAPTER_MAX_CONCURRENCY",
+    )
+    adapter_max_input_bytes: int = Field(
+        default=16384,
+        ge=1,
+        le=1048576,
+        validation_alias="TALOS_ADAPTER_MAX_INPUT_BYTES",
+    )
+    adapter_max_output_bytes: int = Field(
+        default=262144,
+        ge=1,
+        le=2097152,
+        validation_alias="TALOS_ADAPTER_MAX_OUTPUT_BYTES",
+    )
+    adapter_max_network_requests: int = Field(
+        default=8,
+        ge=1,
+        le=32,
+        validation_alias="TALOS_ADAPTER_MAX_NETWORK_REQUESTS",
+    )
+    adapter_invocation_lease_seconds: int = Field(
+        default=120,
+        ge=5,
+        le=900,
+        validation_alias="TALOS_ADAPTER_INVOCATION_LEASE_SECONDS",
+    )
+    adapter_max_invocation_records: int = Field(
+        default=100000,
+        ge=100,
+        le=1000000,
+        validation_alias="TALOS_ADAPTER_MAX_INVOCATION_RECORDS",
+    )
+
     # Agent behaviour
     agent_cycle_interval: int = Field(default=30, description="Seconds between agent cycles")
     polling_interval: int = Field(default=10, description="Seconds between API polls")

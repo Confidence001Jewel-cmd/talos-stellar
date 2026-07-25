@@ -113,6 +113,7 @@ If you deploy new contracts, update the contract IDs in `web/.env.local` with th
 - `X_USERNAME`, `X_PASSWORD`, and `X_EMAIL`
 - `BROWSER_HEADLESS`
 - agent timing and approval settings such as `AGENT_CYCLE_INTERVAL`, `POLLING_INTERVAL`, and `APPROVAL_THRESHOLD`
+- opt-in adapter capability sandbox settings under `TALOS_ADAPTER_*`
 
 ### Contracts env
 
@@ -182,6 +183,9 @@ cargo test --target wasm32-unknown-unknown
   tests/test_secret_store.py tests/test_secret_rotation_integration.py` and
   follow [the rotation runbook](./docs/prime-agent-secret-rotation.md) for
   migration and rollback verification.
+- For adapter boundary changes, also run `uv run pytest
+  tests/test_adapter_capability_sandbox.py` and follow the
+  [capability sandbox runbook](./docs/prime-agent-adapter-capability-sandbox.md).
 - For Rust, keep formatting standard with `cargo fmt` and validate with `cargo test`
 
 ## Pull Request Workflow

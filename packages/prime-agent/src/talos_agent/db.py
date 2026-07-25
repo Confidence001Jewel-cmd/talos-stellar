@@ -260,6 +260,28 @@ CREATE INDEX IF NOT EXISTS idx_secret_audit_lookup
     ON secret_audit_events(scope, name, id);
         """,
     ),
+    (
+        8,
+        """
+CREATE TABLE IF NOT EXISTS adapter_invocations (
+    operation_id       TEXT PRIMARY KEY,
+    adapter_name       TEXT NOT NULL,
+    operation          TEXT NOT NULL,
+    input_digest       TEXT NOT NULL,
+    state              TEXT NOT NULL CHECK (
+        state IN ('running', 'succeeded', 'failed', 'indeterminate')
+    ),
+    owner_id           TEXT NOT NULL,
+    lease_expires_at   TEXT NOT NULL,
+    attempt_count      INTEGER NOT NULL DEFAULT 1,
+    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_adapter_invocations_state_lease
+    ON adapter_invocations(state, lease_expires_at);
+        """,
+    ),
 ]
 
 
