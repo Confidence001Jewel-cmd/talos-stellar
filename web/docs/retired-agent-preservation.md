@@ -115,6 +115,8 @@ cd web
 pnpm test retired-agent-preservation.test.ts
 ```
 
+**Note:** The e2e test suite requires a live Supabase Postgres database and valid Stellar/OpenAI API keys. It cannot be run locally with only `.env.example` - a real `.env` file with production credentials is needed. This test should be verified in CI or by a maintainer with database access.
+
 The test suite covers:
 - Agent retirement with historical data preservation
 - Prevention of double retirement

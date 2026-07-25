@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { Keypair } from "@stellar/stellar-sdk";
 import { db } from "@/db";
-import { tlsTalos, tlsPatrons, tlsActivities, tlsRevenues } from "@/db/schema";
+import { tlsTalos, tlsPatrons, tlsActivities } from "@/db/schema";
 import { eq } from "drizzle-orm";
 
 const BASE = process.env.TEST_BASE_URL || "http://localhost:3000";

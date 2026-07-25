@@ -1,5 +1,5 @@
 import { db } from "@/db";
-import { tlsTalos, tlsPatrons, tlsActivities, tlsApprovals, tlsRevenues, tlsDividends, tlsCommerceJobs, tlsCommerceServices, tlsPlaybooks, tlsApiAuditLogs } from "@/db/schema";
+import { tlsTalos, tlsPatrons, tlsActivities, tlsApprovals, tlsCommerceJobs, tlsCommerceServices, tlsPlaybooks } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { NextResponse } from "next/server";
 
