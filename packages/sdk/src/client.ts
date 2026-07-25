@@ -23,75 +23,28 @@ import type {
   TransferParams,
   TransferResponse,
   PaginatedResponse,
+  CursorPage,
+  CursorRequestOptions,
+  ActivityPage,
+  ActivityPageOptions,
 } from "./types.js";
-import {
-  TalosAPIError,
-  TalosPaymentError,
-  classifyTransportError,
-  errorFromResponse,
-  parseX402Challenge,
-  parseRetryAfter,
-} from "./errors.js";
 
-/**
- * Client configuration. All fields are optional; defaults match the prior
- * behavior for backward compatibility. New fields opt in to bounded
- * timeout/retry behavior.
- */
+export interface RetryPolicyOptions {
+  maxAttempts?: number;
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+  retryMethods?: string[];
+  retryStatusCodes?: number[];
+  jitter?: boolean;
+  random?: () => number;
+}
+
 export interface TalosClientOptions {
   /** Base URL of the Talos API. Defaults to `https://talos-stellar.vercel.app`. */
   baseUrl?: string;
   /** Bearer token (TALOS API key). Adds `Authorization: Bearer <key>` header. */
   apiKey?: string;
-  /**
-   * Per-request timeout in milliseconds. When set, every request is bounded
-   * by an `AbortSignal` that aborts the underlying `fetch` after this delay.
-   * Default: `undefined` (no timeout — matches pre-existing behavior).
-   *
-   * Timeouts are surfaced as {@link TalosTimeoutError} and treated as
-   * retryable when retry is enabled and the request is idempotent.
-   */
-  timeoutMs?: number;
-  /**
-   * Bounded auto-retry policy. When `maxAttempts > 1`, transient failures
-   * (429, 502/503/504, transport, timeout) on idempotent methods (GET/HEAD)
-   * are retried with exponential backoff and a `Retry-After` hint honored
-   * when the server supplies it.
-   *
-   * - `maxAttempts`: total attempts including the initial one (default 1 = off).
-   * - `idempotentOnly`: only retry GET/HEAD (default `true`).
-   * - `maxRetryAfterMs`: cap on server-supplied `Retry-After` (default 60s).
-   * - `baseDelayMs`: initial backoff between attempts (default 500ms).
-   * - `maxDelayMs`: upper bound on backoff (default 8s).
-   * - `jitter`: optional jitter factor `0–1` (default 0.25).
-   * - `onRetry`: called before each retry with the typed error.
-   *
-   * Validation/auth/conflict/payment errors are never retried — those are
-   * caller-fixable, not transient.
-   */
-  retry?: RetryOptions;
-  /**
-   * Optional observer invoked once per failed SDK call (after retries are
-   * exhausted, if any). Useful for centralized logging / metrics. The
-   * callback must not throw; it is invoked fire-and-forget.
-   */
-  onError?: (event: TalosErrorEvent) => void;
-  /**
-   * Optional fetch implementation. Defaults to the global `fetch`. Provided
-   * so callers can inject mock transports for tests or wire in middleware.
-   */
-  fetch?: typeof fetch;
-}
-
-/** Bounded retry configuration. See {@link TalosClientOptions.retry}. */
-export interface RetryOptions {
-  maxAttempts?: number;
-  idempotentOnly?: boolean;
-  maxRetryAfterMs?: number;
-  baseDelayMs?: number;
-  maxDelayMs?: number;
-  jitter?: number;
-  onRetry?: (event: { attempt: number; error: TalosAPIError; delayMs: number }) => void;
+  retryPolicy?: RetryPolicyOptions;
 }
 
 /** Structured event emitted to {@link TalosClientOptions.onError}. */
@@ -150,18 +103,19 @@ function applyJitter(delay: number, jitter: number): number {
 export class TalosClient {
   private baseUrl: string;
   private headers: Record<string, string>;
-  private timeoutMs?: number;
-  private retry: Required<RetryOptions>;
-  private onError?: (event: TalosErrorEvent) => void;
-  /**
-   * Optional fetch override. `undefined` (default) means the SDK reads
-   * `globalThis.fetch` lazily on every call so that test frameworks that
-   * swap `globalThis.fetch` via `vi.stubGlobal` (or equivalent) keep
-   * intercepting requests. When set, the override is honored verbatim.
-   */
-  private fetchOverride?: typeof fetch;
+  private readonly retryPolicy: Required<RetryPolicyOptions>;
 
   constructor(options: TalosClientOptions = {}) {
+    const normalizedRetryMethods = options.retryPolicy?.retryMethods?.map((method) => method.toUpperCase());
+    this.retryPolicy = {
+      maxAttempts: options.retryPolicy?.maxAttempts ?? 3,
+      baseDelayMs: options.retryPolicy?.baseDelayMs ?? 100,
+      maxDelayMs: options.retryPolicy?.maxDelayMs ?? 1000,
+      retryMethods: normalizedRetryMethods ?? ["GET", "HEAD", "PUT", "DELETE", "OPTIONS"],
+      retryStatusCodes: options.retryPolicy?.retryStatusCodes ?? [429, 500, 502, 503, 504],
+      jitter: options.retryPolicy?.jitter ?? true,
+      random: options.retryPolicy?.random ?? Math.random,
+    };
     this.baseUrl = (options.baseUrl ?? "https://talos-stellar.vercel.app").replace(/\/$/, "");
     this.headers = { "Content-Type": "application/json" };
     if (options.apiKey) {
@@ -178,11 +132,75 @@ export class TalosClient {
     return this.fetchOverride ?? globalThis.fetch;
   }
 
-  // ── Internal request helper ──────────────────────────────────
+  private shouldRetry(method: string, status: number): boolean {
+    return (
+      this.retryPolicy.retryStatusCodes.includes(status) &&
+      this.retryPolicy.retryMethods.includes(method)
+    );
+  }
 
-  /** Build the full URL for a path + params. Pure. */
-  private buildUrl(path: string, params?: Record<string, string | number | boolean>): string {
+  private getRetryDelay(attempt: number, retryAfterHeader: string | null): number {
+    if (retryAfterHeader) {
+      const headerDelay = this.parseRetryAfter(retryAfterHeader);
+      if (headerDelay !== null) {
+        return Math.min(headerDelay, this.retryPolicy.maxDelayMs);
+      }
+    }
+
+    const exponent = Math.pow(2, attempt - 1);
+    const delay = Math.min(this.retryPolicy.baseDelayMs * exponent, this.retryPolicy.maxDelayMs);
+    if (!this.retryPolicy.jitter) {
+      return delay;
+    }
+
+    return Math.floor(this.retryPolicy.random() * delay);
+  }
+
+  private parseRetryAfter(header: string | null): number | null {
+    if (!header) return null;
+    const trimmed = header.trim();
+    const seconds = Number(trimmed);
+    if (!Number.isNaN(seconds)) {
+      return Math.max(0, seconds * 1000);
+    }
+
+    const parsedDate = Date.parse(trimmed);
+    if (!Number.isNaN(parsedDate)) {
+      const delta = parsedDate - Date.now();
+      return delta > 0 ? delta : 0;
+    }
+
+    return null;
+  }
+
+  private wait(delayMs: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      return Promise.reject(new Error("Request aborted"));
+    }
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, delayMs);
+
+      const onAbort = () => {
+        clearTimeout(timeout);
+        signal?.removeEventListener("abort", onAbort);
+        reject(new Error("Request aborted"));
+      };
+
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  private async request<T>(
+    path: string,
+    init?: RequestInit & { params?: Record<string, string | number | boolean> },
+  ): Promise<T> {
     let url = `${this.baseUrl}${path}`;
+    const { params, signal, ...requestInit } = init ?? {};
+    const normalizedSignal = signal ?? undefined;
     if (params) {
       const filteredParams = Object.entries(params)
         .filter(([_, value]) => value !== undefined)
@@ -190,182 +208,46 @@ export class TalosClient {
       const qs = new URLSearchParams(filteredParams).toString();
       if (qs) url += `?${qs}`;
     }
-    return url;
-  }
 
-  /**
-   * Build the headers for a single request, respecting the per-call
-   * overrides supplied via `init.headers`. We return a plain `Record`
-   * (rather than a `Headers` instance) so callers — both real fetch and
-   * vitest's `vi.mocked(fetch).mock.calls[i][1].headers` — see the headers
-   * as enumerable own properties, preserving the legacy `toHaveProperty`
-   * test contract.
-   */
-  private mergeHeaders(init?: HeadersInit): Record<string, string> {
-    const headers: Record<string, string> = { ...this.headers };
-    if (!init) return headers;
-    const provided = init instanceof Headers
-      ? Object.fromEntries(init.entries())
-      : Array.isArray(init)
-        ? Object.fromEntries(init)
-        : init;
-    Object.assign(headers, provided as Record<string, string>);
-    return headers;
-  }
+    const method = (requestInit.method?.toString().toUpperCase() ?? "GET");
 
-  /**
-   * Core single-attempt request helper. Throws a typed
-   * {@link TalosAPIError} subclass on failure. Honors an optional
-   * `AbortSignal` from the caller (used by the timeout wrapper).
-   */
-  private async doRequest<T>(
-    url: string,
-    path: string,
-    init: RequestInit & { params?: Record<string, string | number | boolean> },
-    method: string,
-    signal?: AbortSignal,
-  ): Promise<T> {
-    const headers = this.mergeHeaders(init.headers);
-    let res: Response;
-    try {
-      res = await this.resolveFetch()(url, { ...init, method, headers, signal });
-    } catch (cause) {
-      // If the caller aborted (cancel from outside), still classify.
-      throw classifyTransportError(cause, path);
-    }
-    if (!res.ok) {
-      const rawBody = await res.text().catch(() => "");
-      throw errorFromResponse(res.status, path, rawBody, res.headers);
-    }
-    try {
-      return (await res.json()) as T;
-    } catch (cause) {
-      // 2xx with non-JSON body (HTML proxy fallback, truncated response) — wrap it
-      // so callers see one consistent `TalosAPIError` surface.
-      throw classifyTransportError(cause, path);
-    }
-  }
+    for (let attempt = 1; attempt <= this.retryPolicy.maxAttempts; attempt += 1) {
+      const res = await fetch(url, {
+        ...requestInit,
+        ...(normalizedSignal ? { signal: normalizedSignal } : {}),
+        headers: { ...this.headers, ...requestInit.headers },
+      });
 
-  /**
-   * Retry-wrapped request. Returns the typed result or throws the final
-   * {@link TalosAPIError} after all attempts.
-   *
-   * Only retries idempotent methods when `retry.idempotentOnly === true`
-   * (default). Non-idempotent requests are executed once.
-   */
-  private async request<T>(
-    path: string,
-    init?: RequestInit & { params?: Record<string, string | number | boolean> },
-  ): Promise<T> {
-    const method = (init?.method ?? "GET").toUpperCase();
-    const url = this.buildUrl(path, init?.params);
-    const maxAttempts = this.computeMaxAttempts(method);
-    const startedAt = Date.now();
-
-    let lastError: TalosAPIError | undefined;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const timeout = this.acquireTimeoutController();
-      try {
-        return await this.doRequest<T>(url, path, init ?? {}, method, timeout?.signal);
-      } catch (err) {
-        // doRequest always throws via classifyTransportError / errorFromResponse,
-        // which both return subclasses of TalosAPIError. Any non-TalosAPIError
-        // here is a programmer bug; bubble it up.
-        if (!(err instanceof TalosAPIError)) throw err;
-        lastError = err;
-        const shouldRetry = attempt < maxAttempts && err.isRetryable && this.isRetryAttemptable(method, err);
-        if (!shouldRetry) break;
-
-        const delayMs = this.computeBackoffDelay(err, attempt);
-        // `retry.onRetry` is always defined (Required<RetryOptions>); we still
-        // wrap the call in try/catch so a misbehaving callback cannot break
-        // the bounded retry loop.
-        try {
-          this.retry.onRetry({ attempt, error: err, delayMs });
-        } catch {
-          // Swallow callback failure — the next attempt must still be attempted.
-        }
-        await sleep(delayMs);
-      } finally {
-        // Always dispose the timeout — covers both success (return in try)
-        // and failure (throw or break in catch). Without this the underlying
-        // setTimeout would fire against a stale controller.
-        timeout?.dispose();
+      if (res.ok) {
+        return res.json() as Promise<T>;
       }
-    }
 
-    // Out of attempts. Notify the onError observer (best-effort).
-    if (this.onError && lastError) {
-      try {
-        this.onError({
-          error: lastError,
-          path,
-          method,
-          attempt: maxAttempts,
-          durationMs: Date.now() - startedAt,
-        });
-      } catch {
-        // Fire-and-forget.
+      const shouldRetry = this.shouldRetry(method, res.status);
+      if (!shouldRetry || attempt === this.retryPolicy.maxAttempts) {
+        const body = await res.text();
+        throw new TalosAPIError(res.status, body, path);
       }
+
+      const retryAfterHeader = res.headers.get("Retry-After");
+      const delay = this.getRetryDelay(attempt, retryAfterHeader);
+      await this.wait(delay, normalizedSignal);
     }
-    throw lastError;
+
+    throw new Error("Unexpected retry failure");
   }
 
-  /** Compute the effective max-attempt count given method + retry policy. */
-  private computeMaxAttempts(method: string): number {
-    const configured = this.retry.maxAttempts;
-    if (!configured || configured <= 1) return 1;
-    if (this.retry.idempotentOnly && !IDEMPOTENT_METHODS.has(method)) return 1;
-    return Math.max(1, Math.min(configured, 8)); // hard upper bound
-  }
-
-  /** Decide whether a particular error is retryable given the method. */
-  private isRetryAttemptable(method: string, err: TalosAPIError): boolean {
-    if (!err.isRetryable) return false;
-    if (this.retry.idempotentOnly && !IDEMPOTENT_METHODS.has(method)) return false;
-    return true;
-  }
-
-  /**
-   * Compute the delay before the next attempt:
-   *   - Honor server-supplied `Retry-After` (clamped to `maxRetryAfterMs`).
-   *   - Otherwise use exponential backoff: `baseDelayMs * 2^(attempt-1)`.
-   *   - Cap at `maxDelayMs`.
-   *   - Apply jitter (±25% by default).
-   */
-  private computeBackoffDelay(err: TalosAPIError, attempt: number): number {
-    const retryAfterMs = err.retryAfterMs ?? parseRetryAfter(err.headers["retry-after"]);
-    if (retryAfterMs != null) {
-      const capped = Math.min(retryAfterMs, this.retry.maxRetryAfterMs);
-      const jittered = applyJitter(capped, this.retry.jitter);
-      return Math.min(jittered, this.retry.maxDelayMs);
-    }
-    const exp = Math.min(this.retry.maxDelayMs, this.retry.baseDelayMs * Math.pow(2, attempt - 1));
-    return applyJitter(exp, this.retry.jitter);
-  }
-
-  /**
-   * Build a `{ signal, dispose }` pair for the per-request timeout. The
-   * caller MUST call `dispose()` once the request resolves or rejects so
-   * the underlying `setTimeout` does not fire against a stale controller
-   * (we already saw this leave dangling timers in long-running agent loops).
-   *
-   * Returns `null` when no timeout is configured.
-   */
-  private acquireTimeoutController(): { signal: AbortSignal; dispose: () => void } | null {
-    if (!this.timeoutMs) return null;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-    return {
-      signal: controller.signal,
-      dispose: () => clearTimeout(timer),
-    };
+  private async requestPage<T>(
+    path: string,
+    options?: CursorRequestOptions,
+  ): Promise<CursorPage<T>> {
+    const { signal, ...params } = options ?? {};
+    return this.request(path, { params, signal });
   }
 
   // ── Talos CRUD ────────────────────────────────────────────
 
-  async listTaloses(params?: { cursor?: string; limit?: number }): Promise<PaginatedResponse<Talos>> {
-    return this.request("/api/talos", { params });
+  async listTaloses(params?: CursorRequestOptions): Promise<CursorPage<Talos>> {
+    return this.requestPage("/api/talos", params);
   }
 
   async getTalos(id: string): Promise<TalosDetail> {
@@ -385,8 +267,9 @@ export class TalosClient {
 
   // ── Activity ───────────────────────────────────────────────
 
-  async listActivities(params?: { cursor?: string; limit?: number; statsOnly?: boolean }): Promise<any> {
-    return this.request("/api/activity", { params });
+  async listActivities(params?: ActivityPageOptions): Promise<ActivityPage> {
+    const { signal, ...query } = params ?? {};
+    return this.request<ActivityPage>("/api/activity", { params: query, signal });
   }
 
   async reportActivity(talosId: string, params: ReportActivityParams): Promise<Activity> {
@@ -450,8 +333,9 @@ export class TalosClient {
     });
   }
 
-  async discoverServices(params?: DiscoverServicesParams): Promise<PaginatedResponse<CommerceService>> {
-    return this.request("/api/services", { params: params as any });
+  async discoverServices(params?: DiscoverServicesParams): Promise<CursorPage<CommerceService>> {
+    const { signal, ...query } = params ?? {};
+    return this.requestPage("/api/services", { ...query, signal });
   }
 
   async purchaseService(
@@ -599,8 +483,8 @@ export class TalosClient {
 
   // ── Leaderboard ────────────────────────────────────────────
 
-  async getLeaderboard(params?: { cursor?: string; limit?: number }): Promise<PaginatedResponse<LeaderboardEntry>> {
-    return this.request("/api/leaderboard", { params });
+  async getLeaderboard(params?: CursorRequestOptions): Promise<CursorPage<LeaderboardEntry>> {
+    return this.requestPage("/api/leaderboard", params);
   }
 
   // ── Playbooks ──────────────────────────────────────────────
@@ -609,10 +493,8 @@ export class TalosClient {
     category?: string;
     channel?: string;
     search?: string;
-    cursor?: string;
-    limit?: number;
-  }): Promise<PaginatedResponse<Playbook>> {
-    return this.request("/api/playbooks", { params });
+  } & CursorRequestOptions): Promise<CursorPage<Playbook>> {
+    return this.requestPage("/api/playbooks", params);
   }
 
   async createPlaybook(params: CreatePlaybookParams): Promise<Playbook> {
