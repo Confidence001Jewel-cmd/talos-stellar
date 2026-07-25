@@ -64,6 +64,27 @@ To cross-reference: filter both log streams by the same ID.
 | Agent errors | Sentry dashboard → `talos-stellar-agent` project |
 | Agent logs | Railway dashboard → Deployment logs |
 
+## Backup / Restore signals
+
+Backup events emit log entries prefixed with `ops backup completed`,
+`ops backup failed`, `ops restore verified`, `ops restore applied`,
+`ops restore failed`, or `ops backup status failed`. Successful backup /
+restore runs are also recorded in `tls_backup_runs` so alerting rules can
+look at history:
+
+```
+GET /api/ops/backup/status    ← OTel-friendly: include counts, lastSuccess, lastFailure
+```
+
+The web `_backup` and `/ops/restore` endpoints never log:
+- the artifact bytes,
+- the passphrase (`X-Backup-Passphrase` header is read once and discarded),
+- long hex/base64 strings ≥ 32 chars,
+- filesystem paths.
+
+See `sanitizeErrorMessage` in `web/src/lib/backup-types.ts` for the exact
+redaction regex set.
+
 ## Pagination
 
 List endpoints now support cursor-based pagination:

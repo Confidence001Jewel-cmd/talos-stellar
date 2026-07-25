@@ -13,10 +13,14 @@ DB_PATH = APP_DIR / "talos-agent.db"
 
 
 def get_db_path(agent_id: str | None = None) -> Path:
-    """Return per-agent DB path when running multi-agent, else default."""
+    """Return per-agent DB path when running multi-agent, else default.
+
+    Resolved lazily so tests (and ops tooling) can monkeypatch ``APP_DIR``
+    to redirect `get_db_path()` without rewriting module-level constants.
+    """
     if agent_id:
         return APP_DIR / f"agent-{agent_id}.db"
-    return DB_PATH
+    return APP_DIR / "talos-agent.db"
 
 
 def normalize_playbook_name(name: str) -> str:

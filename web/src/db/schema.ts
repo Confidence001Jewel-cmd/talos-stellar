@@ -5,6 +5,7 @@ import {
   integer,
   boolean,
   numeric,
+  bigint,
   timestamp,
   jsonb,
   index,
@@ -344,6 +345,38 @@ export const tlsTokenPurchases = pgTable(
   },
   (t) => [
     index("tls_token_purchases_talosId_createdAt_idx").on(t.talosId, t.createdAt),
+  ],
+);
+
+// ─── Backup Runs (DR audit trail) ──────────────────────────────────
+
+export const tlsBackupRuns = pgTable(
+  "tls_backup_runs",
+  {
+    id: text("id").primaryKey().$defaultFn(() => createId()),
+    op: text("op").notNull(),                    // 'backup' | 'restore' | 'verify'
+    scope: text("scope").notNull(),              // 'system' | 'config'
+    talosId: text("talosId"),
+    agentId: text("agentId"),
+    status: text("status").notNull().default("pending"), // 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
+    triggeredBy: text("triggeredBy"),             // 'cli' | 'api' | 'ci' | 'cron' (free-form, privacy-safe)
+
+    artifactPath: text("artifactPath"),
+    encryption: text("encryption"),              // e.g. 'AES-256-GCM#PBKDF2-SHA256#200000'
+    sizeBytes: bigint("sizeBytes", { mode: "number" }),
+    sha256: text("sha256"),
+    durationMs: integer("durationMs"),
+
+    errorMessage: text("errorMessage"),          // sanitised: no secrets/keys/payloads
+    metadata: jsonb("metadata"),                 // { rowCounts, signalVersion, ... } — privacy-safe only
+
+    startedAt: timestamp("startedAt", { mode: "date", precision: 3 }).notNull().defaultNow(),
+    finishedAt: timestamp("finishedAt", { mode: "date", precision: 3 }),
+  },
+  (t) => [
+    index("tls_backup_runs_status_idx").on(t.status),
+    index("tls_backup_runs_startedAt_idx").on(t.startedAt),
+    index("tls_backup_runs_op_status_idx").on(t.op, t.status),
   ],
 );
 
