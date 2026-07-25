@@ -289,10 +289,19 @@ class TalosAPIClient:
             return r.json()
         return None
 
-    async def submit_job_result(self, job_id: str, result: dict, fencing_token: int = 0) -> dict | None:
+    async def submit_job_result(
+        self,
+        job_id: str,
+        result: dict,
+        fencing_token: int = 0,
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict | None:
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
         r = await self._post(
             f"/api/jobs/{job_id}/result",
             json={"result": result, "fencingToken": fencing_token},
+            headers=headers,
         )
         if r.status_code in (200, 201):
             return r.json()

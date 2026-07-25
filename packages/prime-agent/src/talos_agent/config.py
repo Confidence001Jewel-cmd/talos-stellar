@@ -90,8 +90,43 @@ class Settings(BaseSettings):
     auto_repay_loans: bool = Field(default=False, description="Enable automatic loan repayment from treasury")
 
     # Job leasing
-    job_lease_ttl: int = Field(default=300, description="Seconds for a claimed job lease TTL")
-    job_heartbeat_interval: int = Field(default=60, description="Seconds between job lease heartbeats")
+    job_lease_ttl: int = Field(
+        default=300,
+        ge=1,
+        le=600,
+        description="Seconds for a claimed job lease TTL",
+    )
+    job_heartbeat_interval: int = Field(
+        default=60,
+        ge=1,
+        le=300,
+        description="Seconds between job lease heartbeats",
+    )
+
+    # Durable provider-job inbox/outbox (opt-in)
+    talos_durable_job_effects_enabled: bool = Field(
+        default=False,
+        description="Persist provider jobs and completion effects before external delivery",
+    )
+    talos_job_effect_dispatch_interval: int = Field(default=2, ge=1, le=300)
+    talos_job_effect_lease_seconds: int = Field(default=30, ge=5, le=900)
+    talos_job_effect_max_attempts: int = Field(default=8, ge=1, le=100)
+    talos_job_effect_retry_base_seconds: int = Field(default=2, ge=1, le=300)
+    talos_job_effect_batch_size: int = Field(default=20, ge=1, le=200)
+    talos_job_effect_max_inbox_records: int = Field(
+        default=100_000, ge=100, le=1_000_000
+    )
+    talos_job_effect_max_outbox_records: int = Field(
+        default=100_000, ge=100, le=1_000_000
+    )
+    talos_job_effect_max_payload_bytes: int = Field(
+        default=65_536, ge=1_024, le=1_048_576
+    )
+    talos_job_effect_max_result_bytes: int = Field(
+        default=262_144, ge=1_024, le=2_097_152
+    )
+    talos_job_effect_dispatch_timeout_seconds: int = Field(default=20, ge=1, le=120)
+    talos_job_effect_db_timeout_ms: int = Field(default=5_000, ge=1, le=30_000)
 
     # Dividend distribution
     dividend_distribution_interval: int = Field(default=3600, description="Seconds between dividend distribution checks")

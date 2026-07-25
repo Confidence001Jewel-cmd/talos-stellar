@@ -43,13 +43,19 @@ vi.mock("@stellar/stellar-sdk", () => {
   };
 });
 
-const mockSelectChain = (result: any) => {
-  const chain: any = {
-    from: vi.fn().mockReturnThis(),
-    where: vi.fn().mockReturnThis(),
-    limit: vi.fn().mockReturnThis(),
-    then: vi.fn().mockImplementation((callback) => callback(result)),
+const mockSelectChain = (result: unknown[]) => {
+  const chain = {
+    from: vi.fn(),
+    where: vi.fn(),
+    limit: vi.fn(),
+    then: vi.fn(),
   };
+  chain.from.mockReturnValue(chain);
+  chain.where.mockReturnValue(chain);
+  chain.limit.mockReturnValue(chain);
+  chain.then.mockImplementation(
+    (callback: (rows: unknown[]) => unknown) => callback(result),
+  );
   return chain;
 };
 
@@ -258,6 +264,50 @@ describe("Async Jobs Revenue Recording Unit Tests", () => {
       expect(response.status).toBe(409);
       // Verify that the transaction was never entered
       expect(mockDb.transaction).not.toHaveBeenCalled();
+    });
+
+    it("does NOT record revenue when a concurrent completion loses the pending-state CAS", async () => {
+      // Both workers may read "pending" before either transaction commits.
+      // The UPDATE includes status='pending', so the loser returns no row.
+      mockDb.select
+        .mockReturnValueOnce(mockSelectChain([{ id: "agent_1" }]))
+        .mockReturnValueOnce(mockSelectChain([mockJob]));
+
+      const mockTxUpdate = vi.fn().mockReturnValue({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue([]),
+          }),
+        }),
+      });
+      const mockTxInsert = vi.fn();
+
+      mockDb.transaction.mockImplementation(async (callback) => {
+        const mockTx = {
+          update: mockTxUpdate,
+          insert: mockTxInsert,
+          select: vi.fn(),
+        };
+        return callback(mockTx);
+      });
+
+      const request = new NextRequest("http://localhost:3000/api/jobs/job_1/result", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer mock_token",
+        },
+        body: JSON.stringify({
+          result: { data: "concurrent-result" },
+        }),
+      });
+
+      const response = await completeJobPOST(request, {
+        params: Promise.resolve({ id: "job_1" }),
+      });
+
+      expect(response.status).toBe(409);
+      expect(mockTxUpdate).toHaveBeenCalledTimes(1);
+      expect(mockTxInsert).not.toHaveBeenCalled();
     });
   });
 });

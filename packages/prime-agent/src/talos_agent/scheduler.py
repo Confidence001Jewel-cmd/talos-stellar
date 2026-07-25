@@ -406,13 +406,49 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
     from talos_agent.payments.stellar_kit import StellarKit
     from talos_agent.tools.registry import build_all_tools
 
+    job_effect_store = None
+    job_effect_dispatcher = None
+    if settings.talos_durable_job_effects_enabled:
+        from talos_agent.job_effects import (
+            JobEffectDispatcher,
+            JobEffectLimits,
+            JobEffectStore,
+        )
+
+        limits = JobEffectLimits(
+            max_inbox_records=settings.talos_job_effect_max_inbox_records,
+            max_outbox_records=settings.talos_job_effect_max_outbox_records,
+            max_payload_bytes=settings.talos_job_effect_max_payload_bytes,
+            max_result_bytes=settings.talos_job_effect_max_result_bytes,
+            batch_size=settings.talos_job_effect_batch_size,
+            lease_seconds=settings.talos_job_effect_lease_seconds,
+            max_attempts=settings.talos_job_effect_max_attempts,
+            retry_base_seconds=settings.talos_job_effect_retry_base_seconds,
+            dispatch_timeout_seconds=settings.talos_job_effect_dispatch_timeout_seconds,
+            remote_lease_ttl_seconds=settings.job_lease_ttl,
+            busy_timeout_ms=settings.talos_job_effect_db_timeout_ms,
+        )
+        job_effect_store = JobEffectStore(
+            db,
+            owner_talos_id=settings.talos_id,
+            limits=limits,
+        )
+        job_effect_dispatcher = JobEffectDispatcher(job_effect_store, api)
+
     # Start browser session
     console.print("[bold]Starting browser session...[/bold]")
     browser = await BrowserSession.start(model_api_key=settings.llm_api_key)
     console.print("[green]Browser ready.[/green]")
 
     # Build tools
-    tools = build_all_tools(api=api, db=db, browser=browser, settings=settings)
+    tools = build_all_tools(
+        api=api,
+        db=db,
+        browser=browser,
+        settings=settings,
+        job_effect_store=job_effect_store,
+        job_effect_dispatcher=job_effect_dispatcher,
+    )
     console.print(f"[green]Registered {len(tools)} tools.[/green]")
 
     # Initialize StellarKit for balance checks
@@ -455,7 +491,14 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
                         pass
                 
                 browser = await BrowserSession.start(model_api_key=settings.llm_api_key)
-                tools = build_all_tools(api=api, db=db, browser=browser, settings=settings)
+                tools = build_all_tools(
+                    api=api,
+                    db=db,
+                    browser=browser,
+                    settings=settings,
+                    job_effect_store=job_effect_store,
+                    job_effect_dispatcher=job_effect_dispatcher,
+                )
                 
                 console.print(f"[bold green]Browser reconnection event logged successfully on attempt {browser_restart_attempts}.[/bold green]")
                 return True
@@ -564,9 +607,26 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
 
                 jobs = await api.get_pending_jobs()
                 for job in jobs:
-                    db.add_commerce_job(
-                        job["id"], job["talosId"], job.get("serviceName", ""), job.get("payload")
-                    )
+                    if job_effect_store is not None:
+                        try:
+                            job_effect_store.ingest(job)
+                        except Exception as exc:
+                            from talos_agent.job_effects import JobEffectError
+
+                            if isinstance(exc, JobEffectError):
+                                log.warning(
+                                    "job_inbox_rejected",
+                                    error_code=exc.code,
+                                )
+                                continue
+                            raise
+                    else:
+                        db.add_commerce_job(
+                            job["id"],
+                            job["talosId"],
+                            job.get("serviceName", ""),
+                            job.get("payload"),
+                        )
 
                 backoff.success()
             except Exception as e:
@@ -602,7 +662,11 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
         backoff = DurableBackoff(task_name="job_heartbeat", db=db, base_delay=settings.job_heartbeat_interval)
         while not shutdown_event.is_set():
             try:
-                claimed = get_claimed_jobs_copy()
+                claimed = (
+                    job_effect_store.claimed_jobs()
+                    if job_effect_store is not None
+                    else get_claimed_jobs_copy()
+                )
                 for job_id, fencing_token in claimed.items():
                     result = await api.heartbeat_job(job_id, fencing_token)
                     if not result:
@@ -612,6 +676,40 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
                 logger.debug(f"Job heartbeat error: {e}")
                 backoff.failure()
 
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=backoff.next_delay())
+                break
+            except asyncio.TimeoutError:
+                pass
+
+    async def job_effect_dispatch_task():
+        """Recover and dispatch durable provider-job effects."""
+        if job_effect_dispatcher is None:
+            return
+        backoff = DurableBackoff(
+            task_name="job_effect_dispatch",
+            db=db,
+            base_delay=settings.talos_job_effect_dispatch_interval,
+        )
+        while not shutdown_event.is_set():
+            try:
+                result = await job_effect_dispatcher.dispatch_once()
+                if result["claimed"]:
+                    log.info(
+                        "job_effect_dispatch_batch",
+                        claimed=result["claimed"],
+                        succeeded=result["succeeded"],
+                        retryable=result["retryable"],
+                        indeterminate=result["indeterminate"],
+                        conflict=result["conflict"],
+                        dead=result["dead"],
+                    )
+                backoff.success()
+            except Exception:
+                # Error details can contain driver or remote payload fragments.
+                # Emit only a stable code and let the next bounded scan retry.
+                log.error("job_effect_dispatch_batch_failed", error_code="batch_failure")
+                backoff.failure()
             try:
                 await asyncio.wait_for(shutdown_event.wait(), timeout=backoff.next_delay())
                 break
@@ -796,6 +894,10 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
         asyncio.create_task(dividend_distribution_task(), name="dividend_distribution"),
         asyncio.create_task(loan_repayment_task(), name="loan_repayment"),
     ]
+    if job_effect_dispatcher is not None:
+        tasks.append(
+            asyncio.create_task(job_effect_dispatch_task(), name="job_effect_dispatch")
+        )
 
     try:
         await shutdown_event.wait()

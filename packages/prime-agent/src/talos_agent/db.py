@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -211,6 +212,61 @@ CREATE TABLE IF NOT EXISTS retry_state (
 );
         """,
     ),
+    (
+        7,
+        """
+CREATE TABLE IF NOT EXISTS job_inbox (
+    owner_talos_id         TEXT NOT NULL,
+    job_id                 TEXT NOT NULL,
+    requester_talos_id     TEXT,
+    service_type           TEXT NOT NULL,
+    payload_json           TEXT NOT NULL,
+    payload_digest         TEXT NOT NULL,
+    state                  TEXT NOT NULL DEFAULT 'received'
+                           CHECK (state IN (
+                               'received', 'claimed', 'effect_pending',
+                               'completed', 'conflict'
+                           )),
+    fencing_token          INTEGER,
+    remote_lease_expires_at TEXT,
+    completed_at           TEXT,
+    created_at             TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at             TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (owner_talos_id, job_id)
+);
+
+CREATE TABLE IF NOT EXISTS job_effect_outbox (
+    effect_id          TEXT PRIMARY KEY,
+    owner_talos_id     TEXT NOT NULL,
+    job_id             TEXT NOT NULL,
+    effect_type        TEXT NOT NULL,
+    deduplication_key  TEXT NOT NULL,
+    result_json        TEXT NOT NULL,
+    result_digest      TEXT NOT NULL,
+    fencing_token      INTEGER NOT NULL,
+    state              TEXT NOT NULL DEFAULT 'pending'
+                       CHECK (state IN (
+                           'pending', 'dispatching', 'succeeded', 'retryable',
+                           'indeterminate', 'conflict', 'dead'
+                       )),
+    attempt_count      INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at    TEXT NOT NULL,
+    lease_owner        TEXT,
+    lease_until        TEXT,
+    last_error_code    TEXT,
+    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (owner_talos_id, deduplication_key),
+    FOREIGN KEY (owner_talos_id, job_id)
+        REFERENCES job_inbox(owner_talos_id, job_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_inbox_state
+    ON job_inbox(owner_talos_id, state, created_at);
+CREATE INDEX IF NOT EXISTS idx_job_effect_outbox_due
+    ON job_effect_outbox(owner_talos_id, state, next_attempt_at, lease_until);
+        """,
+    ),
 ]
 
 
@@ -219,6 +275,11 @@ class LocalDB:
         self._path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(path))
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            # Some platforms/filesystems do not implement POSIX modes.
+            pass
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._run_migrations()
