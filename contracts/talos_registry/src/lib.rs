@@ -11,7 +11,9 @@
 #[cfg(all(test, not(target_arch = "wasm32")))]
 extern crate std;
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec,
+};
 use ttl_manager;
 
 // ── Data Types ──────────────────────────────────────────────────────
@@ -238,7 +240,7 @@ const MAX_MIN_DELAY: u64 = 2_592_000; // 30 days in seconds
 /// This constant is embedded in the WASM binary at compile time and is
 /// therefore immutable once deployed; it cannot be altered by any admin
 /// call, storage write, or cross-contract invocation.
-pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 2, 0);
+pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 1, 0);
 
 /// Stable 32-byte interface identifier for TalosRegistry v1.
 ///
@@ -945,11 +947,7 @@ impl TalosRegistry {
     /// test suite — regenerate from the namespace + version tuple at any
     /// time to verify.
     pub fn interface_id(e: Env) -> BytesN<32> {
-        // `INTERFACE_ID` is a compile-time literal whose length matches
-        // `N = 32` exactly, so the underlying `Result` cannot fail at
-        // runtime. We use `.expect()` to make that invariant explicit.
         BytesN::from_array(&e, &INTERFACE_ID)
-            .expect("INTERFACE_ID is exactly 32 bytes; cannot fail")
     }
 
     /// Return `true` when the deployed contract semver is at least the
@@ -1126,6 +1124,7 @@ mod tests {
         testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke},
         Address, Env, IntoVal, Symbol, TryFromVal,
     };
+    use std::string::ToString;
 
     fn setup() -> (Env, Address) {
         let env = Env::default();
@@ -1214,7 +1213,7 @@ mod tests {
     fn version_returns_compile_time_constant() {
         let (env, contract_id) = setup();
         let client = TalosRegistryClient::new(&env, &contract_id);
-        assert_eq!(client.version(), (1u32, 2u32, 0u32));
+        assert_eq!(client.version(), (1u32, 1u32, 0u32));
     }
 
     #[test]
@@ -1272,8 +1271,7 @@ mod tests {
         let id = client.interface_id();
         // Compare against the compile-time constant byte-for-byte;
         // BytesN<32> implements PartialEq + Debug so we can compare inline.
-        let expected = soroban_sdk::BytesN::<32>::from_array(&env, &INTERFACE_ID)
-            .expect("INTERFACE_ID is exactly 32 bytes");
+        let expected = soroban_sdk::BytesN::<32>::from_array(&env, &INTERFACE_ID);
         assert_eq!(id, expected);
 
         // Spot-check the namespace prefix and version slots are recoverable
@@ -1281,7 +1279,7 @@ mod tests {
         let arr = id.to_array();
         assert_eq!(&arr[..8], b"TalosReg");
         assert_eq!(&arr[8..13], b"istry");
-        assert_eq!(&arr[13], b'v');
+        assert_eq!(arr[13], 0u8);
         // Major/minor/patch slots at offsets 16/20/24
         assert_eq!(&arr[16..20], &CONTRACT_VERSION.0.to_be_bytes());
         assert_eq!(&arr[20..24], &CONTRACT_VERSION.1.to_be_bytes());
@@ -1326,8 +1324,7 @@ mod tests {
     #[test]
     fn interface_id_golden_vector_matches_derivation() {
         let (env, _) = setup();
-        let expected = soroban_sdk::BytesN::<32>::from_array(&env, &INTERFACE_ID)
-            .expect("INTERFACE_ID is exactly 32 bytes");
+        let expected = soroban_sdk::BytesN::<32>::from_array(&env, &INTERFACE_ID);
 
         // Reconstruct from scratch using the documented algorithm.
         let namespace = INTERFACE_NAMESPACE.as_bytes();
@@ -1339,8 +1336,7 @@ mod tests {
         derived[20..24].copy_from_slice(&min.to_be_bytes());
         derived[24..28].copy_from_slice(&patch.to_be_bytes());
         // derived[28..32] remains zero padding — matches the constant.
-        let derived_bytesn = soroban_sdk::BytesN::<32>::from_array(&env, &derived)
-            .expect("derived array is exactly 32 bytes");
+        let derived_bytesn = soroban_sdk::BytesN::<32>::from_array(&env, &derived);
 
         assert_eq!(expected, derived_bytesn);
     }
@@ -1489,7 +1485,7 @@ mod tests {
         assert!(
             replacement.to_string().contains("schedule_action"),
             "replacement should mention schedule_action, got: {}",
-            replacement
+            replacement.to_string()
         );
     }
 

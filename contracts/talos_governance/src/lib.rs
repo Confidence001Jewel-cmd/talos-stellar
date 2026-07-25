@@ -5,7 +5,9 @@
 #[cfg(all(test, not(target_arch = "wasm32")))]
 extern crate std;
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec,
+};
 use ttl_manager;
 
 #[contracttype]
@@ -107,7 +109,7 @@ pub const INTERFACE_NAMESPACE: &str = "TalosGovernance";
 
 pub const INTERFACE_ID: [u8; 32] = [
     0x54, 0x61, 0x6C, 0x6F, 0x73, 0x47, 0x6F, 0x76, // "TalosGov"
-    0x65, 0x72, 0x6E, 0x61, 0x6E, 0x63, 0x76, 0x31, // "ernancv1"
+    0x65, 0x72, 0x6E, 0x61, 0x6E, 0x63, 0x65, 0x00, // "ernance" + zero pad
     // (major, minor, patch) big-endian u32s
     0x00, 0x00, 0x00, 0x01, // major = 1
     0x00, 0x00, 0x00, 0x00, // minor = 0
@@ -384,11 +386,7 @@ impl TalosGovernance {
     /// TalosGovernance v1. See the golden-vector test for the
     /// independent reproduction of the byte layout.
     pub fn interface_id(e: Env) -> BytesN<32> {
-        // `INTERFACE_ID` is a compile-time literal whose length matches
-        // `N = 32` exactly, so the underlying `Result` cannot fail at
-        // runtime. We use `.expect()` to make that invariant explicit.
         BytesN::from_array(&e, &INTERFACE_ID)
-            .expect("INTERFACE_ID is exactly 32 bytes; cannot fail")
     }
 
     /// Return `true` when the deployed semver supports the requested
@@ -582,6 +580,7 @@ mod tests {
         testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
         IntoVal,
     };
+    use std::string::ToString;
 
     fn setup() -> (
         Env,
@@ -794,7 +793,7 @@ mod tests {
 
     #[test]
     fn version_returns_compile_time_constant() {
-        let (env, contract_id, _admin, _pulse, client) = setup();
+        let (_env, contract_id, _admin, _pulse, client) = setup();
         assert_eq!(client.version(), CONTRACT_VERSION);
         // ignore contract_id — used for compile-time coverage of the binding.
         let _ = contract_id;
@@ -826,15 +825,14 @@ mod tests {
     fn interface_id_returns_expected_bytes() {
         let (env, _contract_id, _admin, _pulse, client) = setup();
         let id = client.interface_id();
-        let expected = soroban_sdk::BytesN::<32>::from_array(&env, &INTERFACE_ID)
-            .expect("INTERFACE_ID is exactly 32 bytes");
+        let expected = soroban_sdk::BytesN::<32>::from_array(&env, &INTERFACE_ID);
         assert_eq!(id, expected);
 
         // Recover the namespace prefix and version slots directly.
         let arr = id.to_array();
         assert_eq!(&arr[..11], b"TalosGovern");
         assert_eq!(&arr[11..15], b"ance");
-        assert_eq!(&arr[15], b'v');
+        assert_eq!(arr[15], 0u8);
         // Major/minor/patch slots at offsets 16/20/24
         assert_eq!(&arr[16..20], &CONTRACT_VERSION.0.to_be_bytes());
         assert_eq!(&arr[20..24], &CONTRACT_VERSION.1.to_be_bytes());
@@ -849,8 +847,7 @@ mod tests {
         // tests: if this fails, namespace or version changed without
         // bumping `major` and reviewers should reject the diff.
         let (env, _contract_id, _admin, _pulse, _client) = setup();
-        let expected = soroban_sdk::BytesN::<32>::from_array(&env, &INTERFACE_ID)
-            .expect("INTERFACE_ID is exactly 32 bytes");
+        let expected = soroban_sdk::BytesN::<32>::from_array(&env, &INTERFACE_ID);
 
         let namespace = INTERFACE_NAMESPACE.as_bytes();
         let (maj, min, patch) = CONTRACT_VERSION;
@@ -860,8 +857,7 @@ mod tests {
         derived[16..20].copy_from_slice(&maj.to_be_bytes());
         derived[20..24].copy_from_slice(&min.to_be_bytes());
         derived[24..28].copy_from_slice(&patch.to_be_bytes());
-        let derived_bytesn = soroban_sdk::BytesN::<32>::from_array(&env, &derived)
-            .expect("derived array is exactly 32 bytes");
+        let derived_bytesn = soroban_sdk::BytesN::<32>::from_array(&env, &derived);
 
         assert_eq!(expected, derived_bytesn);
     }

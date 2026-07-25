@@ -169,6 +169,23 @@ pub const INTERFACE_ID: [u8; 32] = [
     0x00, 0x00, 0x00, 0x00,
 ];
 
+/// Expected `INTERFACE_ID` of the configured `RegistryContract`, mirroring
+/// the bytes published by `talos_registry::INTERFACE_ID` (namespace
+/// `"TalosRegistry"`, version `(1, 1, 0)`). Kept as an inline copy rather
+/// than a crate dependency so this contract's ABI check has no build-time
+/// coupling to the Registry crate; see the golden-vector test for the
+/// independent reproduction of the byte layout.
+pub const EXPECTED_REGISTRY_INTERFACE_ID: [u8; 32] = [
+    0x54, 0x61, 0x6C, 0x6F, 0x73, 0x52, 0x65, 0x67, // "TalosReg"
+    0x69, 0x73, 0x74, 0x72, 0x79, 0x00, 0x00, 0x00, // "istry" + zero pads
+    // (major, minor, patch) big-endian u32s
+    0x00, 0x00, 0x00, 0x01, // major = 1
+    0x00, 0x00, 0x00, 0x01, // minor = 1
+    0x00, 0x00, 0x00, 0x00, // patch = 0
+    // reserved
+    0x00, 0x00, 0x00, 0x00,
+];
+
 /// Capability symbols returned by `interface_features()`.
 pub fn features_list() -> &'static [&'static str] {
     &[
@@ -242,10 +259,8 @@ pub fn check_registry_compatible(
         soroban_sdk::vec![e],
     );
 
-    if registry_id != BytesN::from_array(e, &INTERFACE_ID)
-        .expect("INTERFACE_ID is exactly 32 bytes; cannot fail")
-    {
-        let topics = (symbol_short!("compat_err"),);
+    if registry_id != BytesN::from_array(e, &EXPECTED_REGISTRY_INTERFACE_ID) {
+        let topics = (Symbol::new(e, "compat_err"),);
         e.events().publish(topics, ());
         if revert_on_mismatch {
             panic!("Registry interface ID mismatch: expected TalosNameService-compatible v1");
@@ -261,7 +276,7 @@ pub fn check_registry_compatible(
 
     // Require the registry at major=1, minor >= 1.
     if !version_supports(version, (1, 1, 0)) {
-        let topics = (symbol_short!("compat_err"),);
+        let topics = (Symbol::new(e, "compat_err"),);
         e.events()
             .publish(topics, (version.0, version.1, version.2));
         if revert_on_mismatch {
@@ -323,7 +338,7 @@ fn validate_name(name: &String) -> bool {
 /// This constant is embedded in the WASM binary at compile time and is
 /// therefore immutable once deployed; it cannot be altered by any admin
 /// call, storage write, or cross-contract invocation.
-pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 2, 0);
+pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 1, 0);
 
 #[contract]
 pub struct TalosNameService;
@@ -354,11 +369,7 @@ impl TalosNameService {
     /// callers use it to confirm they are talking to a Talos v1
     /// name service before invoking entry-points.
     pub fn interface_id(e: Env) -> BytesN<32> {
-        // `INTERFACE_ID` is a compile-time literal whose length matches
-        // `N = 32` exactly, so the underlying `Result` cannot fail at
-        // runtime. We use `.expect()` to make that invariant explicit.
         BytesN::from_array(&e, &INTERFACE_ID)
-            .expect("INTERFACE_ID is exactly 32 bytes; cannot fail")
     }
 
     /// Return `true` when the deployed semver supports the requested
@@ -848,6 +859,7 @@ mod tests {
         testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke},
         Address, Env, IntoVal, Symbol, TryFromVal,
     };
+    use std::string::ToString;
     use talos_registry::{Kernel, Patron, Pulse, TalosRegistry, TalosRegistryClient};
 
     fn setup() -> (
@@ -980,7 +992,7 @@ mod tests {
     #[test]
     fn version_returns_compile_time_constant() {
         let (_env, _registry_contract, _contract_id, _registry_client, client) = setup();
-        assert_eq!(client.version(), (1u32, 2u32, 0u32));
+        assert_eq!(client.version(), (1u32, 1u32, 0u32));
     }
 
     #[test]
@@ -1037,18 +1049,17 @@ mod tests {
     fn interface_id_returns_expected_bytes() {
         let (env, _registry_contract, _contract_id, _registry_client, client) = setup();
         let id = client.interface_id();
-        let expected = soroban_sdk::BytesN::<32>::from_array(&env, &INTERFACE_ID)
-            .expect("INTERFACE_ID is exactly 32 bytes");
+        let expected = soroban_sdk::BytesN::<32>::from_array(&env, &INTERFACE_ID);
         assert_eq!(id, expected);
 
         // Spot-check the namespace prefix and version slots are recoverable
         // from the returned BytesN so test vectors remain human-auditable.
         let arr = id.to_array();
-        assert_eq!(&arr[..12], b"TalosNameServ");
-        assert_eq!(&arr[12..16], &CONTRACT_VERSION.0.to_be_bytes());
-        assert_eq!(&arr[16..20], &CONTRACT_VERSION.1.to_be_bytes());
-        assert_eq!(&arr[20..24], &CONTRACT_VERSION.2.to_be_bytes());
-        assert_eq!(&arr[24..32], &[0u8; 8]);
+        assert_eq!(&arr[..16], b"TalosNameService");
+        assert_eq!(&arr[16..20], &CONTRACT_VERSION.0.to_be_bytes());
+        assert_eq!(&arr[20..24], &CONTRACT_VERSION.1.to_be_bytes());
+        assert_eq!(&arr[24..28], &CONTRACT_VERSION.2.to_be_bytes());
+        assert_eq!(&arr[28..32], &[0u8; 4]);
     }
 
     #[test]
@@ -1088,8 +1099,7 @@ mod tests {
     #[test]
     fn interface_id_golden_vector_matches_derivation() {
         let (env, _rc, _cid, _rc2, _cli) = setup();
-        let expected = soroban_sdk::BytesN::<32>::from_array(&env, &INTERFACE_ID)
-            .expect("INTERFACE_ID is exactly 32 bytes");
+        let expected = soroban_sdk::BytesN::<32>::from_array(&env, &INTERFACE_ID);
 
         let namespace = INTERFACE_NAMESPACE.as_bytes();
         let (maj, min, patch) = CONTRACT_VERSION;
@@ -1099,8 +1109,7 @@ mod tests {
         derived[16..20].copy_from_slice(&maj.to_be_bytes());
         derived[20..24].copy_from_slice(&min.to_be_bytes());
         derived[24..28].copy_from_slice(&patch.to_be_bytes());
-        let derived_bytesn = soroban_sdk::BytesN::<32>::from_array(&env, &derived)
-            .expect("derived array is exactly 32 bytes");
+        let derived_bytesn = soroban_sdk::BytesN::<32>::from_array(&env, &derived);
 
         assert_eq!(expected, derived_bytesn);
     }
@@ -1209,7 +1218,7 @@ mod tests {
                 if *a != _contract_id {
                     return false;
                 }
-                let sym: Result<Symbol, _> = TryFromVal::try_from_val(env, &t.get(0).unwrap());
+                let sym: Result<Symbol, _> = TryFromVal::try_from_val(&env, &t.get(0).unwrap());
                 sym.map(|s| s == symbol_short!("compat_ok")).unwrap_or(false)
             })
             .collect();
