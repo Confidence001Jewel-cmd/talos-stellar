@@ -24,15 +24,26 @@ import type {
   TransferResponse,
   PaginatedResponse,
 } from "./types.js";
+import {
+  SigningController,
+  canonicalizeRequest,
+  encodeSignature,
+  type RequestSigner,
+  type SigningControllerOptions,
+} from "./signing.js";
 
 export interface TalosClientOptions {
   baseUrl?: string;
   apiKey?: string;
+  /** Opt-in request signer. Omitting it preserves the legacy wire format. */
+  signer?: RequestSigner;
+  signing?: SigningControllerOptions;
 }
 
 export class TalosClient {
   private baseUrl: string;
   private headers: Record<string, string>;
+  private signer?: SigningController;
 
   constructor(options: TalosClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? "https://talos-stellar.vercel.app").replace(/\/$/, "");
@@ -40,6 +51,7 @@ export class TalosClient {
     if (options.apiKey) {
       this.headers["Authorization"] = `Bearer ${options.apiKey}`;
     }
+    if (options.signer) this.signer = new SigningController(options.signer, options.signing);
   }
 
   // ── Internal fetch helper ──────────────────────────────────
@@ -56,9 +68,34 @@ export class TalosClient {
       const qs = new URLSearchParams(filteredParams).toString();
       if (qs) url += `?${qs}`;
     }
+    const headers = { ...this.headers, ...init?.headers };
+    if (this.signer) {
+      const timestamp = new Date().toISOString();
+      const nonce = globalThis.crypto.randomUUID();
+      const bytes = await canonicalizeRequest({
+        method: init?.method ?? "GET",
+        url,
+        headers,
+        body: init?.body,
+        timestamp,
+        nonce,
+      });
+      const signed = await this.signer.sign(
+        { kind: "http-request-v1", bytes },
+        { signal: init?.signal ?? undefined, requestId: nonce },
+      );
+      Object.assign(headers, {
+        "X-Talos-Signature-Version": "talos-request-v1",
+        "X-Talos-Key-Id": signed.keyId,
+        "X-Talos-Algorithm": signed.algorithm,
+        "X-Talos-Timestamp": timestamp,
+        "X-Talos-Nonce": nonce,
+        "X-Talos-Signature": encodeSignature(signed.signature),
+      });
+    }
     const res = await fetch(url, {
       ...init,
-      headers: { ...this.headers, ...init?.headers },
+      headers,
     });
     if (!res.ok) {
       const body = await res.text();
@@ -186,9 +223,13 @@ export class TalosClient {
     const url = `${this.baseUrl}/api/talos/${talosId}/service`;
 
     // 1. Try initial request
+    const initialHeaders = await this.signedHeaders(url, {
+      method: "POST",
+      body: JSON.stringify({ payload }),
+    });
     res = await fetch(url, {
       method: "POST",
-      headers: this.headers,
+      headers: initialHeaders,
       body: JSON.stringify({ payload }),
     });
 
@@ -222,6 +263,37 @@ export class TalosClient {
     }
 
     return res.json() as Promise<CommerceJob>;
+  }
+
+  private async signedHeaders(url: string, init: RequestInit): Promise<Record<string, string>> {
+    if (!this.signer && !init.headers) return { ...this.headers };
+    const merged = new Headers(this.headers);
+    new Headers(init.headers).forEach((value, key) => merged.set(key, value));
+    const headers = Object.fromEntries(merged.entries());
+    if (!this.signer) return headers;
+    const timestamp = new Date().toISOString();
+    const nonce = globalThis.crypto.randomUUID();
+    const bytes = await canonicalizeRequest({
+      method: init.method ?? "GET",
+      url,
+      headers,
+      body: init.body,
+      timestamp,
+      nonce,
+    });
+    const signed = await this.signer.sign(
+      { kind: "http-request-v1", bytes },
+      { signal: init.signal ?? undefined, requestId: nonce },
+    );
+    return {
+      ...headers,
+      "X-Talos-Signature-Version": "talos-request-v1",
+      "X-Talos-Key-Id": signed.keyId,
+      "X-Talos-Algorithm": signed.algorithm,
+      "X-Talos-Timestamp": timestamp,
+      "X-Talos-Nonce": nonce,
+      "X-Talos-Signature": encodeSignature(signed.signature),
+    };
   }
 
   private parseX402Challenge(header: string): Record<string, string> {
