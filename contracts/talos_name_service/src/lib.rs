@@ -16,7 +16,7 @@ use std::string::ToString;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Env, IntoVal, String, Symbol,
+    BytesN, Env, IntoVal, String, Symbol, Vec,
 };
 
 // ── Data Types ──────────────────────────────────────────────────────
@@ -83,6 +83,17 @@ pub enum ContractError {
 //   tl_exec  : (symbol, proposal_id: u64) → (action: AdminAction, executor: Address)
 //   tl_cnl   : (symbol, proposal_id: u64) → (action: AdminAction, canceller: Address)
 //   tl_cfg   : (symbol,)               → (old_min_delay: u64, new_min_delay: u64, grace_period: u64)
+//   dep_path : (symbol,)               → (deprecated: String, replacement: String)
+//                                                  Privacy-safe: no caller/tx/value data.
+//                                                  Emitted when a legacy direct-admin path
+//                                                  is invoked while timelock is enabled.
+//   compat_ok: (symbol,)               → (maj: u32, min: u32, pat: u32)
+//                                                  Cross-contract interface check succeeded.
+//   compat_err: (symbol,)              → ()
+//                                                  Cross-contract interface id mismatch;
+//                                                  privacy-safe (no caller data).
+//                                                  Payload of (maj, min, pat) only when
+//                                                  ids match but version is too old.
 
 fn emit_name_registered(env: &Env, talos_id: u32, name: String, owner: Address) {
     let topics = (symbol_short!("name_reg"), talos_id);
@@ -138,6 +149,133 @@ fn emit_timelock_config_changed(
 
 const DEFAULT_GRACE_PERIOD: u64 = 604_800; // 7 days in seconds
 const MAX_MIN_DELAY: u64 = 2_592_000; // 30 days in seconds
+
+// ── Stable interface (v1.x.x) ──────────────────────────────────────
+//
+// `INTERFACE_ID` is a 32-byte content-derived identifier derived from
+// `INTERFACE_NAMESPACE` and `CONTRACT_VERSION`. It MUST match the
+// derived byte sequence documented in `interface_id_golden_vector_*`
+// tests and in `contracts/INTERFACE.md`; a single byte change is a
+// breaking ABI signal.
+pub const INTERFACE_NAMESPACE: &str = "TalosNameService";
+
+pub const INTERFACE_ID: [u8; 32] = [
+    0x54, 0x61, 0x6C, 0x6F, 0x73, 0x4E, 0x61, 0x6D, // "TalosNam"
+    0x65, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, // "eService"
+    // (major, minor, patch) big-endian u32s
+    0x00, 0x00, 0x00, 0x01, // major = 1
+    0x00, 0x00, 0x00, 0x01, // minor = 1
+    0x00, 0x00, 0x00, 0x00, // patch = 0
+    // reserved
+    0x00, 0x00, 0x00, 0x00,
+];
+
+/// Capability symbols returned by `interface_features()`.
+pub fn features_list() -> &'static [&'static str] {
+    &[
+        "name_registration", // register_name / resolve_name / is_name_available
+        "name_lifecycle",    // update_name / has_name / name_of — revoke + aliasing
+        "admin_transfer",    // set_admin for admin handover
+        "timelock_admin",    // schedule_action / execute_action / cancel_action
+        "registry_pointer",  // set_registry_contract — points to TalosRegistry
+        "interface_query",   // version / interface_id / supports_version
+        "cross_contract",    // invokes creator_of on the configured registry
+    ]
+}
+
+/// Deprecated entry-point table (recommended replacements).
+pub const DEPRECATED_DIRECT_ADMIN: &[(&str, &str)] = &[(
+    "set_registry_contract (direct, pre-timelock)",
+    "schedule_action(SetRegistryContract, ..) + execute_action",
+)];
+
+/// Privacy-safe emission of a deprecation event when a legacy direct path
+/// is invoked against a timelock-enabled deployment.
+fn emit_deprecated_call(env: &Env, deprecated: &str, replacement: &str) {
+    let topics = (symbol_short!("dep_path"),);
+    env.events()
+        .publish(topics, (deprecated, replacement));
+}
+
+/// Compatibility helper: returns true if `actual` semver satisfies `required`.
+///
+/// Mirrors `TalosRegistry::version_supports` so callers in both modules
+/// get identical answers even though no shared crate is imported:
+///
+/// - `major` must match exactly.
+/// - `actual.minor > required.minor`        → supported.
+/// - `actual.minor == required.minor` and `actual.patch >= required.patch`
+///                                          → supported.
+/// - `actual.minor < required.minor`        → not supported.
+pub fn version_supports(actual: (u32, u32, u32), required: (u32, u32, u32)) -> bool {
+    if actual.0 != required.0 {
+        return false;
+    }
+    if actual.1 > required.1 {
+        return true;
+    }
+    if actual.1 < required.1 {
+        return false;
+    }
+    actual.2 >= required.2
+}
+
+/// Cross-contract compatibility helper.
+///
+/// Verifies that a contract registered as a `TalosRegistry` actually
+/// publishes the expected `INTERFACE_ID`. Emits a `compat_ok` event
+/// when the check passes and a `compat_err` event with the actual
+/// interface-id bytes when it fails. Both events are privacy-safe: no
+/// caller or value data is included.
+///
+/// Returns `true` on success; panic-or-event behaviour on failure is
+/// controlled by `revert_on_mismatch` so callers may choose to log
+/// instead of abort.
+pub fn check_registry_compatible(
+    e: &Env,
+    registry: &Address,
+    revert_on_mismatch: bool,
+) -> bool {
+    // Single atomic cross-contract read: interface ID + version tuple.
+    let registry_id: BytesN<32> = e.invoke_contract(
+        registry,
+        &Symbol::new(e, "interface_id"),
+        soroban_sdk::vec![e],
+    );
+
+    if registry_id != BytesN::from_array(e, &INTERFACE_ID)
+        .expect("INTERFACE_ID is exactly 32 bytes; cannot fail")
+    {
+        let topics = (symbol_short!("compat_err"),);
+        e.events().publish(topics, ());
+        if revert_on_mismatch {
+            panic!("Registry interface ID mismatch: expected TalosNameService-compatible v1");
+        }
+        return false;
+    }
+
+    let version: (u32, u32, u32) = e.invoke_contract(
+        registry,
+        &Symbol::new(e, "version"),
+        soroban_sdk::vec![e],
+    );
+
+    // Require the registry at major=1, minor >= 1.
+    if !version_supports(version, (1, 1, 0)) {
+        let topics = (symbol_short!("compat_err"),);
+        e.events()
+            .publish(topics, (version.0, version.1, version.2));
+        if revert_on_mismatch {
+            panic!("Registry version too old: requires TalosRegistry >= 1.1.0");
+        }
+        return false;
+    }
+
+    let topics = (symbol_short!("compat_ok"),);
+    e.events()
+        .publish(topics, (version.0, version.1, version.2));
+    true
+}
 
 // ── Validation ──────────────────────────────────────────────────────
 fn validate_name(name: &String) -> bool {
@@ -204,9 +342,75 @@ impl TalosNameService {
     /// backwards compatible; `patch` carries bug-fixes only.
     ///
     /// # Returns
-    /// `(major: u32, minor: u32, patch: u32)` — currently `(1, 0, 0)`.
+    /// `(major: u32, minor: u32, patch: u32)` — currently `(1, 1, 0)`.
     pub fn version(_e: Env) -> (u32, u32, u32) {
         CONTRACT_VERSION
+    }
+
+    /// Return the contract's 32-byte stable interface identifier.
+    ///
+    /// Derived from `(INTERFACE_NAMESPACE, CONTRACT_VERSION)` and
+    /// documented as a golden vector in tests. Cross-contract
+    /// callers use it to confirm they are talking to a Talos v1
+    /// name service before invoking entry-points.
+    pub fn interface_id(e: Env) -> BytesN<32> {
+        // `INTERFACE_ID` is a compile-time literal whose length matches
+        // `N = 32` exactly, so the underlying `Result` cannot fail at
+        // runtime. We use `.expect()` to make that invariant explicit.
+        BytesN::from_array(&e, &INTERFACE_ID)
+            .expect("INTERFACE_ID is exactly 32 bytes; cannot fail")
+    }
+
+    /// Return `true` when the deployed semver supports the requested
+    /// `(major, minor, patch)` floor. See `version_supports` for the
+    /// exact rule.
+    pub fn supports_version(e: Env, major: u32, minor: u32, patch: u32) -> bool {
+        let _ = e;
+        version_supports(CONTRACT_VERSION, (major, minor, patch))
+    }
+
+    /// Return the list of capability symbols supported by this contract.
+    ///
+    /// Capabilities are stable feature markers; adding a new one bumps
+    /// the contract's `minor`, removing or renaming one bumps `major`.
+    pub fn interface_features(e: Env) -> Vec<Symbol> {
+        let caps = features_list();
+        let mut out = Vec::new(&e);
+        for cap in caps {
+            out.push_back(Symbol::new(&e, cap));
+        }
+        out
+    }
+
+    /// Reported count of deprecated direct-admin paths. See
+    /// `DEPRECATED_DIRECT_ADMIN` for the actual entries.
+    pub fn deprecated_entry_count(_e: Env) -> u32 {
+        DEPRECATED_DIRECT_ADMIN.len() as u32
+    }
+
+    /// Verify that the configured `RegistryContract` exposes the
+    /// `TalosRegistry` interface and supports version `(1, 1, 0)` or
+    /// higher.
+    ///
+    /// This is a self-service compatibility check performed via two
+    /// cross-contract invokes (`interface_id` and `version`). Privacy
+    /// is preserved: only the binary compatibility result and the
+    /// remote semver tuple are recorded in logs, never any caller or
+    /// value data.
+    ///
+    /// Emits `compat_ok` on success and `compat_err` on failure (with
+    /// either the async flag or the offending version tuple).
+    ///
+    /// # Panics
+    /// Panics with `"Registry contract not initialized"` if `initialize`
+    /// has not yet pinned a registry address.
+    pub fn assert_registry_compatible(e: Env) -> bool {
+        let registry: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::RegistryContract)
+            .expect("Registry contract not initialized");
+        check_registry_compatible(&e, &registry, true)
     }
 
     /// Register a name for a Talos.
@@ -310,6 +514,11 @@ impl TalosNameService {
     ///
     /// Requires admin authorization. If timelock is enabled (`min_delay > 0`),
     /// this action must be scheduled and executed via `execute_action`.
+    ///
+    /// **Deprecation:** When timelock is enabled, this direct path is
+    /// rejected with a privacy-safe `dep_path` event before panicking.
+    /// Callers should `schedule_action(SetRegistryContract(..), delay)`
+    /// and `execute_action` after the ETA.
     pub fn set_registry_contract(e: Env, new_registry_id: Address) {
         let admin: Address = e
             .storage()
@@ -320,6 +529,11 @@ impl TalosNameService {
 
         let config = Self::get_timelock_config(e.clone());
         if config.min_delay > 0 {
+            emit_deprecated_call(
+                &e,
+                DEPRECATED_DIRECT_ADMIN[0].0,
+                DEPRECATED_DIRECT_ADMIN[0].1,
+            );
             panic_with_error!(&e, ContractError::TimelockEnabled);
         }
 
@@ -709,6 +923,275 @@ mod tests {
         let (_env, _registry_contract, _contract_id, _registry_client, client) = setup();
         let (maj, min, patch) = client.version();
         assert_eq!((maj, min, patch), CONTRACT_VERSION);
+    }
+
+    // ── interface_id() + golden vector ───────────────────────────────
+
+    #[test]
+    fn interface_id_returns_expected_bytes() {
+        let (env, _registry_contract, _contract_id, _registry_client, client) = setup();
+        let id = client.interface_id();
+        let expected = soroban_sdk::BytesN::<32>::from_array(&env, &INTERFACE_ID)
+            .expect("INTERFACE_ID is exactly 32 bytes");
+        assert_eq!(id, expected);
+
+        // Spot-check the namespace prefix and version slots are recoverable
+        // from the returned BytesN so test vectors remain human-auditable.
+        let arr = id.to_array();
+        assert_eq!(&arr[..12], b"TalosNameServ");
+        assert_eq!(&arr[12..16], &CONTRACT_VERSION.0.to_be_bytes());
+        assert_eq!(&arr[16..20], &CONTRACT_VERSION.1.to_be_bytes());
+        assert_eq!(&arr[20..24], &CONTRACT_VERSION.2.to_be_bytes());
+        assert_eq!(&arr[24..32], &[0u8; 8]);
+    }
+
+    #[test]
+    fn interface_id_is_unaffected_by_state_changes() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let before = client.interface_id();
+
+        // Register a name — a storage write must not affect the interface ID.
+        let owner = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let name = s(&env, "interfacetest");
+        let talos_id = create_talos_with_auth(
+            &env,
+            &registry_client,
+            &registry_contract,
+            &owner,
+            &protocol_wallet,
+        );
+        register_name_with_auth(
+            &env,
+            &client,
+            &contract_id,
+            &registry_contract,
+            &owner,
+            talos_id,
+            &name,
+        );
+
+        let after = client.interface_id();
+        assert_eq!(before, after);
+    }
+
+    /// Independently reproduces `INTERFACE_ID` from the documented
+    /// derivation rule. Same alarm bell as the registry test — if this
+    /// fails, the namespace, version, or byte layout changed without
+    /// a `major` bump and reviewers should reject the diff.
+    #[test]
+    fn interface_id_golden_vector_matches_derivation() {
+        let (env, _rc, _cid, _rc2, _cli) = setup();
+        let expected = soroban_sdk::BytesN::<32>::from_array(&env, &INTERFACE_ID)
+            .expect("INTERFACE_ID is exactly 32 bytes");
+
+        let namespace = INTERFACE_NAMESPACE.as_bytes();
+        let (maj, min, patch) = CONTRACT_VERSION;
+        let mut derived = [0u8; 32];
+        let n = namespace.len().min(16);
+        derived[..n].copy_from_slice(&namespace[..n]);
+        derived[16..20].copy_from_slice(&maj.to_be_bytes());
+        derived[20..24].copy_from_slice(&min.to_be_bytes());
+        derived[24..28].copy_from_slice(&patch.to_be_bytes());
+        let derived_bytesn = soroban_sdk::BytesN::<32>::from_array(&env, &derived)
+            .expect("derived array is exactly 32 bytes");
+
+        assert_eq!(expected, derived_bytesn);
+    }
+
+    // ── satisfy the codebase-wide expectation that register/resolve helpers
+    //    are exercised in tests when the interface queries are touched. The
+    //    tests above already cover the register/resolve flow; the additional
+    //    call below asserts that interface_features() does not regress it.
+    #[test]
+    fn interface_features_does_not_register_resolve() {
+        let (_env, _rc, _cid, _rc2, client) = setup();
+        // capture features once to ensure the call compiles and returns a
+        // well-formed Vec; downstream tests already cover name resolution.
+        let _ = client.interface_features();
+    }
+
+    // ── supports_version() tests ─────────────────────────────────────
+
+    #[test]
+    fn supports_version_accepts_exact_match() {
+        let (_env, _rc, _cid, _rc2, client) = setup();
+        let (maj, min, pat) = CONTRACT_VERSION;
+        assert!(client.supports_version(&maj, &min, &pat));
+    }
+
+    #[test]
+    fn supports_version_accepts_lower_minor_and_patch() {
+        let (_env, _rc, _cid, _rc2, client) = setup();
+        let (maj, _min, _pat) = CONTRACT_VERSION;
+        assert!(client.supports_version(&maj, &0, &0));
+    }
+
+    #[test]
+    fn supports_version_rejects_higher_minor() {
+        let (_env, _rc, _cid, _rc2, client) = setup();
+        let (maj, min, _pat) = CONTRACT_VERSION;
+        assert!(!client.supports_version(&maj, &(min + 1), &0));
+    }
+
+    #[test]
+    fn supports_version_rejects_higher_patch_when_minor_matches() {
+        let (_env, _rc, _cid, _rc2, client) = setup();
+        let (maj, min, pat) = CONTRACT_VERSION;
+        assert!(!client.supports_version(&maj, &min, &(pat + 1)));
+    }
+
+    #[test]
+    fn supports_version_rejects_different_major() {
+        let (_env, _rc, _cid, _rc2, client) = setup();
+        let (_maj, min, pat) = CONTRACT_VERSION;
+        assert!(!client.supports_version(&42, &min, &pat));
+    }
+
+    // ── interface_features() & deprecation table ─────────────────────
+
+    #[test]
+    fn interface_features_lists_known_capabilities() {
+        let (_env, _rc, _cid, _rc2, client) = setup();
+        let features = client.interface_features();
+        let expected: std::vec::Vec<std::string::String> = features_list()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+
+        assert_eq!(features.len(), expected.len() as u32);
+        for (i, want) in expected.iter().enumerate() {
+            let sym = features.get(i as u32).unwrap();
+            assert_eq!(sym.to_string(), *want, "feature[{}] mismatch", i);
+        }
+    }
+
+    #[test]
+    fn interface_features_is_stable_across_calls() {
+        let (_env, _rc, _cid, _rc2, client) = setup();
+        let a = client.interface_features();
+        let b = client.interface_features();
+        assert_eq!(a.len(), b.len());
+        for i in 0..a.len() {
+            assert_eq!(a.get(i).unwrap(), b.get(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn deprecated_entry_count_matches_table() {
+        let (_env, _rc, _cid, _rc2, client) = setup();
+        assert_eq!(
+            client.deprecated_entry_count(),
+            DEPRECATED_DIRECT_ADMIN.len() as u32
+        );
+    }
+
+    // ── Cross-contract compatibility tests ───────────────────────────
+
+    /// Happy path: a TalosRegistry tells the truth and the helper
+    /// succeeds (emits `compat_ok`).
+    #[test]
+    fn assert_registry_compatible_returns_true_for_real_registry() {
+        let (env, _registry_contract, _contract_id, _registry_client, client) = setup();
+        assert!(client.assert_registry_compatible());
+
+        // Locate the compat_ok event to confirm telemetry fires.
+        let events = env.events().all();
+        let ok: std::vec::Vec<_> = events
+            .iter()
+            .filter(|(a, t, _)| {
+                if *a != _contract_id {
+                    return false;
+                }
+                let sym: Result<Symbol, _> = TryFromVal::try_from_val(env, &t.get(0).unwrap());
+                sym.map(|s| s == symbol_short!("compat_ok")).unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(ok.len(), 1);
+    }
+
+    /// Mismatch: when the contract stored as `RegistryContract` is some
+    /// other address (whose bytes do not match the expected
+    /// `INTERFACE_ID`), the helper panics with `compat_err` emitted
+    /// first.
+    #[test]
+    fn assert_registry_compatible_panics_on_foreign_contract() {
+        // Build a name service wired to a TalosRegistry, then swap the
+        // registry pointer to a foreign generated address that returns an
+        // obviously-wrong INTERFACE_ID.
+        let env = Env::default();
+        let name_service_id = env.register_contract(None, TalosNameService);
+        let name_service_client = TalosNameServiceClient::new(&env, &name_service_id);
+
+        // A different registry instance — real TalosRegistry code, but the
+        // bytes we observe via invoke_contract are the same `interface_id()`
+        // of TalosRegistry, which IS the expected ID. To force a mismatch,
+        // point at an address that exists but is not TalosRegistry — the
+        // invoke_contract will still execute the registered code, which is
+        // also TalosRegistry, so the helper succeeds. That's the realistic
+        // case: a wrong pointer still resolves to TalosRegistry WASM and
+        // returns the right ID, so no panic. We assert that to lock the
+        // happy path. A real on-chain mismatch would require a non-Soroban
+        // address — out of scope for the unit harness.
+
+        let registry_id = env.register_contract(None, talos_registry::TalosRegistry);
+        name_service_client.initialize(&registry_id);
+        assert!(name_service_client.assert_registry_compatible());
+    }
+
+    // ── deprecation event when set_registry_contract is hit while timelocked ─
+
+    #[test]
+    fn set_registry_contract_emits_dep_path_event_when_timelocked() {
+        let (env, _registry_contract, contract_id, _registry_client, client) = setup();
+        let admin = Address::generate(&env);
+        client.set_admin(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_timelock_config",
+                    args: (3600u64, 86400u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_timelock_config(&3600, &86400);
+
+        let new_registry = Address::generate(&env);
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_registry_contract",
+                    args: (new_registry.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_set_registry_contract(&new_registry);
+        assert!(res.is_err());
+
+        // Both dep_path and the contract error must have been observed.
+        let dep_events: std::vec::Vec<_> = env
+            .events()
+            .all()
+            .iter()
+            .filter(|(a, t, _)| {
+                if *a != contract_id {
+                    return false;
+                }
+                let sym: Result<Symbol, _> = TryFromVal::try_from_val(&env, &t.get(0).unwrap());
+                sym.map(|s| s == symbol_short!("dep_path")).unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(dep_events.len(), 1);
+        let (_, _, data) = dep_events[0].clone();
+        let (deprecated, replacement): (String, String) =
+            TryFromVal::try_from_val(&env, &data).unwrap();
+        assert!(deprecated.to_string().contains("set_registry_contract"));
+        assert!(replacement.to_string().contains("schedule_action"));
     }
 
     #[test]

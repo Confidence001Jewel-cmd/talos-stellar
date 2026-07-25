@@ -5,7 +5,7 @@
 #[cfg(all(test, not(target_arch = "wasm32")))]
 extern crate std;
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,6 +87,57 @@ fn emit_vote_cast(env: &Env, proposal_id: u32, voter: Address, choice: VoteChoic
 fn emit_proposal_status_changed(env: &Env, proposal_id: u32, status: ProposalStatus) {
     env.events()
         .publish((symbol_short!("prop_stat"), proposal_id), status);
+}
+
+// ── Stable interface (v1.0.0) ───────────────────────────────────────
+//
+// Also fixes a pre-existing omission: Governance did not previously
+// expose `version()` or `interface_id()`. Cross-contract callers and
+// tooling (e.g. an indexer reconciling the protocol's contract families)
+// now read these bytes via the standard interface queries exposed on
+// every Talos contract. The version starts at `(1, 0, 0)` to align
+// with the rest of the v1 protocol generation; the namespace and
+// golden-vector derivation follow the same algorithm as the Registry
+// and Name Service (see `INTERFACE_ID` tests below).
+pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 0, 0);
+
+pub const INTERFACE_NAMESPACE: &str = "TalosGovernance";
+
+pub const INTERFACE_ID: [u8; 32] = [
+    0x54, 0x61, 0x6C, 0x6F, 0x73, 0x47, 0x6F, 0x76, // "TalosGov"
+    0x65, 0x72, 0x6E, 0x61, 0x6E, 0x63, 0x76, 0x31, // "ernancv1"
+    // (major, minor, patch) big-endian u32s
+    0x00, 0x00, 0x00, 0x01, // major = 1
+    0x00, 0x00, 0x00, 0x00, // minor = 0
+    0x00, 0x00, 0x00, 0x00, // patch = 0
+    // reserved
+    0x00, 0x00, 0x00, 0x00,
+];
+
+/// Capability symbols returned by `interface_features()`. Capability
+/// IDs are stable: appending to this list bumps `minor`; renaming or
+/// removing bumps `major`.
+pub fn features_list() -> &'static [&'static str] {
+    &[
+        "proposal_lifecycle", // create_proposal / vote / finalize / execute
+        "vote_weighting",     // snapshot-based token-weighted voting
+        "config_admin",       // update_config / cache_token_balance requires admin
+        "interface_query",    // version / interface_id / supports_version
+    ]
+}
+
+/// SemVer compatibility helper used by `supports_version`.
+pub fn version_supports(actual: (u32, u32, u32), required: (u32, u32, u32)) -> bool {
+    if actual.0 != required.0 {
+        return false;
+    }
+    if actual.1 > required.1 {
+        return true;
+    }
+    if actual.1 < required.1 {
+        return false;
+    }
+    actual.2 >= required.2
 }
 
 #[contract]
@@ -316,6 +367,43 @@ impl TalosGovernance {
 
     pub fn get_admin(env: Env) -> Option<Address> {
         env.storage().persistent().get(&DataKey::Admin)
+    }
+
+    // ── Stable interface (v1.0.0) ───────────────────────────────────
+
+    /// Return `(major, minor, patch)` for this contract. Fixes a
+    /// pre-existing omission; the value is compile-time and immutable
+    /// past deployment.
+    pub fn version(_e: Env) -> (u32, u32, u32) {
+        CONTRACT_VERSION
+    }
+
+    /// Return the 32-byte stable interface identifier for
+    /// TalosGovernance v1. See the golden-vector test for the
+    /// independent reproduction of the byte layout.
+    pub fn interface_id(e: Env) -> BytesN<32> {
+        // `INTERFACE_ID` is a compile-time literal whose length matches
+        // `N = 32` exactly, so the underlying `Result` cannot fail at
+        // runtime. We use `.expect()` to make that invariant explicit.
+        BytesN::from_array(&e, &INTERFACE_ID)
+            .expect("INTERFACE_ID is exactly 32 bytes; cannot fail")
+    }
+
+    /// Return `true` when the deployed semver supports the requested
+    /// `(major, minor, patch)` floor — see `version_supports`.
+    pub fn supports_version(e: Env, major: u32, minor: u32, patch: u32) -> bool {
+        let _ = e;
+        version_supports(CONTRACT_VERSION, (major, minor, patch))
+    }
+
+    /// Return the list of capability symbols offered by this contract.
+    pub fn interface_features(e: Env) -> Vec<Symbol> {
+        let caps = features_list();
+        let mut out = Vec::new(&e);
+        for cap in caps {
+            out.push_back(Symbol::new(&e, cap));
+        }
+        out
     }
 
     pub fn next_proposal_id(env: Env) -> u32 {
@@ -591,5 +679,130 @@ mod tests {
                 },
             }])
             .update_config(&attacker, &config);
+    }
+
+    // ── Stable-interface tests ─────────────────────────────────────
+
+    #[test]
+    fn version_returns_compile_time_constant() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        assert_eq!(client.version(), CONTRACT_VERSION);
+        // ignore contract_id — used for compile-time coverage of the binding.
+        let _ = contract_id;
+    }
+
+    #[test]
+    fn version_is_unaffected_by_state_changes() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let before = client.version();
+
+        // State writes — initialize already ran in setup(); cache_token_balance
+        // is the next admin-only write. Both must not affect version().
+        let voter = Address::generate(&env);
+        cache_balance_with_auth(
+            &env,
+            &contract_id,
+            &client,
+            &admin,
+            90,
+            &voter,
+            100,
+        );
+
+        let after = client.version();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn interface_id_returns_expected_bytes() {
+        let (env, _contract_id, _admin, _pulse, client) = setup();
+        let id = client.interface_id();
+        let expected = soroban_sdk::BytesN::<32>::from_array(&env, &INTERFACE_ID)
+            .expect("INTERFACE_ID is exactly 32 bytes");
+        assert_eq!(id, expected);
+
+        // Recover the namespace prefix and version slots directly.
+        let arr = id.to_array();
+        assert_eq!(&arr[..11], b"TalosGovern");
+        assert_eq!(&arr[11..15], b"ance");
+        assert_eq!(&arr[15], b'v');
+        // Major/minor/patch slots at offsets 16/20/24
+        assert_eq!(&arr[16..20], &CONTRACT_VERSION.0.to_be_bytes());
+        assert_eq!(&arr[20..24], &CONTRACT_VERSION.1.to_be_bytes());
+        assert_eq!(&arr[24..28], &CONTRACT_VERSION.2.to_be_bytes());
+        assert_eq!(&arr[28..32], &[0u8; 4]);
+    }
+
+    #[test]
+    fn interface_id_golden_vector_matches_derivation() {
+        // Independent reproduction of INTERFACE_ID from the documented
+        // algorithm. Same alarm bell as the registry / name-service
+        // tests: if this fails, namespace or version changed without
+        // bumping `major` and reviewers should reject the diff.
+        let (env, _contract_id, _admin, _pulse, _client) = setup();
+        let expected = soroban_sdk::BytesN::<32>::from_array(&env, &INTERFACE_ID)
+            .expect("INTERFACE_ID is exactly 32 bytes");
+
+        let namespace = INTERFACE_NAMESPACE.as_bytes();
+        let (maj, min, patch) = CONTRACT_VERSION;
+        let mut derived = [0u8; 32];
+        let n = namespace.len().min(16);
+        derived[..n].copy_from_slice(&namespace[..n]);
+        derived[16..20].copy_from_slice(&maj.to_be_bytes());
+        derived[20..24].copy_from_slice(&min.to_be_bytes());
+        derived[24..28].copy_from_slice(&patch.to_be_bytes());
+        let derived_bytesn = soroban_sdk::BytesN::<32>::from_array(&env, &derived)
+            .expect("derived array is exactly 32 bytes");
+
+        assert_eq!(expected, derived_bytesn);
+    }
+
+    #[test]
+    fn supports_version_accepts_exact_match() {
+        let (_env, _cid, _admin, _pulse, client) = setup();
+        let (maj, min, pat) = CONTRACT_VERSION;
+        assert!(client.supports_version(&maj, &min, &pat));
+    }
+
+    #[test]
+    fn supports_version_accepts_lower_minor_and_patch() {
+        let (_env, _cid, _admin, _pulse, client) = setup();
+        let (maj, _min, _pat) = CONTRACT_VERSION;
+        assert!(client.supports_version(&maj, &0, &0));
+    }
+
+    #[test]
+    fn supports_version_rejects_higher_minor_and_mismatched_major() {
+        let (_env, _cid, _admin, _pulse, client) = setup();
+        let (maj, min, _pat) = CONTRACT_VERSION;
+        assert!(!client.supports_version(&maj, &(min + 1), &0));
+        assert!(!client.supports_version(&7, &min, &0));
+    }
+
+    #[test]
+    fn interface_features_lists_known_capabilities() {
+        let (_env, _cid, _admin, _pulse, client) = setup();
+        let features = client.interface_features();
+        let expected: std::vec::Vec<std::string::String> = features_list()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+
+        assert_eq!(features.len(), expected.len() as u32);
+        for (i, want) in expected.iter().enumerate() {
+            let sym = features.get(i as u32).unwrap();
+            assert_eq!(sym.to_string(), *want, "feature[{}] mismatch", i);
+        }
+    }
+
+    #[test]
+    fn interface_features_is_stable_across_calls() {
+        let (_env, _cid, _admin, _pulse, client) = setup();
+        let a = client.interface_features();
+        let b = client.interface_features();
+        assert_eq!(a.len(), b.len());
+        for i in 0..a.len() {
+            assert_eq!(a.get(i).unwrap(), b.get(i).unwrap());
+        }
     }
 }
