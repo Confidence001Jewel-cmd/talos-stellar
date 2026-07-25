@@ -2175,4 +2175,419 @@ mod tests {
             .try_propose_admin(&new_admin);
         assert!(res_prop.is_err());
     }
+
+    // ── Ledger-boundary & resource-exhaustion tests ────────────────
+
+    // -- Protocol fee boundaries --
+
+    #[test]
+    fn protocol_fee_zero_bps() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_protocol_fee",
+                    args: (0u32,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_protocol_fee(&0);
+
+        assert_eq!(client.protocol_fee_bps(), Some(0));
+        assert_eq!(client.calculate_protocol_fee(&10_000), 0);
+    }
+
+    #[test]
+    fn protocol_fee_max_bps() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_protocol_fee",
+                    args: (10_000u32,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_protocol_fee(&10_000);
+
+        assert_eq!(client.protocol_fee_bps(), Some(10_000));
+    }
+
+    #[test]
+    fn protocol_fee_above_max_rejected() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_protocol_fee",
+                    args: (10_001u32,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_set_protocol_fee(&10_001);
+        assert!(res.is_err());
+    }
+
+    // -- Fee calculation boundaries --
+
+    #[test]
+    fn calculate_protocol_fee_amount_zero() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        assert_eq!(client.calculate_protocol_fee(&0), 0);
+    }
+
+    #[test]
+    fn calculate_protocol_fee_negative_amount_rejected() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        assert!(client.try_calculate_protocol_fee(&-1).is_err());
+    }
+
+    // -- Timelock boundary: max_min_delay --
+
+    #[test]
+    fn timelock_config_at_max_min_delay() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        // MAX_MIN_DELAY = 2_592_000 should be accepted
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_timelock_config",
+                    args: (2_592_000u64, 86400u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_timelock_config(&2_592_000, &86400);
+
+        let cfg = client.get_timelock_config();
+        assert_eq!(cfg.min_delay, 2_592_000);
+    }
+
+    #[test]
+    fn timelock_config_above_max_min_delay_rejected() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_timelock_config",
+                    args: (2_592_001u64, 86400u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_set_timelock_config(&2_592_001, &86400);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn timelock_config_zero_grace_period_rejected() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_timelock_config",
+                    args: (3600u64, 0u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_set_timelock_config(&3600, &0);
+        assert!(res.is_err());
+    }
+
+    // -- Timelock: schedule_action with delay at min_delay boundary --
+
+    #[test]
+    fn schedule_action_delay_exactly_min_delay_succeeds() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_timelock_config",
+                    args: (3600u64, 86400u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_timelock_config(&3600, &86400);
+
+        let action = AdminAction::SetProtocolFee(500);
+        let id = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "schedule_action",
+                    args: (action.clone(), 3600u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .schedule_action(&action, &3600);
+
+        assert_eq!(id, 1);
+
+        let prop = client.get_timelock_proposal(&id).unwrap();
+        assert_eq!(prop.eta, env.ledger().timestamp() + 3600);
+    }
+
+    #[test]
+    fn schedule_action_delay_below_min_delay_rejected() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_timelock_config",
+                    args: (3600u64, 86400u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_timelock_config(&3600, &86400);
+
+        let action = AdminAction::SetProtocolFee(500);
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "schedule_action",
+                    args: (action.clone(), 3599u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_schedule_action(&action, &3599);
+        assert!(res.is_err());
+    }
+
+    // -- Timelock: execute_action at exact ETA boundary --
+
+    #[test]
+    fn execute_action_at_exact_eta_succeeds() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let action = AdminAction::SetProtocolFee(250);
+        let id = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "schedule_action",
+                    args: (action.clone(), 0u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .schedule_action(&action, &0);
+
+        // At the same timestamp, ETA has been reached (delay=0)
+        client.execute_action(&id);
+        let prop = client.get_timelock_proposal(&id).unwrap();
+        assert_eq!(prop.status, ProposalStatus::Executed);
+    }
+
+    #[test]
+    fn execute_action_at_exact_expiry_boundary_fails() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let action = AdminAction::SetProtocolFee(250);
+        let id = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "schedule_action",
+                    args: (action.clone(), 0u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .schedule_action(&action, &0);
+
+        let prop = client.get_timelock_proposal(&id).unwrap();
+
+        // Advance past grace_period + 1
+        env.ledger().with_mut(|li| {
+            li.timestamp += DEFAULT_GRACE_PERIOD + 1;
+        });
+
+        assert!(client.try_execute_action(&id).is_err());
+    }
+
+    // -- Storage TTL boundary tests --
+
+    #[test]
+    fn get_storage_health_empty_uninitialized() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+
+        let (min_age, max_age, warn, crit, total) = client.get_storage_health();
+        assert_eq!((min_age, max_age, warn, crit, total), (0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn get_storage_health_after_talos_created_no_touch() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        client.initialize(&admin);
+
+        create_talos_with_auth(&env, &client, &contract_id, &creator, &admin);
+
+        let (min_age, max_age, _warn, _crit, total) = client.get_storage_health();
+        assert_eq!(total, 1);
+        // Age should be current_ledger - 0 = 0 since no advancement
+        assert_eq!(min_age, 0);
+        assert_eq!(max_age, 0);
+    }
+
+    #[test]
+    fn touch_talos_skipped_below_threshold() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        client.initialize(&admin);
+
+        let id = create_talos_with_auth(&env, &client, &contract_id, &creator, &admin);
+
+        // At ledger 0, age is 0 → below RENEWAL_THRESHOLD
+        assert!(!client.touch_talos(&id));
+    }
+
+    #[test]
+    fn touch_talos_performed_at_renewal_boundary() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        client.initialize(&admin);
+
+        let id = create_talos_with_auth(&env, &client, &contract_id, &creator, &admin);
+
+        // Advance ledger to exactly RENEWAL_THRESHOLD
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 2_000_000;
+        });
+
+        assert!(client.touch_talos(&id));
+
+        // Verify LastTouched was updated
+        let last_touched: u32 = env
+            .as_contract(&contract_id, || {
+                env.storage()
+                    .persistent()
+                    .get(&DataKey::LastTouched(id))
+            })
+            .unwrap_or(0);
+        assert_eq!(last_touched, 2_000_000);
+    }
+
+    #[test]
+    fn touch_batch_with_start_at_boundary_saturates() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        client.initialize(&admin);
+
+        create_talos_with_auth(&env, &client, &contract_id, &creator, &admin);
+
+        // start_id near u32::MAX with limit — saturating_add prevents overflow
+        let (touched, skipped) = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "touch_batch",
+                    args: (u32::MAX - 1u32, 10u32).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .touch_batch(&(u32::MAX - 1), &10);
+
+        // Should not panic; results are (0,0) since no talos at those IDs
+        assert_eq!((touched, skipped), (0, 0));
+    }
+
+    #[test]
+    fn next_talos_id_defaults_to_one() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+
+        // Before initialization, next_talos_id returns 1
+        assert_eq!(client.next_talos_id(), 1);
+    }
+
+    #[test]
+    fn created_at_uses_ledger_timestamp() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let creator = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+
+        // Set specific timestamp
+        env.ledger().with_mut(|li| {
+            li.timestamp = 1_700_000_000;
+        });
+
+        let id = create_talos_with_auth(&env, &client, &contract_id, &creator, &protocol_wallet);
+        let talos = client.get_talos(&id).unwrap();
+        assert_eq!(talos.created_at, 1_700_000_000);
+    }
 }

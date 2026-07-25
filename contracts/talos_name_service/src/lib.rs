@@ -1269,4 +1269,485 @@ mod tests {
         assert_eq!(prop.status, ProposalStatus::Cancelled);
         assert!(client.try_execute_action(&proposal_id).is_err());
     }
+
+    // ── Ledger-boundary & resource-exhaustion tests ────────────────
+
+    // -- Name validation: boundary lengths --
+
+    #[test]
+    fn register_name_exactly_3_chars() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let owner = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let name = s(&env, "abc");
+
+        let talos_id = create_talos_with_auth(
+            &env,
+            &registry_client,
+            &registry_contract,
+            &owner,
+            &protocol_wallet,
+        );
+
+        register_name_with_auth(
+            &env,
+            &client,
+            &contract_id,
+            &registry_contract,
+            &owner,
+            talos_id,
+            &name,
+        );
+
+        assert_eq!(client.resolve_name(&name), Some(talos_id));
+    }
+
+    #[test]
+    fn register_name_exactly_32_chars() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let owner = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        // Exactly 32 lowercase alphanumeric chars
+        let name = s(&env, "abcdefghij1234567890abcdefghij12");
+        assert_eq!(name.len(), 32);
+
+        let talos_id = create_talos_with_auth(
+            &env,
+            &registry_client,
+            &registry_contract,
+            &owner,
+            &protocol_wallet,
+        );
+
+        register_name_with_auth(
+            &env,
+            &client,
+            &contract_id,
+            &registry_contract,
+            &owner,
+            talos_id,
+            &name,
+        );
+
+        assert_eq!(client.resolve_name(&name), Some(talos_id));
+    }
+
+    #[test]
+    fn register_name_33_chars_rejected() {
+        let (env, _registry_contract, contract_id, _registry_client, client) = setup();
+        let owner = Address::generate(&env);
+        let name = s(&env, "abcdefghij1234567890abcdefghij123");
+        assert_eq!(name.len(), 33);
+
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &owner,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "register_name",
+                    args: (owner.clone(), 1u32, name.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_register_name(&owner, &1, &name);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn is_name_available_returns_false_for_invalid_name() {
+        let (_env, _registry_contract, _contract_id, _registry_client, client) = setup();
+
+        // Too short
+        assert!(!client.is_name_available(&s(&_env, "ab")));
+        // Leading hyphen
+        assert!(!client.is_name_available(&s(&_env, "-abc")));
+        // Uppercase
+        assert!(!client.is_name_available(&s(&_env, "ABC")));
+    }
+
+    // -- Name validation: max-length with all valid character types --
+
+    #[test]
+    fn register_name_all_valid_chars_at_max_length() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let owner = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        // 32 chars: mix of lowercase, digits, and hyphens (no consecutive/leading/trailing)
+        let name = s(&env, "a1b2c3-d4e5f6-g7h8i9-j0k1l2-m3");
+        assert_eq!(name.len(), 32);
+
+        let talos_id = create_talos_with_auth(
+            &env,
+            &registry_client,
+            &registry_contract,
+            &owner,
+            &protocol_wallet,
+        );
+
+        register_name_with_auth(
+            &env,
+            &client,
+            &contract_id,
+            &registry_contract,
+            &owner,
+            talos_id,
+            &name,
+        );
+
+        assert_eq!(client.resolve_name(&name), Some(talos_id));
+    }
+
+    // -- Timelock: max_min_delay boundary --
+
+    #[test]
+    fn name_service_timelock_at_max_min_delay() {
+        let (env, _registry_contract, contract_id, _registry_client, client) = setup();
+        let admin = Address::generate(&env);
+        client.set_admin(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_timelock_config",
+                    args: (2_592_000u64, 86400u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_timelock_config(&2_592_000, &86400);
+
+        let cfg = client.get_timelock_config();
+        assert_eq!(cfg.min_delay, 2_592_000);
+    }
+
+    #[test]
+    fn name_service_timelock_above_max_min_delay_rejected() {
+        let (env, _registry_contract, contract_id, _registry_client, client) = setup();
+        let admin = Address::generate(&env);
+        client.set_admin(&admin);
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_timelock_config",
+                    args: (2_592_001u64, 86400u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_set_timelock_config(&2_592_001, &86400);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn name_service_timelock_zero_grace_period_rejected() {
+        let (env, _registry_contract, contract_id, _registry_client, client) = setup();
+        let admin = Address::generate(&env);
+        client.set_admin(&admin);
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_timelock_config",
+                    args: (3600u64, 0u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_set_timelock_config(&3600, &0);
+        assert!(res.is_err());
+    }
+
+    // -- Timelock: execute at ETA + grace_period boundary --
+
+    #[test]
+    fn name_service_execute_at_exact_eta_plus_grace() {
+        let (env, _registry_contract, contract_id, _registry_client, client) = setup();
+        let admin = Address::generate(&env);
+        client.set_admin(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_timelock_config",
+                    args: (100u64, 500u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_timelock_config(&100, &500);
+
+        let new_registry = Address::generate(&env);
+        let action = AdminAction::SetRegistryContract(new_registry.clone());
+
+        let proposal_id = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "schedule_action",
+                    args: (action.clone(), 100u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .schedule_action(&action, &100);
+
+        // Advance to ETA + grace_period (still within window)
+        env.ledger().with_mut(|li| {
+            li.timestamp += 600; // 100 (delay) + 500 (grace)
+        });
+
+        client.execute_action(&proposal_id);
+
+        let prop = client.get_timelock_proposal(&proposal_id).unwrap();
+        assert_eq!(prop.status, ProposalStatus::Executed);
+    }
+
+    #[test]
+    fn name_service_execute_after_grace_expired_fails() {
+        let (env, _registry_contract, contract_id, _registry_client, client) = setup();
+        let admin = Address::generate(&env);
+        client.set_admin(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_timelock_config",
+                    args: (100u64, 500u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_timelock_config(&100, &500);
+
+        let new_registry = Address::generate(&env);
+        let action = AdminAction::SetRegistryContract(new_registry.clone());
+
+        let proposal_id = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "schedule_action",
+                    args: (action.clone(), 100u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .schedule_action(&action, &100);
+
+        // Advance past ETA + grace_period + 1
+        env.ledger().with_mut(|li| {
+            li.timestamp += 601;
+        });
+
+        assert!(client.try_execute_action(&proposal_id).is_err());
+    }
+
+    // -- Timelock: schedule with delay below min_delay --
+
+    #[test]
+    fn name_service_schedule_below_min_delay_rejected() {
+        let (env, _registry_contract, contract_id, _registry_client, client) = setup();
+        let admin = Address::generate(&env);
+        client.set_admin(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_timelock_config",
+                    args: (3600u64, 86400u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_timelock_config(&3600, &86400);
+
+        let new_registry = Address::generate(&env);
+        let action = AdminAction::SetRegistryContract(new_registry.clone());
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "schedule_action",
+                    args: (action.clone(), 3599u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_schedule_action(&action, &3599);
+        assert!(res.is_err());
+    }
+
+    // -- Storage TTL boundary tests --
+
+    #[test]
+    fn touch_name_at_renewal_boundary() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let owner = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let name = s(&env, "marketbot");
+
+        let talos_id = create_talos_with_auth(
+            &env,
+            &registry_client,
+            &registry_contract,
+            &owner,
+            &protocol_wallet,
+        );
+
+        register_name_with_auth(
+            &env,
+            &client,
+            &contract_id,
+            &registry_contract,
+            &owner,
+            talos_id,
+            &name,
+        );
+
+        // Advance ledger to RENEWAL_THRESHOLD
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 2_000_000;
+        });
+
+        assert!(client.touch_name(&name));
+    }
+
+    #[test]
+    fn touch_name_skipped_below_renewal() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let owner = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let name = s(&env, "marketbot");
+
+        let talos_id = create_talos_with_auth(
+            &env,
+            &registry_client,
+            &registry_contract,
+            &owner,
+            &protocol_wallet,
+        );
+
+        register_name_with_auth(
+            &env,
+            &client,
+            &contract_id,
+            &registry_contract,
+            &owner,
+            talos_id,
+            &name,
+        );
+
+        // At ledger 0, age is 0 → skipped
+        assert!(!client.touch_name(&name));
+    }
+
+    #[test]
+    fn get_storage_health_empty_name_records() {
+        let (_env, _registry_contract, _contract_id, _registry_client, client) = setup();
+
+        // No name records registered yet
+        let (min_age, max_age, warn, crit, total) = client.get_storage_health(&1);
+        assert_eq!((min_age, max_age, warn, crit, total), (0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn get_storage_health_with_name_record() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let owner = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let name = s(&env, "testbot");
+
+        let talos_id = create_talos_with_auth(
+            &env,
+            &registry_client,
+            &registry_contract,
+            &owner,
+            &protocol_wallet,
+        );
+
+        register_name_with_auth(
+            &env,
+            &client,
+            &contract_id,
+            &registry_contract,
+            &owner,
+            talos_id,
+            &name,
+        );
+
+        let (min_age, max_age, _warn, _crit, total) = client.get_storage_health(&talos_id);
+        assert_eq!(total, 1);
+        assert_eq!(min_age, 0);
+        assert_eq!(max_age, 0);
+    }
+
+    // -- touch_all_ttl boundary --
+
+    #[test]
+    fn touch_all_ttl_no_names_registered_touches_only_admin_keys() {
+        let (_env, _registry_contract, _contract_id, _registry_client, client) = setup();
+        let admin = Address::generate(&_env);
+        client.set_admin(&admin);
+
+        // max_talos_id = 1, but none registered
+        let touched = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &_contract_id,
+                    fn_name: "touch_all_ttl",
+                    args: (1u32,).into_val(&_env),
+                    sub_invokes: &[],
+                },
+            }])
+            .touch_all_ttl(&1);
+
+        // Only admin keys are touched, no name records
+        assert_eq!(touched, 2);
+    }
+
+    #[test]
+    fn set_admin_transfers_authority() {
+        let (_env, _registry_contract, _contract_id, _registry_client, client) = setup();
+        let admin = Address::generate(&_env);
+        let new_admin = Address::generate(&_env);
+        client.set_admin(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &_contract_id,
+                    fn_name: "set_admin",
+                    args: (new_admin.clone(),).into_val(&_env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_admin(&new_admin);
+
+        // Verify admin was updated by testing that new_admin can set timelock config
+        client
+            .mock_auths(&[MockAuth {
+                address: &new_admin,
+                invoke: &MockAuthInvoke {
+                    contract: &_contract_id,
+                    fn_name: "set_timelock_config",
+                    args: (3600u64, 86400u64).into_val(&_env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_timelock_config(&3600, &86400);
+
+        let cfg = client.get_timelock_config();
+        assert_eq!(cfg.min_delay, 3600);
+    }
 }

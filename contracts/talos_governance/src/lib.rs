@@ -701,4 +701,497 @@ mod tests {
             }])
             .update_config(&attacker, &config);
     }
+
+    // ── Ledger-boundary & resource-exhaustion tests ────────────────
+
+    // -- Initialization boundaries --
+
+    #[test]
+    #[should_panic(expected = "Quorum must be positive")]
+    fn initialize_rejects_zero_quorum() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, TalosGovernance);
+        let client = TalosGovernanceClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let pulse = Address::generate(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (admin.clone(), pulse.clone(), 0_i128, 5_100_i128, 20_u32)
+                        .into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin, &pulse, &0_i128, &5_100_i128, &20_u32);
+    }
+
+    #[test]
+    fn initialize_accepts_boundary_consensus_thresholds() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, TalosGovernance);
+        let client = TalosGovernanceClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let pulse = Address::generate(&env);
+
+        // Minimum: 1 bps
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (admin.clone(), pulse.clone(), 100_i128, 1_i128, 20_u32)
+                        .into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin, &pulse, &100_i128, &1_i128, &20_u32);
+
+        let cfg = client.get_config().unwrap();
+        assert_eq!(cfg.consensus_threshold, 1);
+    }
+
+    #[test]
+    fn initialize_accepts_max_consensus_threshold() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, TalosGovernance);
+        let client = TalosGovernanceClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let pulse = Address::generate(&env);
+
+        // Maximum: 10_000 bps (100%)
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (
+                        admin.clone(),
+                        pulse.clone(),
+                        100_i128,
+                        10_000_i128,
+                        20_u32,
+                    )
+                        .into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin, &pulse, &100_i128, &10_000_i128, &20_u32);
+
+        let cfg = client.get_config().unwrap();
+        assert_eq!(cfg.consensus_threshold, 10_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "Consensus threshold must be 1..10000 bps")]
+    fn initialize_rejects_consensus_above_max() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, TalosGovernance);
+        let client = TalosGovernanceClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let pulse = Address::generate(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (
+                        admin.clone(),
+                        pulse.clone(),
+                        100_i128,
+                        10_001_i128,
+                        20_u32,
+                    )
+                        .into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin, &pulse, &100_i128, &10_001_i128, &20_u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Voting period must be positive")]
+    fn initialize_rejects_zero_voting_period() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, TalosGovernance);
+        let client = TalosGovernanceClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let pulse = Address::generate(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (admin.clone(), pulse.clone(), 100_i128, 5_100_i128, 0_u32)
+                        .into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin, &pulse, &100_i128, &5_100_i128, &0_u32);
+    }
+
+    // -- Voting boundary tests --
+
+    #[test]
+    fn vote_exactly_at_end_ledger_succeeds() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+
+        cache_balance_with_auth(
+            &env,
+            &contract_id,
+            &client,
+            &admin,
+            proposal.snapshot_ledger,
+            &voter,
+            200,
+        );
+
+        // Advance to exactly end_ledger
+        env.ledger().with_mut(|li| {
+            li.sequence_number = proposal.end_ledger;
+        });
+
+        // Voting should still succeed at the boundary
+        client
+            .mock_auths(&[MockAuth {
+                address: &voter,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "vote",
+                    args: (voter.clone(), proposal_id, VoteChoice::Approve).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .vote(&voter, &proposal_id, &VoteChoice::Approve);
+    }
+
+    #[test]
+    #[should_panic(expected = "Voting period has ended")]
+    fn vote_after_end_ledger_fails() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+
+        cache_balance_with_auth(
+            &env,
+            &contract_id,
+            &client,
+            &admin,
+            proposal.snapshot_ledger,
+            &voter,
+            200,
+        );
+
+        // Advance past end_ledger
+        env.ledger().with_mut(|li| {
+            li.sequence_number = proposal.end_ledger + 1;
+        });
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &voter,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "vote",
+                    args: (voter.clone(), proposal_id, VoteChoice::Approve).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .vote(&voter, &proposal_id, &VoteChoice::Approve);
+    }
+
+    #[test]
+    #[should_panic(expected = "No voting power")]
+    fn vote_with_zero_balance_rejected() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+
+        // No cached balance → voting power is 0
+        client
+            .mock_auths(&[MockAuth {
+                address: &voter,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "vote",
+                    args: (voter.clone(), proposal_id, VoteChoice::Approve).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .vote(&voter, &proposal_id, &VoteChoice::Approve);
+    }
+
+    // -- Quorum boundary tests --
+
+    #[test]
+    fn finalize_rejects_when_below_quorum() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+
+        // Cache balance below quorum (quorum is 100, weight is 99)
+        cache_balance_with_auth(
+            &env,
+            &contract_id,
+            &client,
+            &admin,
+            proposal.snapshot_ledger,
+            &voter,
+            99,
+        );
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &voter,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "vote",
+                    args: (voter.clone(), proposal_id, VoteChoice::Approve).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .vote(&voter, &proposal_id, &VoteChoice::Approve);
+
+        // Voting complete but below quorum — still Active
+        let updated = client.get_proposal(&proposal_id).unwrap();
+        assert_eq!(updated.status, ProposalStatus::Active);
+
+        // Advance past voting period and finalize
+        env.ledger().with_mut(|li| {
+            li.sequence_number = proposal.end_ledger + 1;
+        });
+        client.finalize_proposal(&proposal_id);
+
+        let finalized = client.get_proposal(&proposal_id).unwrap();
+        assert_eq!(finalized.status, ProposalStatus::Rejected);
+    }
+
+    #[test]
+    fn proposal_approved_when_exactly_at_quorum_and_consensus() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+
+        // Cache balance exactly at quorum (quorum is 100)
+        cache_balance_with_auth(
+            &env,
+            &contract_id,
+            &client,
+            &admin,
+            proposal.snapshot_ledger,
+            &voter,
+            100,
+        );
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &voter,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "vote",
+                    args: (voter.clone(), proposal_id, VoteChoice::Approve).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .vote(&voter, &proposal_id, &VoteChoice::Approve);
+
+        // Exactly at quorum with 100% approve → should be Approved immediately
+        let updated = client.get_proposal(&proposal_id).unwrap();
+        assert_eq!(updated.status, ProposalStatus::Approved);
+        assert_eq!(updated.yes_votes, 100);
+    }
+
+    // -- Ledger-boundary snapshot tests --
+
+    #[test]
+    fn create_proposal_when_ledger_below_10_uses_saturating_sub() {
+        let env = Env::default();
+        // Start at ledger 5 — below the 10-ledger snapshot window
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 5;
+            li.timestamp = 1_000;
+        });
+
+        let contract_id = env.register_contract(None, TalosGovernance);
+        let client = TalosGovernanceClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let pulse = Address::generate(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (admin.clone(), pulse.clone(), 100_i128, 5_100_i128, 20_u32)
+                        .into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin, &pulse, &100_i128, &5_100_i128, &20_u32);
+
+        let proposer = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+
+        // snapshot_ledger should be 0 (saturating_sub: 5 - 10 = 0)
+        assert_eq!(proposal.snapshot_ledger, 0);
+    }
+
+    // -- cache_token_balance boundary --
+
+    #[test]
+    #[should_panic(expected = "Balance cannot be negative")]
+    fn cache_token_balance_rejects_negative() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let voter = Address::generate(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "cache_token_balance",
+                    args: (admin.clone(), 90_u32, voter.clone(), -1_i128).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .cache_token_balance(&admin, &90_u32, &voter, &-1_i128);
+    }
+
+    #[test]
+    fn cache_token_balance_accepts_zero() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let voter = Address::generate(&env);
+
+        // Zero balance should be accepted (the caller just has no voting power)
+        let ledger = 90_u32;
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "cache_token_balance",
+                    args: (admin.clone(), ledger, voter.clone(), 0_i128).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .cache_token_balance(&admin, &ledger, &voter, &0_i128);
+
+        // Should succeed without panic
+        let balance = env
+            .as_contract(&contract_id, || {
+                env.storage()
+                    .persistent()
+                    .get::<_, i128>(&DataKey::TokenBalanceSnapshot(ledger, voter))
+            });
+        assert_eq!(balance, Some(0_i128));
+    }
+
+    // -- Storage TTL boundary tests --
+
+    #[test]
+    fn get_storage_health_empty_registry_returns_zeros() {
+        let env = Env::default();
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 100;
+            li.timestamp = 1_000;
+        });
+
+        let contract_id = env.register_contract(None, TalosGovernance);
+        let client = TalosGovernanceClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let pulse = Address::generate(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (admin.clone(), pulse.clone(), 100_i128, 5_100_i128, 20_u32)
+                        .into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin, &pulse, &100_i128, &5_100_i128, &20_u32);
+
+        let (min_age, max_age, warn, crit, total) = client.get_storage_health();
+        // No proposals yet → empty
+        assert_eq!((min_age, max_age, warn, crit, total), (0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn touch_proposal_at_ledger_zero() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+
+        // At ledger 100, LastTouched is 0, so age = 100 < RENEWAL_THRESHOLD
+        assert!(!client.touch_proposal(&proposal_id));
+    }
+
+    #[test]
+    fn touch_proposal_at_renewal_boundary() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+
+        // Advance ledger to exactly 2_000_000 (at RENEWAL_THRESHOLD)
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 2_000_000;
+        });
+
+        // age = 2_000_000 - 0 = 2_000_000 >= RENEWAL_THRESHOLD → should touch
+        assert!(client.touch_proposal(&proposal_id));
+    }
+
+    // -- Finalize boundary test --
+
+    #[test]
+    #[should_panic(expected = "Voting period has not ended")]
+    fn finalize_before_period_ends_fails() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+
+        // Still at ledger 100, end is at 120 → cannot finalize
+        client.finalize_proposal(&proposal_id);
+    }
+
+    #[test]
+    fn finalize_at_exact_end_ledger_plus_one() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+
+        // Advance exactly to end_ledger + 1
+        env.ledger().with_mut(|li| {
+            li.sequence_number = proposal.end_ledger + 1;
+        });
+
+        // Should not panic — voting period has ended
+        client.finalize_proposal(&proposal_id);
+    }
 }
