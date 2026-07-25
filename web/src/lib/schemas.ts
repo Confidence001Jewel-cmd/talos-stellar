@@ -3,46 +3,126 @@
  * Shared across all POST endpoints to ensure consistent validation.
  */
 import { z } from "zod/v4";
-import { StrKey } from "@stellar/stellar-sdk";
 
-export const stellarAssetCodeSchema = z
-  .string()
-  .min(1, "Asset code must be at least 1 character")
-  .max(12, "Asset code must be at most 12 characters")
-  .regex(
-    /^[A-Z0-9]+$/,
-    "Asset code must contain only uppercase letters and numbers",
-  );
+// ── Stellar StrKey helpers ───────────────────────────────────────────────────
 
-export const stellarPublicKeySchema = z
-  .string()
-  .startsWith("G", "Stellar public key must start with 'G'")
-  .length(56, "Stellar public key must be exactly 56 characters")
-  .refine(
-    (key) => {
-      try {
-        return StrKey.isValidEd25519PublicKey(key);
-      } catch {
-        return false;
-      }
-    },
-    { message: "Invalid Stellar Ed25519 public key" },
-  );
+const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
-export const stellarNativeAssetSchema = z.object({
-  type: z.literal("native"),
-}).strict();
+function base32Decode(input: string): Uint8Array | null {
+  const cleaned = input.toUpperCase().replace(/=/g, "");
+  const len = cleaned.length;
+  if (len === 0 || len % 8 !== 0) return null;
 
-export const stellarIssuedAssetSchema = z.object({
-  type: z.literal("issued"),
-  code: stellarAssetCodeSchema,
-  issuer: stellarPublicKeySchema,
-}).strict();
+  const out: number[] = [];
+  let bits = 0;
+  let value = 0;
 
-export const stellarAssetSchema = z.discriminatedUnion("type", [
-  stellarNativeAssetSchema,
-  stellarIssuedAssetSchema,
+  for (let i = 0; i < len; i++) {
+    const idx = BASE32_ALPHABET.indexOf(cleaned[i]);
+    if (idx === -1) return null;
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push((value >>> bits) & 0xff);
+    }
+  }
+  return new Uint8Array(out);
+}
+
+const CRC16_TABLE = (() => {
+  const table = new Uint16Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i << 8;
+    for (let j = 0; j < 8; j++) c = c & 0x8000 ? (c << 1) ^ 0x1021 : c << 1;
+    table[i] = c & 0xffff;
+  }
+  return table;
+})();
+
+function crc16(bytes: Uint8Array): number {
+  let crc = 0;
+  for (const b of bytes) crc = ((crc << 8) ^ CRC16_TABLE[((crc >>> 8) ^ b) & 0xff]) & 0xffff;
+  return crc;
+}
+
+/**
+ * Decode a Stellar StrKey-encoded public key and verify its CRC16 checksum.
+ * Accepts version bytes 0x30 (ed25519 public) and 0xb0 (ed25519签 seed).
+ * Returns the raw payload on success, null on any validation failure.
+ */
+function decodeStrKey(strKey: string): Uint8Array | null {
+  if (typeof strKey !== "string") return null;
+  const decoded = base32Decode(strKey);
+  if (!decoded || decoded.length < 4) return null;
+
+  const version = decoded[0];
+  if (version !== 0x30 && version !== 0xb0) return null;
+
+  const payload = decoded.slice(0, decoded.length - 2);
+  // Stellar stores CRC-16 little-endian (LSB first)
+  const checksum =
+    decoded[decoded.length - 2] | (decoded[decoded.length - 1] << 8);
+
+  if (crc16(payload) !== checksum) return null;
+
+  // ed25519 public key payload must be exactly 32 bytes (version + 32)
+  if (version === 0x30 && payload.length !== 33) return null;
+  // ed25519 secret seed payload must be exactly 33 bytes (version + 32)
+  if (version === 0xb0 && payload.length !== 33) return null;
+
+  return payload;
+}
+
+function isValidStellarPublicKey(value: string): boolean {
+  return decodeStrKey(value) !== null;
+}
+
+// ── Shared Stellar asset schema ──────────────────────────────────────────────
+
+/**
+ * Discriminated schema for Stellar native or issued assets.
+ *
+ * Native (XLM):
+ *   { "native": true }
+ *
+ * Issued token (e.g. USDC, MITOS):
+ *   { "code": "USDC", "issuer": "GABC...56chars" }
+ *
+ * The issuer field must be a valid Stellar StrKey with a verified CRC16
+ * checksum.  Asset codes are constrained to 1-12 uppercase alphanumeric
+ * characters, matching the Stellar protocol limits.
+ */
+export const stellarAssetSchema = z.union([
+  z.object({
+    native: z.literal(true),
+    code: z.undefined().optional(),
+    issuer: z.undefined().optional(),
+  }),
+  z.object({
+    native: z.undefined().optional(),
+    code: z
+      .string()
+      .min(1, "Asset code is required for issued assets")
+      .max(12, "Asset code must be at most 12 characters")
+      .regex(/^[A-Z0-9]{1,12}$/, "Asset code must be 1-12 uppercase alphanumeric characters"),
+    issuer: z.string().refine(isValidStellarPublicKey, {
+      message: "Issuer must be a valid Stellar public key (G..., 56 chars, valid checksum)",
+    }),
+  }),
 ]);
+
+/** Inferred type for use in route handlers. */
+export type StellarAsset = z.infer<typeof stellarAssetSchema>;
+
+/**
+ * Optional asset field for schemas where the caller may omit the asset
+ * (defaults to native XLM).  When provided, the value must pass the full
+ * stellarAssetSchema validation.
+ */
+export const optionalStellarAssetField = stellarAssetSchema.optional();
+
+// ── Categories ───────────────────────────────────────────────────────────────
 
 export const VALID_CATEGORIES = [
   "Marketing", "Development", "Research", "Design", "Finance",
@@ -78,7 +158,15 @@ export const createTalosSchema = z.object({
   agentName: z.string().max(100).nullable().optional(),
   initialPrice: z.number().nonnegative().optional().default(0),
   minPatronPulse: z.number().int().nonnegative().nullable().optional(),
-  stellarAssetCode: stellarAssetCodeSchema.nullable().optional(),
+  stellarAssetCode: z.string().nullable().optional().refine(
+    (val) => {
+      if (val === null || val === undefined || val === "") return true;
+      const match = val.match(/^([A-Z0-9]{1,12}):(.+)$/);
+      if (!match) return false;
+      return isValidStellarPublicKey(match[2]);
+    },
+    { message: "stellarAssetCode must be null or in the format 'CODE:G...55chars' with a valid issuer checksum (e.g. 'MITOS:GABC...')" },
+  ),
   tokenSymbol: z.string().max(20).nullable().optional(),
   serviceName: z.string().min(1).max(200).optional(),
   serviceDescription: z.string().max(2000).optional(),
@@ -226,7 +314,9 @@ export const regenerateKeySchema = z.object({
 export const signPaymentSchema = z.object({
   payee: stellarPublicKeySchema,
   amount: z.union([z.string(), z.number()]),
-  assetCode: stellarAssetCodeSchema.optional().default("USDC"),
+  asset: optionalStellarAssetField,
+  /** @deprecated Use `asset` instead. Kept for backward compatibility. */
+  assetCode: z.string().optional(),
 });
 
 // --- Buy Token ---
