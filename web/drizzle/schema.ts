@@ -34,8 +34,17 @@ export const tlsTalos = pgTable("tls_talos", {
 	treasuryPublicKey: text(),
 	agentWalletId: text(),
 	agentWalletAddress: text(),
+	// Retirement tracking - preserves historical identity while preventing reuse
+	retiredAt: timestamp({ precision: 3, mode: 'string' }),
+	retiredReason: text(),
+	supersededBy: text(),
+	// Soft deletion - separates identity retirement from privacy deletion
+	deletedAt: timestamp({ precision: 3, mode: 'string' }),
+	deletedReason: text(),
 }, (table) => [
 	uniqueIndex("tls_talos_apiKey_key").using("btree", table.apiKey.asc().nullsLast().op("text_ops")),
+	// Partial unique index: agentName must be unique among non-retired agents
+	uniqueIndex("tls_talos_agentName_active_key").using("btree", table.agentName.asc().nullsLast().op("text_ops")).where(sql`"retiredAt" IS NULL`),
 ]);
 
 export const tlsPatrons = pgTable("tls_patrons", {
@@ -54,7 +63,7 @@ export const tlsPatrons = pgTable("tls_patrons", {
 			columns: [table.talosId],
 			foreignColumns: [tlsTalos.id],
 			name: "tls_patrons_talosId_fkey"
-		}).onUpdate("cascade").onDelete("cascade"),
+		}).onUpdate("cascade").onDelete("restrict"),
 ]);
 
 export const tlsActivities = pgTable("tls_activities", {
@@ -71,7 +80,7 @@ export const tlsActivities = pgTable("tls_activities", {
 			columns: [table.talosId],
 			foreignColumns: [tlsTalos.id],
 			name: "tls_activities_talosId_fkey"
-		}).onUpdate("cascade").onDelete("cascade"),
+		}).onUpdate("cascade").onDelete("restrict"),
 ]);
 
 export const tlsCommerceJobs = pgTable("tls_commerce_jobs", {
@@ -98,7 +107,7 @@ export const tlsCommerceJobs = pgTable("tls_commerce_jobs", {
 			columns: [table.talosId],
 			foreignColumns: [tlsTalos.id],
 			name: "tls_commerce_jobs_talosId_fkey"
-		}).onUpdate("cascade").onDelete("cascade"),
+		}).onUpdate("cascade").onDelete("restrict"),
 ]);
 
 export const tlsCommerceServices = pgTable("tls_commerce_services", {
@@ -119,7 +128,7 @@ export const tlsCommerceServices = pgTable("tls_commerce_services", {
 			columns: [table.talosId],
 			foreignColumns: [tlsTalos.id],
 			name: "tls_commerce_services_talosId_fkey"
-		}).onUpdate("cascade").onDelete("cascade"),
+		}).onUpdate("cascade").onDelete("restrict"),
 ]);
 
 export const tlsApprovals = pgTable("tls_approvals", {
@@ -140,7 +149,7 @@ export const tlsApprovals = pgTable("tls_approvals", {
 			columns: [table.talosId],
 			foreignColumns: [tlsTalos.id],
 			name: "tls_approvals_talosId_fkey"
-		}).onUpdate("cascade").onDelete("cascade"),
+		}).onUpdate("cascade").onDelete("restrict"),
 ]);
 
 export const tlsRevenues = pgTable("tls_revenues", {
@@ -157,7 +166,7 @@ export const tlsRevenues = pgTable("tls_revenues", {
 			columns: [table.talosId],
 			foreignColumns: [tlsTalos.id],
 			name: "tls_revenues_talosId_fkey"
-		}).onUpdate("cascade").onDelete("cascade"),
+		}).onUpdate("cascade").onDelete("restrict"),
 ]);
 
 export const tlsPlaybooks = pgTable("tls_playbooks", {
@@ -185,7 +194,7 @@ export const tlsPlaybooks = pgTable("tls_playbooks", {
 			columns: [table.talosId],
 			foreignColumns: [tlsTalos.id],
 			name: "tls_playbooks_talosId_fkey"
-		}).onUpdate("cascade").onDelete("cascade"),
+		}).onUpdate("cascade").onDelete("restrict"),
 ]);
 
 export const tlsPlaybookPurchases = pgTable("tls_playbook_purchases", {
@@ -201,7 +210,7 @@ export const tlsPlaybookPurchases = pgTable("tls_playbook_purchases", {
 			columns: [table.playbookId],
 			foreignColumns: [tlsPlaybooks.id],
 			name: "tls_playbook_purchases_playbookId_fkey"
-		}).onUpdate("cascade").onDelete("cascade"),
+		}).onUpdate("cascade").onDelete("restrict"),
 ]);
 
 export const tlsTokenPurchases = pgTable("tls_token_purchases", {

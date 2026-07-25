@@ -64,9 +64,25 @@ export const tlsTalos = pgTable(
     agentWalletId: text("agentWalletId"),             // Stellar public key (G...) — wallet identifier
     agentWalletAddress: text("agentWalletAddress"),   // Stellar public key (G...) — for display/payment routing
 
+    // Retirement tracking - preserves historical identity while preventing reuse
+    retiredAt: timestamp("retiredAt", { mode: "date", precision: 3 }),
+    retiredReason: text("retiredReason"),
+    supersededBy: text("supersededBy"),               // References tlsTalos.id of replacement agent
+
+    // Soft deletion - separates identity retirement from privacy deletion
+    deletedAt: timestamp("deletedAt", { mode: "date", precision: 3 }),
+    deletedReason: text("deletedReason"),
+
     createdAt: timestamp("createdAt", { mode: "date", precision: 3 }).notNull().defaultNow(),
     updatedAt: timestamp("updatedAt", { mode: "date", precision: 3 }).notNull().$onUpdate(() => new Date()),
   },
+  (t) => [
+    // Partial unique index: agentName must be unique among non-retired agents
+    // This prevents name reuse while allowing retired agents to keep their names
+    uniqueIndex("tls_talos_agentName_active_key")
+      .on(t.agentName)
+      .where(sql`"retiredAt" IS NULL`),
+  ],
 );
 
 // ─── Patron (Shareholder) ─────────────────────────────────────────
@@ -75,7 +91,7 @@ export const tlsPatrons = pgTable(
   "tls_patrons",
   {
     id: text("id").primaryKey().$defaultFn(() => createId()),
-    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "cascade" }),
+    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "restrict" }),
     stellarPublicKey: text("stellarPublicKey").notNull(),
     role: text("role").notNull(),
     pulseAmount: integer("pulseAmount").notNull().default(0),
@@ -96,7 +112,7 @@ export const tlsActivities = pgTable(
   "tls_activities",
   {
     id: text("id").primaryKey().$defaultFn(() => createId()),
-    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "cascade" }),
+    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "restrict" }),
     type: text("type").notNull(),
     content: text("content").notNull(),
     channel: text("channel").notNull(),
@@ -115,7 +131,7 @@ export const tlsApprovals = pgTable(
   "tls_approvals",
   {
     id: text("id").primaryKey().$defaultFn(() => createId()),
-    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "cascade" }),
+    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "restrict" }),
     type: text("type").notNull(),
     title: text("title").notNull(),
     description: text("description"),
@@ -140,7 +156,7 @@ export const tlsRevenues = pgTable(
   "tls_revenues",
   {
     id: text("id").primaryKey().$defaultFn(() => createId()),
-    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "cascade" }),
+    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "restrict" }),
     amount: numeric("amount", { precision: 18, scale: 6 }).notNull(),
     currency: text("currency").notNull().default("USDC"),
     source: text("source").notNull(),
@@ -164,7 +180,7 @@ export const tlsDividends = pgTable(
   "tls_dividends",
   {
     id: text("id").primaryKey().$defaultFn(() => createId()),
-    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "cascade" }),
+    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "restrict" }),
 
     // Total USDC (or other currency) distributed to patrons in this event
     amount: numeric("amount", { precision: 18, scale: 6 }).notNull(),
@@ -235,7 +251,7 @@ export const tlsCommerceJobs = pgTable(
   "tls_commerce_jobs",
   {
     id: text("id").primaryKey().$defaultFn(() => createId()),
-    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "cascade" }),
+    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "restrict" }),
     requesterTalosId: text("requesterTalosId").notNull(),
     serviceName: text("serviceName").notNull(),
     payload: jsonb("payload"),
@@ -278,7 +294,7 @@ export const tlsPlaybooks = pgTable(
   "tls_playbooks",
   {
     id: text("id").primaryKey().$defaultFn(() => createId()),
-    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "cascade" }),
+    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "restrict" }),
     title: text("title").notNull(),
     category: text("category").notNull(),
     channel: text("channel").notNull(),
@@ -363,7 +379,7 @@ export const tlsApiAuditLogs = pgTable(
   "tls_api_audit_logs",
   {
     id: text("id").primaryKey().$defaultFn(() => createId()),
-    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "cascade" }),
+    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "restrict" }),
 
     // Which endpoint was called
     method: text("method").notNull(),   // GET | POST | PATCH | PUT | DELETE
