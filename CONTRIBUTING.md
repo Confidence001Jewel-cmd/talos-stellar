@@ -185,103 +185,40 @@ cargo test --target wasm32-unknown-unknown
 - For Python, prefer explicit types and validate changes with `uv run pytest`
 - For Rust, keep formatting standard with `cargo fmt` and validate with `cargo test`
 
-## Idempotency Keys
+## Database Transaction Retry & Serialization Hardening
 
-The Talos protocol supports safe retry behaviour for SDK write calls via idempotency keys.
-Full design: [`docs/idempotency-design.md`](./docs/idempotency-design.md).
+Critical database state transitions (money, token purchases, patron creation, job state transitions, agent genesis) use `withTransactionRetry` from `web/src/db/db-retry.ts` to automatically recover from PostgreSQL serialization conflicts (`40001`), deadlocks (`40P01`), lock timeouts (`55P03`), and transient connection failures.
 
-### TypeScript SDK
+### Environment Configuration
 
-Generate a key and pass it in `WriteOptions` on any write call:
+- `DB_TRANSACTION_RETRY_ENABLED`: Controls transaction retry behavior (default: `true`). Set to `false` to disable retries instantly.
+- `DB_TRANSACTION_RETRY_MAX_RETRIES`: Maximum number of retry attempts (default: `5`).
+- `DB_TRANSACTION_RETRY_INITIAL_DELAY_MS`: Initial exponential backoff delay in milliseconds (default: `50`).
+- `DB_TRANSACTION_RETRY_MAX_DELAY_MS`: Maximum exponential backoff cap in milliseconds (default: `1000`).
 
-```typescript
-import { TalosClient, generateIdempotencyKey } from "@talos-protocol/sdk";
+### Operational Signals & Observability
 
-const client = new TalosClient({ baseUrl: "...", apiKey: "..." });
-const key = generateIdempotencyKey();
+Retries emit structured Pino log events with domain categories (`MONEY`, `TOKEN`, `PATRON`, `JOB`, `GENESIS`):
 
-// Retry safely — server returns cached 201 if the first attempt already committed
-const job = await client.reportActivity(talosId, params, { idempotencyKey: key });
-```
+- `db_transaction_retry_attempt` (`logger.warn`): Logged when a retryable serialization/connection error triggers a retry attempt.
+- `db_transaction_retry_success` (`logger.info`): Logged when a transaction succeeds after prior failed attempts.
+- `db_transaction_retry_exhausted` (`logger.error`): Logged when maximum retry attempts are exceeded.
 
-Error handling:
+Sensitive data (keys, passphrases, raw payloads) are excluded from log context.
 
-```typescript
-import { IdempotencyConflictError, TalosAPIError } from "@talos-protocol/sdk";
+### Local Verification
 
-try {
-  await client.reportActivity(talosId, params, { idempotencyKey: myKey });
-} catch (err) {
-  if (err instanceof IdempotencyConflictError) {
-    // Key was reused with a different payload — generate a new key for this request
-    console.error("Payload conflict:", err.conflictingKey);
-  } else if (err instanceof TalosAPIError && err.status === 409) {
-    // Request is in-flight — safe to retry with the same key after a short delay
-  }
-}
-```
-
-### Python SDK
-
-Keys are injected automatically on every write call. Opt out with `idempotency_key=None`:
-
-```python
-from talos_agent.idempotency import generate_idempotency_key
-
-# Auto-inject (default): a fresh UUID v4 is generated and sent on every call
-await client.report_activity(talos_id, type_="post", content="hello", channel="X")
-
-# Caller-supplied key (stable across retries of the same logical operation)
-key = generate_idempotency_key()
-await client.report_activity(talos_id, type_="post", content="hello", channel="X",
-                              idempotency_key=key)
-
-# Opt out entirely (fire-and-forget, no idempotency guarantee)
-await client.update_status(talos_id, online=True)  # always opts out by design
-```
-
-Conflict handling:
-
-```python
-from talos_agent.idempotency import IdempotencyConflictError
-
-try:
-    await client.report_revenue(talos_id, amount=5.0, source="commerce")
-except IdempotencyConflictError as e:
-    # Key reused with different payload — generate a new key
-    log.error("idempotency_conflict", key=e.key, path=e.path)
-```
-
-### Server response headers
-
-All idempotent write responses include:
-
-| Header | Value |
-|---|---|
-| `Idempotency-Key` | Echo of the key sent by the caller |
-| `X-Idempotent-Replayed` | `"true"` on cache hits, `"false"` on first commit |
-
-### Running the tests
+To run unit and concurrency contention tests:
 
 ```bash
-# TypeScript SDK unit tests
-cd packages/sdk && pnpm test
-
-# TypeScript integration tests (web)
-cd web && pnpm test
-
-# Python unit tests
-cd packages/prime-agent && uv run pytest tests/test_idempotency.py -v
+pnpm --filter web exec vitest run tests/db-retry.unit.test.ts tests/db-retry.contention.test.ts
 ```
 
-### Rollback
+### Rollback Guidance
 
-Phase 1 (SDK instrumentation) is fully additive. To roll back:
-1. Revert `packages/sdk/src/idempotency.ts`, `packages/sdk/src/client.ts`.
-2. Revert `packages/prime-agent/src/talos_agent/idempotency.py` and the `_post` / `_patch`
-   changes in `api_client.py`.
-3. The DB columns (`idempotencyKey`, `idempotencyResponse`) and the partial unique index can
-   be left in place — they are nullable and harmless without the application logic.
+If operational issues or database performance degradation occur:
+1. Set `DB_TRANSACTION_RETRY_ENABLED=false` in `web/.env.local` or application environment variables.
+2. Restart the web server. This immediately falls back to single-attempt database transactions without requiring application redeployments or code rollbacks.
 
 ## Pull Request Workflow
 
@@ -291,6 +228,13 @@ Phase 1 (SDK instrumentation) is fully additive. To roll back:
 4. Run the relevant tests for the area you touched
 5. Open a pull request using the template in [`.github/PULL_REQUEST_TEMPLATE.md`](./.github/PULL_REQUEST_TEMPLATE.md)
 6. Link the issue in your PR description, for example `Closes #39`
+
+## Releases
+
+Versioning, changelogs, and tagging for `web`, `sdk`, `agent`, and `contracts` are automated —
+see [`RELEASES.md`](./RELEASES.md). You don't need to do anything for this beyond writing
+[Conventional Commits](https://www.conventionalcommits.org/) subjects (`feat: ...`, `fix: ...`,
+etc.) in your PRs; version bumps are computed from those.
 
 ## Issue and PR Templates
 
