@@ -75,11 +75,17 @@ describe("Retired Agent Preservation - Issue #315", () => {
       });
 
       // Retire the agent
+      const message = `Retire TALOS ${talosId}`;
+      const signature = creatorKeypair.sign(Buffer.from(message, "utf-8")).toString("base64");
+      
       const res = await api(`/api/talos/${talosId}/retire`, {
         method: "POST",
         body: JSON.stringify({
           reason: "Test retirement",
           supersededBy: null,
+          stellarPublicKey: creatorKeypair.publicKey(),
+          signature,
+          message,
         }),
       });
 
@@ -107,10 +113,16 @@ describe("Retired Agent Preservation - Issue #315", () => {
     });
 
     it("should prevent retiring an already retired agent", async () => {
+      const message = `Double retirement attempt ${talosId}`;
+      const signature = creatorKeypair.sign(Buffer.from(message, "utf-8")).toString("base64");
+      
       const res = await api(`/api/talos/${talosId}/retire`, {
         method: "POST",
         body: JSON.stringify({
           reason: "Double retirement attempt",
+          stellarPublicKey: creatorKeypair.publicKey(),
+          signature,
+          message,
         }),
       });
 
@@ -184,10 +196,16 @@ describe("Retired Agent Preservation - Issue #315", () => {
         status: "completed",
       });
 
+      const message = `Delete TALOS ${talosId}`;
+      const signature = creatorKeypair.sign(Buffer.from(message, "utf-8")).toString("base64");
+
       const res = await api(`/api/talos/${talosId}/delete`, {
         method: "POST",
         body: JSON.stringify({
           reason: "Privacy deletion requested",
+          stellarPublicKey: creatorKeypair.publicKey(),
+          signature,
+          message,
         }),
       });
 
@@ -226,10 +244,16 @@ describe("Retired Agent Preservation - Issue #315", () => {
     });
 
     it("should prevent deleting an already deleted agent", async () => {
+      const message = `Double deletion attempt ${talosId}`;
+      const signature = creatorKeypair.sign(Buffer.from(message, "utf-8")).toString("base64");
+
       const res = await api(`/api/talos/${talosId}/delete`, {
         method: "POST",
         body: JSON.stringify({
           reason: "Double deletion attempt",
+          stellarPublicKey: creatorKeypair.publicKey(),
+          signature,
+          message,
         }),
       });
 
@@ -278,9 +302,17 @@ describe("Retired Agent Preservation - Issue #315", () => {
       const statusTestId = createBody.id;
 
       // Retire it
+      const retireMessage = `Retire TALOS ${statusTestId}`;
+      const retireSignature = creatorKeypair.sign(Buffer.from(retireMessage, "utf-8")).toString("base64");
+      
       await api(`/api/talos/${statusTestId}/retire`, {
         method: "POST",
-        body: JSON.stringify({ reason: "Status test" }),
+        body: JSON.stringify({ 
+          reason: "Status test",
+          stellarPublicKey: creatorKeypair.publicKey(),
+          signature: retireSignature,
+          message: retireMessage,
+        }),
       });
 
       // Query it

@@ -131,27 +131,51 @@ The test suite covers:
 ### Retiring an Agent
 
 ```typescript
+import { Keypair } from "@stellar/stellar-sdk";
+
+const creatorKeypair = Keypair.fromSecret("S..."); // Your secret key
+const stellarPublicKey = creatorKeypair.publicKey();
+const message = `Retire TALOS ${agentId}`;
+const signature = creatorKeypair.sign(Buffer.from(message)).toString("base64");
+
 const response = await fetch(`/api/talos/${agentId}/retire`, {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
     reason: 'Agent superseded by new version',
-    supersededBy: newAgentId
+    supersededBy: newAgentId,
+    stellarPublicKey,
+    signature,
+    message
   })
 });
 ```
+
+**Authentication**: Requires Stellar ED25519 signature from the agent's creator wallet or wallet owner. The message must contain the TALOS ID to prevent replay attacks.
 
 ### Privacy Deletion
 
 ```typescript
+import { Keypair } from "@stellar/stellar-sdk";
+
+const creatorKeypair = Keypair.fromSecret("S..."); // Your secret key
+const stellarPublicKey = creatorKeypair.publicKey();
+const message = `Delete TALOS ${agentId}`;
+const signature = creatorKeypair.sign(Buffer.from(message)).toString("base64");
+
 const response = await fetch(`/api/talos/${agentId}/delete`, {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
-    reason: 'User requested data removal'
+    reason: 'User requested data removal',
+    stellarPublicKey,
+    signature,
+    message
   })
 });
 ```
+
+**Authentication**: Requires Stellar ED25519 signature from the agent's creator wallet or wallet owner. The message must contain the TALOS ID to prevent replay attacks.
 
 ### Querying Retired Agent History
 
