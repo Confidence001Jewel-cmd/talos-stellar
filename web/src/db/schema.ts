@@ -357,7 +357,7 @@ export const tlsTokenPurchases = pgTable(
   ],
 );
 
-// ─── API Key Audit Log ────────────────────────────────────────────
+// ─── API Key Audit Log (Tamper-Evident Hash Chain) ────────────────
 
 export const tlsApiAuditLogs = pgTable(
   "tls_api_audit_logs",
@@ -374,6 +374,12 @@ export const tlsApiAuditLogs = pgTable(
 
     // Caller info
     ipAddress: text("ipAddress"),
+
+    // ── Hash chain columns (tamper-evidence) ──
+    sequenceNumber: integer("sequenceNumber"),          // Monotonic per-agent (0, 1, 2, ...)
+    previousHash: text("previousHash"),                 // SHA-256 hex of prior entry ("GENESIS" for first)
+    entryHash: text("entryHash"),                       // SHA-256 hex of this entry (canonical encoding)
+    chainVersion: text("chainVersion"),                 // Schema version ("1" for current)
 
     createdAt: timestamp("createdAt", { mode: "date", precision: 3 }).notNull().defaultNow(),
   },

@@ -2,7 +2,16 @@ import { NextRequest } from "next/server";
 import { timingSafeEqual } from "crypto";
 import { db } from "@/db";
 import { tlsTalos, tlsApiAuditLogs } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { eq, desc } from "drizzle-orm";
+import { withTransactionRetry } from "@/db/db-retry";
+import {
+  AUDIT_CHAIN_VERSION,
+  GENESIS_HASH,
+  computeEntryHash,
+  isAuditChainEnabled,
+  type AuditChainEntry,
+} from "@/lib/audit-chain";
+import { logger } from "@/lib/logger";
 
 /**
  * Verify API key from Authorization header against the TALOS's stored key.
@@ -10,6 +19,10 @@ import { eq } from "drizzle-orm";
  *
  * All authenticated requests are logged to tls_api_audit_logs for security
  * hardening (key rotation auditing, anomaly detection, scope tracking).
+ *
+ * When the audit hash chain is enabled, each log entry is cryptographically
+ * chained to the previous entry via SHA-256 hashing, making the log
+ * tamper-evident.
  */
 export async function verifyAgentApiKey(
   request: NextRequest,
@@ -78,11 +91,90 @@ async function writeAuditLog(
 
   const url = new URL(request.url);
 
-  await db.insert(tlsApiAuditLogs).values({
-    talosId,
-    method: request.method,
-    path: url.pathname,
-    statusCode,
-    ipAddress: ip,
-  });
+  if (isAuditChainEnabled()) {
+    await writeAuditLogWithChain(talosId, request.method, url.pathname, statusCode, ip);
+  } else {
+    await db.insert(tlsApiAuditLogs).values({
+      talosId,
+      method: request.method,
+      path: url.pathname,
+      statusCode,
+      ipAddress: ip,
+    });
+  }
+}
+
+/**
+ * Write an audit log entry with a tamper-evident hash chain.
+ *
+ * Uses a serializable transaction to atomically:
+ *   1. Fetch the latest sequence number + entryHash for this agent
+ *   2. Compute the new chain link (sequenceNumber, previousHash, entryHash)
+ *   3. Insert the new row
+ *
+ * The serialization-retry wrapper handles concurrent write conflicts.
+ */
+async function writeAuditLogWithChain(
+  talosId: string,
+  method: string,
+  path: string,
+  statusCode: number,
+  ipAddress: string | null,
+): Promise<void> {
+  const now = new Date();
+  const createdAt = now.toISOString();
+
+  try {
+    await withTransactionRetry(
+      async (tx) => {
+        // Lock the chain: SELECT ... FOR UPDATE on the latest entry for this agent
+        const latestRows = await tx
+          .select({
+            sequenceNumber: tlsApiAuditLogs.sequenceNumber,
+            entryHash: tlsApiAuditLogs.entryHash,
+          })
+          .from(tlsApiAuditLogs)
+          .where(eq(tlsApiAuditLogs.talosId, talosId))
+          .orderBy(desc(tlsApiAuditLogs.createdAt))
+          .limit(1);
+
+        const latest = latestRows[0] ?? null;
+
+        // Compute chain linkage
+        const sequenceNumber = (latest?.sequenceNumber ?? -1) + 1;
+        const previousHash = latest?.entryHash ?? GENESIS_HASH;
+
+        const entry: AuditChainEntry = {
+          sequenceNumber,
+          talosId,
+          method,
+          path,
+          statusCode,
+          ipAddress,
+          createdAt,
+        };
+
+        const entryHash = computeEntryHash(entry);
+
+        await tx.insert(tlsApiAuditLogs).values({
+          talosId,
+          method,
+          path,
+          statusCode,
+          ipAddress,
+          sequenceNumber,
+          previousHash,
+          entryHash,
+          chainVersion: AUDIT_CHAIN_VERSION,
+          createdAt: now,
+        });
+      },
+      { category: "JOB" },
+    );
+  } catch (err) {
+    logger.error(
+      { err, talosId, method, path, statusCode },
+      "audit_chain_write_error",
+    );
+  }
 }
