@@ -381,3 +381,26 @@ export const tlsApiAuditLogs = pgTable(
     index("tls_api_audit_logs_talosId_createdAt_idx").on(t.talosId, t.createdAt),
   ],
 );
+
+// ─── Reputation Input Ledger ──────────────────────────────────────
+
+export const tlsReputationInputs = pgTable(
+  "tls_reputation_inputs",
+  {
+    id: text("id").primaryKey().$defaultFn(() => createId()),
+    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "cascade" }),
+    jobId: text("jobId").notNull().unique(), // Unique to ensure idempotency per job
+    requesterTalosId: text("requesterTalosId").notNull(),
+    status: text("status").notNull(),
+    jobCreatedAt: timestamp("jobCreatedAt", { mode: "date", precision: 3 }).notNull(),
+    jobUpdatedAt: timestamp("jobUpdatedAt", { mode: "date", precision: 3 }),
+    hasResult: boolean("hasResult").notNull().default(false),
+    txHash: text("txHash"), // Cryptographically linked outcome (if any)
+
+    createdAt: timestamp("createdAt", { mode: "date", precision: 3 }).notNull().defaultNow(),
+    updatedAt: timestamp("updatedAt", { mode: "date", precision: 3 }).notNull().$onUpdate(() => new Date()),
+  },
+  (t) => [
+    index("tls_reputation_inputs_talosId_jobCreatedAt_idx").on(t.talosId, t.jobCreatedAt),
+  ],
+);

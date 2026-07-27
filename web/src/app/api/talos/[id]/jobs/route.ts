@@ -5,6 +5,7 @@ import { tlsTalos, tlsCommerceServices, tlsCommerceJobs, tlsRevenues } from "@/d
 import { eq, and } from "drizzle-orm";
 import { fulfillInstant } from "@/lib/fulfillment";
 import { OPERATOR_PUBLIC_KEY, USDC_ISSUER } from "@/lib/stellar-config";
+import { ingestJobToLedger } from "@/lib/reputation-ledger";
 
 /**
  * POST /api/talos/:id/jobs
@@ -248,6 +249,9 @@ export async function POST(
               .set({ idempotencyResponse: finalResponse })
               .where(eq(tlsCommerceJobs.id, job.id));
           }
+
+          // Record terminal status to the reputation input ledger idempotently
+          await ingestJobToLedger(job.id, tx);
 
           return [job];
         },
