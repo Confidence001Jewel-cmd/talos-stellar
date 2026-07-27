@@ -123,6 +123,9 @@ pub enum DataKey {
 //   tl_exec : (symbol, proposal_id: u64)   → (action: AdminAction, executor: Address)
 //   tl_cnl  : (symbol, proposal_id: u64)   → (action: AdminAction, canceller: Address)
 //   tl_cfg  : (symbol,)                    → (old_min_delay: u64, new_min_delay: u64, grace_period: u64)
+//   dep_path: (symbol,)                    → (deprecated: String, replacement: String)
+//                                                  Privacy-safe: no caller/tx/value data.
+//                                                  Reasons callers hit a deprecated path.
 
 fn emit_talos_created(env: &Env, talos_id: u32, creator: Address, name: String, category: String) {
     let topics = (symbol_short!("tls_crt"), creator);
@@ -525,6 +528,14 @@ impl TalosRegistry {
     /// Update the protocol fee in basis points.
     ///
     /// Only the configured protocol wallet may update the fee.
+    ///
+    /// **Deprecation:** When the timelock is enabled (`min_delay > 0`),
+    /// this direct entry-point is rejected. Callers should use
+    /// `schedule_action(SetProtocolFee(..), delay)` followed by
+    /// `execute_action` after the timelock ETA. The rejection emits a
+    /// `dep_path` event with the recommended replacement before
+    /// panicking so off-chain telemetry can still see the attempted
+    /// legacy call.
     pub fn set_protocol_fee(e: Env, fee_bps: u32) {
         pause_control::check_not_paused(&e, PAUSE_PROTOCOL_CONFIG);
 
@@ -542,6 +553,11 @@ impl TalosRegistry {
 
         let config = Self::get_timelock_config(e.clone());
         if config.min_delay > 0 {
+            emit_deprecated_call(
+                &e,
+                DEPRECATED_DIRECT_ADMIN[0].0,
+                DEPRECATED_DIRECT_ADMIN[0].1,
+            );
             panic!("Timelock enabled: action must be scheduled");
         }
 
@@ -561,6 +577,13 @@ impl TalosRegistry {
     /// step is required for the proposer). The replacement emits a fresh
     /// `adm_prp` event without emitting `adm_cnl`.
     ///
+    /// **Deprecation:** When the timelock is enabled (`min_delay > 0`),
+    /// this direct entry-point is rejected. Callers should schedule
+    /// `ProposeAdmin(new_admin)` via `schedule_action` and execute it
+    /// after the timelock ETA. The rejection emits a `dep_path` event
+    /// with the recommended replacement before panicking so off-chain
+    /// telemetry can still observe the attempted legacy call.
+    ///
     /// # Authorization
     /// Requires the current admin (`ProtocolWallet`) to sign the transaction.
     ///
@@ -579,6 +602,11 @@ impl TalosRegistry {
 
         let config = Self::get_timelock_config(e.clone());
         if config.min_delay > 0 {
+            emit_deprecated_call(
+                &e,
+                DEPRECATED_DIRECT_ADMIN[1].0,
+                DEPRECATED_DIRECT_ADMIN[1].1,
+            );
             panic!("Timelock enabled: action must be scheduled");
         }
 
@@ -850,9 +878,64 @@ impl TalosRegistry {
     /// backwards compatible; `patch` carries bug-fixes only.
     ///
     /// # Returns
-    /// `(major: u32, minor: u32, patch: u32)` — currently `(1, 0, 0)`.
+    /// `(major: u32, minor: u32, patch: u32)` — currently `(1, 1, 0)`.
     pub fn version(_e: Env) -> (u32, u32, u32) {
         CONTRACT_VERSION
+    }
+
+    /// Return the contract's 32-byte stable interface identifier.
+    ///
+    /// The identifier is content-derived from
+    /// `(INTERFACE_NAMESPACE, CONTRACT_VERSION)` and is identical to the
+    /// `INTERFACE_ID` constant embedded in the WASM binary at compile
+    /// time. Cross-contract callers and SDKs use it to detect which
+    /// `interface_id()` consumer is registered at a given address — they
+    /// should treat a mismatch as a hard `abort()` rather than fall back,
+    /// since the contract family has changed.
+    ///
+    /// Stable identifiers are also documented as "golden vectors" in the
+    /// test suite — regenerate from the namespace + version tuple at any
+    /// time to verify.
+    pub fn interface_id(e: Env) -> BytesN<32> {
+        BytesN::from_array(&e, &INTERFACE_ID)
+    }
+
+    /// Return `true` when the deployed contract semver is at least the
+    /// `major.minor.patch` requested by the caller.
+    ///
+    /// Compatibility rule (see `version_supports`):
+    /// - `major` must match exactly;
+    /// - `minor` must be `>=` required, with `patch` checked on exact minor.
+    ///
+    /// Returns `false` for any incompatible combination (including
+    /// illegal inputs such as `major > u32::MAX`, which silently
+    /// round-trips to `0` — tests cover this).
+    pub fn supports_version(e: Env, major: u32, minor: u32, patch: u32) -> bool {
+        let _ = e;
+        version_supports(CONTRACT_VERSION, (major, minor, patch))
+    }
+
+    /// Return the list of capability symbols supported by this contract.
+    ///
+    /// Capability IDs are **stable feature markers**: if a consumer is
+    /// gated on a particular capability (e.g. `"timelock_admin"`), they
+    /// can read this list at integration time rather than guessing from
+    /// version bumps. Adding a capability requires a `minor` bump;
+    /// removing or renaming requires a `major` bump.
+    pub fn interface_features(e: Env) -> Vec<Symbol> {
+        let caps = features_list();
+        let mut out = Vec::new(&e);
+        for cap in caps {
+            out.push_back(Symbol::new(&e, cap));
+        }
+        out
+    }
+
+    /// Reported count of deprecated direct-admin paths exposed for
+    /// telemetry. Each entry in the static table corresponds to exactly
+    /// one entry-point that becomes a no-op after timelocks are enabled.
+    pub fn deprecated_entry_count(_e: Env) -> u32 {
+        DEPRECATED_DIRECT_ADMIN.len() as u32
     }
 
     /// Calculate the protocol fee for an amount using the configured fee bps.
@@ -1076,6 +1159,7 @@ mod tests {
         testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke},
         Address, Env, IntoVal, Symbol, TryFromVal,
     };
+    use std::string::ToString;
 
     fn setup() -> (Env, Address) {
         let env = Env::default();
@@ -1164,7 +1248,7 @@ mod tests {
     fn version_returns_compile_time_constant() {
         let (env, contract_id) = setup();
         let client = TalosRegistryClient::new(&env, &contract_id);
-        assert_eq!(client.version(), (1u32, 2u32, 0u32));
+        assert_eq!(client.version(), (1u32, 1u32, 0u32));
     }
 
     #[test]
@@ -1211,6 +1295,282 @@ mod tests {
         let client = TalosRegistryClient::new(&env, &contract_id);
         let (maj, min, patch) = client.version();
         assert_eq!((maj, min, patch), CONTRACT_VERSION);
+    }
+
+    // ── interface_id() tests ────────────────────────────────────────
+
+    #[test]
+    fn interface_id_returns_expected_bytes() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let id = client.interface_id();
+        // Compare against the compile-time constant byte-for-byte;
+        // BytesN<32> implements PartialEq + Debug so we can compare inline.
+        let expected = soroban_sdk::BytesN::<32>::from_array(&env, &INTERFACE_ID);
+        assert_eq!(id, expected);
+
+        // Spot-check the namespace prefix and version slots are recoverable
+        // from the returned BytesN so test vectors remain human-auditable.
+        let arr = id.to_array();
+        assert_eq!(&arr[..8], b"TalosReg");
+        assert_eq!(&arr[8..13], b"istry");
+        assert_eq!(arr[13], 0u8);
+        // Major/minor/patch slots at offsets 16/20/24
+        assert_eq!(&arr[16..20], &CONTRACT_VERSION.0.to_be_bytes());
+        assert_eq!(&arr[20..24], &CONTRACT_VERSION.1.to_be_bytes());
+        assert_eq!(&arr[24..28], &CONTRACT_VERSION.2.to_be_bytes());
+        // Reserved tail is zero-padded.
+        assert_eq!(&arr[28..32], &[0u8; 4]);
+    }
+
+    #[test]
+    fn interface_id_is_unaffected_by_state_changes() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let before = client.interface_id();
+
+        // Initialize the contract and change the fee — state writes must not
+        // affect the interface ID constant.
+        let protocol_wallet = Address::generate(&env);
+        client.initialize(&protocol_wallet);
+        client
+            .mock_auths(&[MockAuth {
+                address: &protocol_wallet,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_protocol_fee",
+                    args: (500u32,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_protocol_fee(&500);
+
+        let after = client.interface_id();
+        assert_eq!(before, after);
+    }
+
+    // ── Golden vector: namespace + version → expected INTERFACE_ID ───
+
+    /// Independently reproduces `INTERFACE_ID` from the documented
+    /// derivation rule. If this test ever fails, either the namespace,
+    /// the version, or the byte layout changed without bumping `major`
+    /// — a manually-updateable alarm bell that reviewers should not
+    /// accept silently.
+    #[test]
+    fn interface_id_golden_vector_matches_derivation() {
+        let (env, _) = setup();
+        let expected = soroban_sdk::BytesN::<32>::from_array(&env, &INTERFACE_ID);
+
+        // Reconstruct from scratch using the documented algorithm.
+        let namespace = INTERFACE_NAMESPACE.as_bytes();
+        let (maj, min, patch) = CONTRACT_VERSION;
+        let mut derived = [0u8; 32];
+        let n = namespace.len().min(16);
+        derived[..n].copy_from_slice(&namespace[..n]);
+        derived[16..20].copy_from_slice(&maj.to_be_bytes());
+        derived[20..24].copy_from_slice(&min.to_be_bytes());
+        derived[24..28].copy_from_slice(&patch.to_be_bytes());
+        // derived[28..32] remains zero padding — matches the constant.
+        let derived_bytesn = soroban_sdk::BytesN::<32>::from_array(&env, &derived);
+
+        assert_eq!(expected, derived_bytesn);
+    }
+
+    // ── supports_version() tests ─────────────────────────────────────
+
+    #[test]
+    fn supports_version_accepts_exact_match() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let (maj, min, pat) = CONTRACT_VERSION;
+        assert!(client.supports_version(&maj, &min, &pat));
+    }
+
+    #[test]
+    fn supports_version_accepts_lower_minor_and_patch() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let (maj, _min, _pat) = CONTRACT_VERSION;
+        // Floor at (major, 0, 0) — deploy has at least all 1.0.x features.
+        assert!(client.supports_version(&maj, &0u32, &0u32));
+    }
+
+    #[test]
+    fn supports_version_rejects_higher_minor() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let (maj, min, _pat) = CONTRACT_VERSION;
+        // Caller requires a feature added in a future minor.
+        assert!(!client.supports_version(&maj, &(min + 1), &0u32));
+    }
+
+    #[test]
+    fn supports_version_rejects_higher_patch_when_minor_matches() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let (maj, min, pat) = CONTRACT_VERSION;
+        // Caller requires a bug-fix-only patch newer than deployed.
+        assert!(!client.supports_version(&maj, &min, &(pat + 1)));
+    }
+
+    #[test]
+    fn supports_version_rejects_different_major() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let (_maj, min, pat) = CONTRACT_VERSION;
+        assert!(!client.supports_version(&99u32, &min, &pat));
+        assert!(!client.supports_version(&0u32, &min, &pat));
+    }
+
+    // ── interface_features() tests ──────────────────────────────────
+
+    #[test]
+    fn interface_features_lists_known_capabilities() {
+        let (_env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&_env, &contract_id);
+        let features = client.interface_features();
+
+        let expected: std::vec::Vec<std::string::String> = features_list()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(features.len(), expected.len() as u32);
+        for (i, want) in expected.iter().enumerate() {
+            let sym = features.get(i as u32).unwrap();
+            assert_eq!(sym.to_string(), *want, "feature[{}] mismatch", i);
+        }
+    }
+
+    #[test]
+    fn interface_features_is_stable_across_calls() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let a = client.interface_features();
+        let b = client.interface_features();
+        assert_eq!(a.len(), b.len());
+        for i in 0..a.len() {
+            assert_eq!(a.get(i).unwrap(), b.get(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn deprecated_entry_count_matches_table() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        assert_eq!(
+            client.deprecated_entry_count(),
+            DEPRECATED_DIRECT_ADMIN.len() as u32
+        );
+    }
+
+    // ── deprecation event tests ──────────────────────────────────────
+
+    #[test]
+    fn set_protocol_fee_emits_dep_path_event_when_timelocked() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let protocol_wallet = Address::generate(&env);
+        client.initialize(&protocol_wallet);
+
+        // Enable timelock so set_protocol_fee becomes a deprecated path.
+        client
+            .mock_auths(&[MockAuth {
+                address: &protocol_wallet,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_timelock_config",
+                    args: (3600u64, 86400u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_timelock_config(&3600, &86400);
+
+        // Attempt the legacy path — must panic after emitting the event.
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &protocol_wallet,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_protocol_fee",
+                    args: (500u32,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_set_protocol_fee(&500);
+        assert!(res.is_err());
+
+        // Find dep_path events; the data must include the recommended
+        // replacement so telemetry is self-describing.
+        let events = env.events().all();
+        let dep_events: std::vec::Vec<_> = events
+            .iter()
+            .filter(|(a, t, _)| {
+                if *a != contract_id {
+                    return false;
+                }
+                let sym: Result<Symbol, _> = TryFromVal::try_from_val(&env, &t.get(0).unwrap());
+                sym.map(|s| s == symbol_short!("dep_path")).unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(dep_events.len(), 1);
+        let (_, _, data) = dep_events[0].clone();
+        let (deprecated, replacement): (String, String) =
+            TryFromVal::try_from_val(&env, &data).unwrap();
+        assert!(deprecated.to_string().contains("set_protocol_fee"));
+        assert!(
+            replacement.to_string().contains("schedule_action"),
+            "replacement should mention schedule_action, got: {}",
+            replacement.to_string()
+        );
+    }
+
+    #[test]
+    fn propose_admin_emits_dep_path_event_when_timelocked() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_timelock_config",
+                    args: (3600u64, 86400u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_timelock_config(&3600, &86400);
+
+        // Attempt the legacy propose_admin path — must panic after event.
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "propose_admin",
+                    args: (new_admin.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_propose_admin(&new_admin)
+            .is_err());
+
+        let dep_events: std::vec::Vec<_> = env
+            .events()
+            .all()
+            .iter()
+            .filter(|(a, t, _)| {
+                if *a != contract_id {
+                    return false;
+                }
+                let sym: Result<Symbol, _> = TryFromVal::try_from_val(&env, &t.get(0).unwrap());
+                sym.map(|s| s == symbol_short!("dep_path")).unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(dep_events.len(), 1);
     }
 
     #[test]

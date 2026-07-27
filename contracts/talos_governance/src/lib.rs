@@ -5,7 +5,9 @@
 #[cfg(all(test, not(target_arch = "wasm32")))]
 extern crate std;
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec,
+};
 use ttl_manager;
 use pause_control;
 
@@ -99,6 +101,57 @@ fn emit_vote_cast(env: &Env, proposal_id: u32, voter: Address, choice: VoteChoic
 fn emit_proposal_status_changed(env: &Env, proposal_id: u32, status: ProposalStatus) {
     env.events()
         .publish((symbol_short!("prop_stat"), proposal_id), status);
+}
+
+// ── Stable interface (v1.0.0) ───────────────────────────────────────
+//
+// Also fixes a pre-existing omission: Governance did not previously
+// expose `version()` or `interface_id()`. Cross-contract callers and
+// tooling (e.g. an indexer reconciling the protocol's contract families)
+// now read these bytes via the standard interface queries exposed on
+// every Talos contract. The version starts at `(1, 0, 0)` to align
+// with the rest of the v1 protocol generation; the namespace and
+// golden-vector derivation follow the same algorithm as the Registry
+// and Name Service (see `INTERFACE_ID` tests below).
+pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 0, 0);
+
+pub const INTERFACE_NAMESPACE: &str = "TalosGovernance";
+
+pub const INTERFACE_ID: [u8; 32] = [
+    0x54, 0x61, 0x6C, 0x6F, 0x73, 0x47, 0x6F, 0x76, // "TalosGov"
+    0x65, 0x72, 0x6E, 0x61, 0x6E, 0x63, 0x65, 0x00, // "ernance" + zero pad
+    // (major, minor, patch) big-endian u32s
+    0x00, 0x00, 0x00, 0x01, // major = 1
+    0x00, 0x00, 0x00, 0x00, // minor = 0
+    0x00, 0x00, 0x00, 0x00, // patch = 0
+    // reserved
+    0x00, 0x00, 0x00, 0x00,
+];
+
+/// Capability symbols returned by `interface_features()`. Capability
+/// IDs are stable: appending to this list bumps `minor`; renaming or
+/// removing bumps `major`.
+pub fn features_list() -> &'static [&'static str] {
+    &[
+        "proposal_lifecycle", // create_proposal / vote / finalize / execute
+        "vote_weighting",     // snapshot-based token-weighted voting
+        "config_admin",       // update_config / cache_token_balance requires admin
+        "interface_query",    // version / interface_id / supports_version
+    ]
+}
+
+/// SemVer compatibility helper used by `supports_version`.
+pub fn version_supports(actual: (u32, u32, u32), required: (u32, u32, u32)) -> bool {
+    if actual.0 != required.0 {
+        return false;
+    }
+    if actual.1 > required.1 {
+        return true;
+    }
+    if actual.1 < required.1 {
+        return false;
+    }
+    actual.2 >= required.2
 }
 
 #[contract]
@@ -336,6 +389,39 @@ impl TalosGovernance {
         env.storage().persistent().get(&DataKey::Admin)
     }
 
+    // ── Stable interface (v1.0.0) ───────────────────────────────────
+
+    /// Return `(major, minor, patch)` for this contract. Fixes a
+    /// pre-existing omission; the value is compile-time and immutable
+    /// past deployment.
+    pub fn version(_e: Env) -> (u32, u32, u32) {
+        CONTRACT_VERSION
+    }
+
+    /// Return the 32-byte stable interface identifier for
+    /// TalosGovernance v1. See the golden-vector test for the
+    /// independent reproduction of the byte layout.
+    pub fn interface_id(e: Env) -> BytesN<32> {
+        BytesN::from_array(&e, &INTERFACE_ID)
+    }
+
+    /// Return `true` when the deployed semver supports the requested
+    /// `(major, minor, patch)` floor — see `version_supports`.
+    pub fn supports_version(e: Env, major: u32, minor: u32, patch: u32) -> bool {
+        let _ = e;
+        version_supports(CONTRACT_VERSION, (major, minor, patch))
+    }
+
+    /// Return the list of capability symbols offered by this contract.
+    pub fn interface_features(e: Env) -> Vec<Symbol> {
+        let caps = features_list();
+        let mut out = Vec::new(&e);
+        for cap in caps {
+            out.push_back(Symbol::new(&e, cap));
+        }
+        out
+    }
+
     pub fn next_proposal_id(env: Env) -> u32 {
         env.storage()
             .persistent()
@@ -545,6 +631,7 @@ mod tests {
         testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
         IntoVal,
     };
+    use std::string::ToString;
 
     fn setup() -> (
         Env,

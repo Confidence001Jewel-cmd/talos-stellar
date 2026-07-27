@@ -17,7 +17,11 @@ See [EVENTS.md](./EVENTS.md) for the full contract event indexing specification.
   - **Two-step admin transfer** (`propose_admin` / `accept_admin` / `cancel_admin_transfer`)
   - **Admin timelocks** (`schedule_action` / `execute_action` / `cancel_action` / `set_timelock_config`)
   - **Interface version query** (`version()` — immutable, compile-time constant `(1, 1, 0)`)
-  - Events: `tls_crt`, `pat_upd`, `fee_chg`, `adm_prp`, `adm_acc`, `adm_cnl`, `tl_sch`, `tl_exec`, `tl_cnl`, `tl_cfg`
+  - **Stable interface identifier** (`interface_id()` returns `BytesN<32>` derived from `"TalosRegistry"` + version)
+  - **Version negotiation** (`supports_version(maj, min, patch)`)
+  - **Capability catalogue** (`interface_features()` returns `Vec<Symbol>`)
+  - **Deprecation telemetry** (`dep_path` event emitted before panic when timelock is enabled)
+  - Events: `tls_crt`, `pat_upd`, `fee_chg`, `adm_prp`, `adm_acc`, `adm_cnl`, `tl_sch`, `tl_exec`, `tl_cnl`, `tl_cfg`, `dep_path`
 
 ### 2. TalosNameService
 - **Purpose**: Human-readable name registration for Talos IDs
@@ -27,7 +31,12 @@ See [EVENTS.md](./EVENTS.md) for the full contract event indexing specification.
   - Admin-controlled registry contract pointer (`set_registry_contract`)
   - **Admin timelocks** (`schedule_action` / `execute_action` / `cancel_action` / `set_timelock_config`)
   - **Interface version query** (`version()` — immutable, compile-time constant `(1, 1, 0)`)
-  - Events: `name_reg`, `tl_sch`, `tl_exec`, `tl_cnl`, `tl_cfg`
+  - **Stable interface identifier** (`interface_id()` returns `BytesN<32>` derived from `"TalosNameService"` + version)
+  - **Version negotiation** (`supports_version(maj, min, patch)`)
+  - **Capability catalogue** (`interface_features()` returns `Vec<Symbol>`)
+  - **Cross-contract compatibility** (`assert_registry_compatible()` cross-invokes Registry's `interface_id` + `version`)
+  - **Deprecation telemetry** (`dep_path` event emitted before panic when timelock is enabled)
+  - Events: `name_reg`, `tl_sch`, `tl_exec`, `tl_cnl`, `tl_cfg`, `dep_path`, `compat_ok`, `compat_err`
 
 ### 3. TalosGovernance
 - **Purpose**: Token-weighted governance for Talos Protocol
@@ -37,6 +46,10 @@ See [EVENTS.md](./EVENTS.md) for the full contract event indexing specification.
   - Snapshot-based vote weight calculation (balances at proposal creation)
   - Quorum and consensus-based proposal approval/rejection
   - Configurable voting periods and thresholds
+  - **Interface version query** (`version()` — immutable, compile-time constant `(1, 0, 0)`)
+  - **Stable interface identifier** (`interface_id()` returns `BytesN<32>` derived from `"TalosGovernance"` + version)
+  - **Version negotiation** (`supports_version(maj, min, patch)`)
+  - **Capability catalogue** (`interface_features()` returns `Vec<Symbol>`)
   - Events: `proposal_created`, `vote_cast`, `proposal_status_changed`
   - **Scoped emergency pause controls** (`pause_domain` / `unpause_domain` / `is_domain_paused`) with domain-scoped pausing, auto-expiration, and event emission
 
@@ -233,6 +246,33 @@ stellar contract invoke \
   set_timelock_config \
   --min_delay 86400 \
   --grace_period 604800
+```
+
+### Step 6.1: (Optional) Verify Interface Compatibility
+
+Every Talos contract exposes a stable interface identifier and a
+SemVer-style version query. Tools (SDKs, off-chain indexers, dependent
+contracts) should call these before invoking any mutating entry-point.
+See [`INTERFACE.md`](INTERFACE.md) for the full specification.
+
+```bash
+# TalosRegistry — verify version and interface id
+stellar contract invoke --id "$REGISTRY_CONTRACT" --network testnet -- version
+# Expected: [1, 1, 0]
+stellar contract invoke --id "$REGISTRY_CONTRACT" --network testnet -- supports_version \
+  --major 1 --minor 1 --patch 0
+# Expected: true
+stellar contract invoke --id "$REGISTRY_CONTRACT" --network testnet -- interface_features
+# Expected: ["create_talos", "talos_lifecycle", "admin_transfer",
+#           "timelock_admin", "protocol_fee", "interface_query", "fees_collector"]
+
+# TalosNameService — assert registry compatibility via cross-contract check
+stellar contract invoke --id "$NAME_SERVICE_CONTRACT" --network testnet -- assert_registry_compatible
+# Emits `compat_ok` event with the registry's version tuple on success.
+
+# TalosGovernance — verify version
+stellar contract invoke --id "$GOVERNANCE_CONTRACT" --network testnet -- version
+# Expected: [1, 0, 0]
 ```
 
 ### Environment Variables Reference
