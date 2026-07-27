@@ -434,7 +434,11 @@ impl TalosGovernance {
     /// Touch a governance proposal to reset its Soroban TTL.
     pub fn touch_proposal(e: Env, proposal_id: u32) -> bool {
         let key = DataKey::Proposal(proposal_id);
-        let proposal: Proposal = e.storage().persistent().get(&key).expect("Proposal not found");
+        let proposal: Proposal = e
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Proposal not found");
         let current_ledger = e.ledger().sequence();
         let last_touched: u32 = e
             .storage()
@@ -470,10 +474,16 @@ impl TalosGovernance {
         let mut skipped = 0u32;
 
         if let Some(a) = e.storage().persistent().get::<_, Address>(&DataKey::Admin) {
-            let last: u32 = e.storage().persistent().get(&DataKey::LastTouched(0)).unwrap_or(0);
+            let last: u32 = e
+                .storage()
+                .persistent()
+                .get(&DataKey::LastTouched(0))
+                .unwrap_or(0);
             if ttl_manager::needs_touch(last, current_ledger) {
                 e.storage().persistent().set(&DataKey::Admin, &a);
-                e.storage().persistent().set(&DataKey::LastTouched(0), &current_ledger);
+                e.storage()
+                    .persistent()
+                    .set(&DataKey::LastTouched(0), &current_ledger);
                 touched += 1;
             } else {
                 skipped += 1;
@@ -534,7 +544,13 @@ impl TalosGovernance {
         if health.is_empty() {
             (0, 0, 0, 0, 0)
         } else {
-            (health.min_age, health.max_age, health.keys_below_warn, health.keys_below_crit, health.total_keys)
+            (
+                health.min_age,
+                health.max_age,
+                health.keys_below_warn,
+                health.keys_below_crit,
+                health.total_keys,
+            )
         }
     }
 
