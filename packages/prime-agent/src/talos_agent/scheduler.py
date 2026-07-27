@@ -17,6 +17,7 @@ from rich.console import Console
 if TYPE_CHECKING:
     from talos_agent.config import Settings
 
+from talos_agent.circuit_breaker import cb_registry
 from talos_agent.observability import log, setup as setup_observability
 
 console = Console()
@@ -411,13 +412,93 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
     browser = await BrowserSession.start(model_api_key=settings.llm_api_key)
     console.print("[green]Browser ready.[/green]")
 
-    # Build tools
-    tools = build_all_tools(api=api, db=db, browser=browser, settings=settings)
+    # ── Policy engine (disabled by default — opt-in via config) ─────
+    from talos_agent.policy import PolicyEngine, PolicyLoader, PolicyMiddleware
+
+    policy_engine = PolicyEngine()
+    policy_loader = PolicyLoader(db=db)
+    policy_enabled = os.environ.get(
+        "POLICY_ENGINE_ENABLED",
+        str(talos_config.get("policyEngineEnabled", False)),
+    ).lower() in ("true", "1", "yes")
+    policy_engine.enabled = policy_enabled
+    if policy_enabled:
+        policy_engine.load(policy_loader.load())
+
+    # Budget getter for policy middleware context
+    def _get_budget_context() -> dict[str, float]:
+        cfg = db.get_talos_config()
+        gtm_budget = float((cfg or {}).get("gtmBudget", 200))
+        spent = float(db.get_spending_period(30))
+        return {
+            "gtm_budget": gtm_budget,
+            "spent_this_period": spent,
+            "budget_remaining": max(0.0, gtm_budget - spent),
+        }
+
+    def _get_config_context() -> dict[str, float]:
+        return {
+            "approval_threshold": float(settings.approval_threshold),
+        }
+
+    policy_middleware = PolicyMiddleware(
+        policy_engine,
+        policy_loader,
+        budget_getter=_get_budget_context,
+        config_getter=_get_config_context,
+    )
+
+    if policy_enabled:
+        console.print("[bold cyan]Policy engine ENABLED — actions will be gated.[/bold cyan]")
+    else:
+        console.print("[dim]Policy engine disabled (set POLICY_ENGINE_ENABLED=true to enable).[/dim]")
+    # ──────────────────────────────────────────────────────────────
+
+    # Build tools — pass policy middleware for pre-execution policy checks
+    tools = build_all_tools(api=api, db=db, browser=browser, settings=settings,
+                            policy_middleware=policy_middleware)
     console.print(f"[green]Registered {len(tools)} tools.[/green]")
 
     # Initialize StellarKit for balance checks
     stellar = StellarKit(api)
     await stellar.initialize()
+
+    # ── Post-restore reconciliation (#296) ──────────────────────────────────
+    # Reconcile backoff state, schedule timestamps, fencing tokens, and
+    # completion markers before starting any tasks.  This ensures stale state
+    # from a previous run (crashed or checkpointed) does not cause duplicate
+    # work, stale heartbeats, or frozen backoff waits.
+    from talos_agent.restore import ReconcileConfig, reconcile_after_restore
+
+    _reconcile_config = ReconcileConfig(
+        max_backoff_future_secs=3_600.0,
+        backoff_cap_secs=60.0,
+        max_clock_skew_secs=300.0,
+        api_verify_leases=True,
+        api_timeout_secs=10.0,
+    )
+    try:
+        reconcile_result = await reconcile_after_restore(db, api, config=_reconcile_config)
+        console.print(
+            f"[dim cyan]Restore reconciliation: "
+            f"backoff_capped={reconcile_result.backoff_rows_capped}, "
+            f"schedules_reset={reconcile_result.schedules_reset}, "
+            f"jobs_restored={reconcile_result.claimed_jobs_restored}, "
+            f"jobs_dropped={reconcile_result.claimed_jobs_dropped}, "
+            f"markers_pruned={reconcile_result.markers_pruned}"
+            f"[/dim cyan]"
+        )
+        if reconcile_result.errors:
+            console.print(
+                f"[yellow]Restore reconciliation warnings ({len(reconcile_result.errors)}): "
+                + "; ".join(reconcile_result.errors[:3])
+                + ("[...]" if len(reconcile_result.errors) > 3 else "")
+                + "[/yellow]"
+            )
+    except Exception as _rec_exc:
+        console.print(f"[yellow]Restore reconciliation failed (non-fatal): {_rec_exc}[/yellow]")
+        logger.warning("reconcile_after_restore failed: %s", _rec_exc)
+    # ────────────────────────────────────────────────────────────────────────
 
     # Tracking restart parameters
     browser_restart_attempts = 0
@@ -506,6 +587,11 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
                 structlog.contextvars.bind_contextvars(cycle_id=cycle_id)
                 api.set_request_id(cycle_id)
                 try:
+                    # Hot-reload policies if the file changed
+                    if policy_engine.enabled:
+                        if policy_middleware.hot_reload():
+                            console.print("[cyan]Policy engine: policies reloaded (file change detected).[/cyan]")
+
                     if not await ensure_browser_healthy():
                         console.print(
                             "[red]Skipping agent cycle: browser session is down and unrecoverable.[/red]"
@@ -786,6 +872,63 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
             except asyncio.TimeoutError:
                 pass
 
+    async def telemetry_log_task():
+        """Periodically log runtime telemetry for operator observability.
+
+        Privacy-safe: no prompts, API keys, signatures, or wallet secrets
+        are included in the output.
+
+        Runs once every 30 minutes (or immediately after the first cycle
+        completes so startup state is captured).
+        """
+        from talos_agent.telemetry import TelemetryCollector
+
+        telemetry_interval = 30 * 60  # 30 minutes
+
+        # Wait for initial startup to settle
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=telemetry_interval)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        while not shutdown_event.is_set():
+            try:
+                collector = TelemetryCollector(
+                    db=db,
+                    agent_name=talos_config.get("name", settings.talos_id),
+                )
+                report = collector.collect(
+                    cb_registry=cb_registry,
+                    policy_engine=policy_engine if policy_engine.enabled else None,
+                )
+                log.info(
+                    "telemetry_snapshot",
+                    tasks=[
+                        {"name": t.name, "last_run": t.last_run_at, "retries": t.retry_attempts}
+                        for t in report.tasks
+                    ],
+                    queues=[
+                        {"name": q.name, "pending": q.pending_count, "total": q.total_count}
+                        for q in report.queues
+                    ],
+                    posts_7d=report.total_posts_7d,
+                    impressions_7d=report.total_impressions_7d,
+                    circuit_breakers=[
+                        {"provider": c.get("provider"), "state": c.get("state")}
+                        for c in report.circuit_breakers
+                    ],
+                    policy_evaluations=report.policy_evaluation_count,
+                )
+            except Exception as _tel_exc:
+                logger.debug("Telemetry snapshot failed: %s", _tel_exc)
+
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=telemetry_interval)
+                break
+            except asyncio.TimeoutError:
+                pass
+
     tasks = [
         asyncio.create_task(agent_cycle_task(), name="agent_cycle"),
         asyncio.create_task(polling_task(), name="polling"),
@@ -795,14 +938,55 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
         asyncio.create_task(learning_cycle_task(), name="learning_cycle"),
         asyncio.create_task(dividend_distribution_task(), name="dividend_distribution"),
         asyncio.create_task(loan_repayment_task(), name="loan_repayment"),
+        asyncio.create_task(telemetry_log_task(), name="telemetry_log"),
     ]
 
     try:
         await shutdown_event.wait()
 
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # ── Graceful shutdown (#182) ──────────────────────────────────────
+        # Stop polling: shutdown_event is already set so each task's inner
+        # wait() will break on the next iteration without starting new work.
+        #
+        # Wait up to shutdown_deadline seconds for running tasks to finish
+        # naturally before we force-cancel them.
+        deadline = settings.shutdown_deadline
+        if deadline > 0:
+            console.print(
+                f"[yellow]Waiting up to {deadline:.0f}s for in-flight tasks to finish...[/yellow]"
+            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(asyncio.gather(*tasks, return_exceptions=True)),
+                    timeout=deadline,
+                )
+                console.print("[green]All tasks finished within deadline.[/green]")
+            except asyncio.TimeoutError:
+                still_running = [t for t in tasks if not t.done()]
+                console.print(
+                    f"[red]Deadline exceeded — cancelling {len(still_running)} task(s): "
+                    + ", ".join(t.get_name() for t in still_running)
+                    + "[/red]"
+                )
+                # Record each cancelled task so operators can inspect what was cut short.
+                for t in still_running:
+                    try:
+                        db.add_activity(
+                            "shutdown_cancelled",
+                            f"Task '{t.get_name()}' was cancelled at shutdown (deadline={deadline:.0f}s)",
+                            "system",
+                        )
+                    except Exception:
+                        pass
+                for t in still_running:
+                    t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            # Immediate cancel when deadline == 0.
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        # ─────────────────────────────────────────────────────────────────
     finally:
         console.print("[yellow]Cleaning up...[/yellow]")
         try:

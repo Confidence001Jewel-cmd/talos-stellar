@@ -191,10 +191,20 @@ export const tlsDividends = pgTable(
 
     status: text("status").notNull().default("completed"),
 
+    // Idempotency key to prevent duplicate distributions
+    distributionId: text("distributionId").unique(),
+
+    // Retry metadata for failed distributions
+    retryCount: integer("retryCount").notNull().default(0),
+    lastError: text("lastError"),
+    retryable: boolean("retryable").notNull().default(true),
+
     createdAt: timestamp("createdAt", { mode: "date", precision: 3 }).notNull().defaultNow(),
+    updatedAt: timestamp("updatedAt", { mode: "date", precision: 3 }).notNull().$onUpdate(() => new Date()),
   },
   (t) => [
     index("tls_dividends_talosId_createdAt_idx").on(t.talosId, t.createdAt),
+    uniqueIndex("tls_dividends_talosId_distributionId_key").on(t.talosId, t.distributionId),
   ],
 );
 
@@ -402,5 +412,122 @@ export const tlsApiAuditLogs = pgTable(
   },
   (t) => [
     index("tls_api_audit_logs_talosId_createdAt_idx").on(t.talosId, t.createdAt),
+  ],
+);
+
+// ─── Lifecycle Event Log ──────────────────────────────────────────
+//
+// Append-only, canonical record of every governed lifecycle transition.
+// `sequence` is monotonic per talosId and forms the replay cursor: an indexer
+// or UI resumes from the last sequence it committed. Rows are never updated.
+
+export const tlsLifecycleEvents = pgTable(
+  "tls_lifecycle_events",
+  {
+    id: text("id").primaryKey().$defaultFn(() => createId()),
+    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "cascade" }),
+
+    sequence: integer("sequence").notNull(),      // monotonic per talosId, starts at 1
+    eventType: text("eventType").notNull(),       // canonical name, see lib/governance/events.ts
+    fromState: text("fromState"),                 // null for the initial "proposed" event
+    toState: text("toState").notNull(),
+
+    // Who caused it. `actorId` is a Stellar G-address or the literal "system".
+    actorId: text("actorId").notNull(),
+    actorRole: text("actorRole").notNull(),       // creator | operator | governance | system
+
+    jobId: text("jobId"),                         // durable job that produced this event
+    stepName: text("stepName"),                   // provisioning step, when applicable
+
+    // Redacted diagnostic payload — never stores secrets or raw request bodies.
+    detail: jsonb("detail").notNull().default({}),
+
+    // Dedupe key for at-least-once producers (worker retries, duplicate delivery).
+    idempotencyKey: text("idempotencyKey"),
+
+    createdAt: timestamp("createdAt", { mode: "date", precision: 3 }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("tls_lifecycle_events_talosId_sequence_key").on(t.talosId, t.sequence),
+    index("tls_lifecycle_events_talosId_createdAt_idx").on(t.talosId, t.createdAt),
+    uniqueIndex("tls_lifecycle_events_talosId_idempotencyKey_unique")
+      .on(t.talosId, t.idempotencyKey)
+      .where(sql`"idempotencyKey" IS NOT NULL`),
+  ],
+);
+
+// ─── Consumed Nonces (replay protection) ────────────────────────────
+//
+// Every signed transfer nonce is persisted here with a UNIQUE constraint on
+// (talosId, nonce) so the database enforces single-use semantics across
+// process restarts and concurrent requests.  Rows are retained for a short
+// window after the nonce expires so delayed replays are still caught, then
+// pruned by a periodic vacuum.
+//
+// expiry — the original transfer-authorization expiry (Unix seconds).
+//          Used by the vacuum to safely remove expired rows without
+//          consulting external state.
+// consumedAt — wall-clock time when the nonce was first consumed.
+//              Present for audit and to bound the vacuum window.
+
+export const tlsConsumedNonces = pgTable(
+  "tls_consumed_nonces",
+  {
+    id: text("id").primaryKey().$defaultFn(() => createId()),
+    talosId: text("talosId").notNull(),
+    nonce: text("nonce").notNull(),
+    expiry: integer("expiry").notNull(),             // original auth expiry (Unix seconds)
+    consumedAt: timestamp("consumedAt", { mode: "date", precision: 3 })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("tls_consumed_nonces_talosId_nonce_key").on(t.talosId, t.nonce),
+    index("tls_consumed_nonces_expiry_idx").on(t.expiry),
+  ],
+);
+
+// ─── Provisioning Job (durable, compensated workflow) ─────────────
+//
+// One row per durable lifecycle run (activate / retire / recover). Step state
+// lives in `steps` so a run is fully resumable after a process restart: the
+// worker leases a row, replays completed steps from the record rather than
+// re-executing them, and unwinds via each step's compensation on failure.
+
+export const tlsProvisioningJobs = pgTable(
+  "tls_provisioning_jobs",
+  {
+    id: text("id").primaryKey().$defaultFn(() => createId()),
+    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "cascade" }),
+
+    action: text("action").notNull(),             // activate | retire | recover
+    // pending | running | completed | compensating | compensated | failed
+    status: text("status").notNull().default("pending"),
+
+    // [{ name, status, attempts, startedAt, completedAt, idempotencyKey, output, error }]
+    steps: jsonb("steps").notNull().default([]),
+    cursor: integer("cursor").notNull().default(0), // index of the next step to run
+
+    attempt: integer("attempt").notNull().default(0),
+    maxAttempts: integer("maxAttempts").notNull().default(3),
+    lastError: text("lastError"),                 // redacted, operator-facing
+
+    // Same lease/fencing contract as tls_commerce_jobs — see 0012_add_job_leases.
+    leasedBy: text("leasedBy"),
+    leaseExpiresAt: timestamp("leaseExpiresAt", { mode: "date", precision: 3 }),
+    fencingToken: integer("fencingToken").notNull().default(0),
+
+    requestedBy: text("requestedBy").notNull(),   // Stellar G-address of the requester
+    // Scoped per talosId; a duplicate submission returns the original run.
+    idempotencyKey: text("idempotencyKey").notNull(),
+
+    createdAt: timestamp("createdAt", { mode: "date", precision: 3 }).notNull().defaultNow(),
+    updatedAt: timestamp("updatedAt", { mode: "date", precision: 3 }).notNull().$onUpdate(() => new Date()),
+    completedAt: timestamp("completedAt", { mode: "date", precision: 3 }),
+  },
+  (t) => [
+    uniqueIndex("tls_provisioning_jobs_talosId_idempotencyKey_unique").on(t.talosId, t.idempotencyKey),
+    index("tls_provisioning_jobs_status_idx").on(t.status, t.leaseExpiresAt),
+    index("tls_provisioning_jobs_talosId_createdAt_idx").on(t.talosId, t.createdAt),
   ],
 );
