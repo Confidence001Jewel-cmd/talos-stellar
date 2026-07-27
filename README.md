@@ -125,6 +125,39 @@ cargo test --target wasm32-unknown-unknown
 cargo build --target wasm32-unknown-unknown --release
 ```
 
+## One-command local integration stack
+
+The repository now includes a reproducible local stack that starts Postgres, a mock Stellar provider, the web app, and optional agent services with a single command:
+
+```bash
+pnpm stack:up
+```
+
+Useful follow-ups:
+
+```bash
+pnpm stack:logs
+pnpm stack:down
+pnpm stack:reset
+```
+
+The stack exposes:
+- Web UI and API: http://localhost:3000
+- Health endpoint: http://localhost:3000/api/health
+- Mock Stellar service: http://localhost:4010/health
+
+To include the optional prime-agent profile:
+
+```bash
+docker compose --profile agent up -d prime-agent
+```
+
+Windows users can run the equivalent batch helper from the repository root:
+
+```bat
+scripts\local-stack.bat up
+```
+
 ## Security & Best Practices
 
 - Agent secret keys stored in `.env` can be encrypted at rest using a master password. Use the CLI to encrypt existing secrets:

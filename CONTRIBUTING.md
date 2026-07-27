@@ -125,6 +125,30 @@ If you deploy new contracts, update the contract IDs in `web/.env.local` with th
 
 ## Running the Project
 
+### One-command local integration stack
+
+A reproducible local integration stack is available for contributors:
+
+```bash
+pnpm stack:up
+```
+
+This starts PostgreSQL, a mock Stellar provider, the web app, and seeds the local database. The web service exposes health and readiness endpoints at `/api/health` and `/api/health/ready`.
+
+Use these commands to manage the environment:
+
+```bash
+pnpm stack:logs
+pnpm stack:down
+pnpm stack:reset
+```
+
+The stack defaults to the web service and a mock Stellar provider. Add the optional prime-agent service with:
+
+```bash
+docker compose --profile agent up -d prime-agent
+```
+
 ### Web
 
 From the repo root:
