@@ -105,8 +105,10 @@ export async function GET(request: NextRequest) {
   const stream = new ReadableStream({
     async start(controller) {
       let isClosed = false;
-      let pollTimer: ReturnType<typeof setInterval> | undefined;
-      let pingTimer: ReturnType<typeof setInterval> | undefined;
+      const pollTimer = setInterval(poll, POLL_INTERVAL_MS);
+      const pingTimer = setInterval(() => {
+        if (!send("ping", { ts: Date.now() })) cleanup();
+      }, PING_INTERVAL_MS);
 
       function send(event: string, data: unknown): boolean {
         if (isClosed) return false;
@@ -141,7 +143,7 @@ export async function GET(request: NextRequest) {
 
       send("ping", { ts: Date.now() });
 
-      let talosIds: string[];
+      let talosIds: string[] = [];
       try {
         talosIds = await fetchTalosIds();
       } catch (err) {
@@ -205,17 +207,12 @@ export async function GET(request: NextRequest) {
         }
       }
 
-      pollTimer = setInterval(poll, POLL_INTERVAL_MS);
-
       // Ping doubles as a zombie-connection probe. When a client disconnects
       // behind a proxy that doesn't relay the TCP RST, `request.signal` never
       // fires "abort". Attempting to write to the closed stream will throw
       // (or return false from send()), at which point we clean up immediately
       // rather than leaking the connection for the rest of the process lifetime.
       // Worst-case detection latency with this approach is PING_INTERVAL_MS (30 s).
-      pingTimer = setInterval(() => {
-        if (!send("ping", { ts: Date.now() })) cleanup();
-      }, PING_INTERVAL_MS);
     },
   });
 

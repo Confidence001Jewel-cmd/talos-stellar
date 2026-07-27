@@ -65,7 +65,7 @@ export async function GET(request: NextRequest) {
     const hasMore = services.length > limit;
     const page = hasMore ? services.slice(0, limit) : services;
 
-    let results = page.map((s) => ({
+    const results = page.map((s) => ({
       talosId: s.talosId,
       talosName: s.talosName,
       talosCategory: s.talosCategory,

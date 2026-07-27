@@ -178,8 +178,8 @@ export async function POST(
       const recipient = service.stellarPublicKey ?? talos.agentWalletAddress ?? OPERATOR;
       try {
         ({ txHash } = await submitAndVerifyPayment(signedXdr, String(service.price), recipient));
-      } catch (err: any) {
-        return Response.json({ error: err?.message ?? "Payment submission failed" }, { status: 402 });
+      } catch (err: unknown) {
+        return Response.json({ error: err instanceof Error ? err.message : "Payment submission failed" }, { status: 402 });
       }
     } else {
       txHash = legacyTxHash!;
@@ -202,9 +202,9 @@ export async function POST(
       let result: Record<string, unknown>;
       try {
         result = await fulfillInstant(service.serviceName, payload ?? {});
-      } catch (err: any) {
+      } catch (err: unknown) {
         return Response.json(
-          { error: `Fulfillment failed: ${err?.message ?? "unknown error"}` },
+          { error: `Fulfillment failed: ${err instanceof Error ? err.message : "unknown error"}` },
           { status: 502 },
         );
       }
