@@ -13,6 +13,7 @@ extern crate std;
 
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
 use ttl_manager;
+use pause_control;
 
 // ── Data Types ──────────────────────────────────────────────────────
 
@@ -235,7 +236,18 @@ const MAX_MIN_DELAY: u64 = 2_592_000; // 30 days in seconds
 /// This constant is embedded in the WASM binary at compile time and is
 /// therefore immutable once deployed; it cannot be altered by any admin
 /// call, storage write, or cross-contract invocation.
-pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 2, 0);
+pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 3, 0);
+
+// ── Pause Domains ───────────────────────────────────────────────────
+
+/// Pause domain for Talos creation (create_talos).
+pub const PAUSE_TALOS_CREATION: u32 = 1;
+/// Pause domain for Talos metadata updates (update_patron, update_kernel, update_pulse).
+pub const PAUSE_TALOS_UPDATE: u32 = 2;
+/// Pause domain for Talos deactivation.
+pub const PAUSE_TALOS_DEACTIVATION: u32 = 3;
+/// Pause domain for protocol configuration (fees, admin, timelock).
+pub const PAUSE_PROTOCOL_CONFIG: u32 = 4;
 
 // ── Contract ────────────────────────────────────────────────────────
 
@@ -267,6 +279,8 @@ impl TalosRegistry {
         pulse: Pulse,
         protocol_wallet: Address,
     ) -> u32 {
+        pause_control::check_not_paused(&e, PAUSE_TALOS_CREATION);
+
         // Require creator authorization
         patron.creator_addr.require_auth();
 
@@ -362,6 +376,8 @@ impl TalosRegistry {
 
     /// Update patron shares for a Talos.
     pub fn update_patron(e: Env, talos_id: u32, patron: Patron) {
+        pause_control::check_not_paused(&e, PAUSE_TALOS_UPDATE);
+
         let mut talos: Talos = e
             .storage()
             .persistent()
@@ -384,6 +400,8 @@ impl TalosRegistry {
 
     /// Update kernel policy for a Talos.
     pub fn update_kernel(e: Env, talos_id: u32, kernel: Kernel) {
+        pause_control::check_not_paused(&e, PAUSE_TALOS_UPDATE);
+
         let mut talos: Talos = e
             .storage()
             .persistent()
@@ -401,6 +419,8 @@ impl TalosRegistry {
 
     /// Update pulse token config for a Talos.
     pub fn update_pulse(e: Env, talos_id: u32, pulse: Pulse) {
+        pause_control::check_not_paused(&e, PAUSE_TALOS_UPDATE);
+
         let mut talos: Talos = e
             .storage()
             .persistent()
@@ -418,6 +438,8 @@ impl TalosRegistry {
 
     /// Deactivate a Talos.
     pub fn deactivate_talos(e: Env, talos_id: u32) {
+        pause_control::check_not_paused(&e, PAUSE_TALOS_DEACTIVATION);
+
         let mut talos: Talos = e
             .storage()
             .persistent()
@@ -491,6 +513,8 @@ impl TalosRegistry {
     ///
     /// Only the configured protocol wallet may update the fee.
     pub fn set_protocol_fee(e: Env, fee_bps: u32) {
+        pause_control::check_not_paused(&e, PAUSE_PROTOCOL_CONFIG);
+
         if fee_bps > MAX_PROTOCOL_FEE_BPS {
             panic!("Protocol fee cannot exceed 100%");
         }
@@ -530,6 +554,8 @@ impl TalosRegistry {
     /// # Panics
     /// - `"Contract not initialized"` — if `initialize` has not been called.
     pub fn propose_admin(e: Env, new_admin: Address) {
+        pause_control::check_not_paused(&e, PAUSE_PROTOCOL_CONFIG);
+
         let current: Address = e
             .storage()
             .persistent()
@@ -553,6 +579,8 @@ impl TalosRegistry {
     /// # Authorization
     /// Requires current protocol wallet (admin) authorization.
     pub fn set_timelock_config(e: Env, min_delay: u64, grace_period: u64) {
+        pause_control::check_not_paused(&e, PAUSE_PROTOCOL_CONFIG);
+
         let admin: Address = e
             .storage()
             .persistent()
@@ -597,6 +625,8 @@ impl TalosRegistry {
     /// # Authorization
     /// Requires current protocol wallet (admin) authorization.
     pub fn schedule_action(e: Env, action: AdminAction, delay: u64) -> u64 {
+        pause_control::check_not_paused(&e, PAUSE_PROTOCOL_CONFIG);
+
         let admin: Address = e
             .storage()
             .persistent()
@@ -688,6 +718,8 @@ impl TalosRegistry {
     /// # Authorization
     /// Requires current protocol wallet (admin) authorization.
     pub fn cancel_action(e: Env, proposal_id: u64) {
+        pause_control::check_not_paused(&e, PAUSE_PROTOCOL_CONFIG);
+
         let admin: Address = e
             .storage()
             .persistent()
@@ -734,6 +766,8 @@ impl TalosRegistry {
     /// # Panics
     /// - `"No pending admin transfer"` — if `propose_admin` has not been called.
     pub fn accept_admin(e: Env) {
+        pause_control::check_not_paused(&e, PAUSE_PROTOCOL_CONFIG);
+
         let pending: Address = e
             .storage()
             .persistent()
@@ -765,6 +799,8 @@ impl TalosRegistry {
     /// - `"Contract not initialized"` — if `initialize` has not been called.
     /// - `"No pending admin transfer"` — if there is nothing to cancel.
     pub fn cancel_admin_transfer(e: Env) {
+        pause_control::check_not_paused(&e, PAUSE_PROTOCOL_CONFIG);
+
         let current: Address = e
             .storage()
             .persistent()
@@ -859,6 +895,8 @@ impl TalosRegistry {
     /// # Authorization
     /// Requires the protocol wallet (admin) to sign.
     pub fn touch_batch(e: Env, start_id: u32, limit: u32) -> (u32, u32) {
+        pause_control::check_not_paused(&e, PAUSE_PROTOCOL_CONFIG);
+
         let admin: Address = e
             .storage()
             .persistent()
@@ -931,6 +969,45 @@ impl TalosRegistry {
         } else {
             (health.min_age, health.max_age, health.keys_below_warn, health.keys_below_crit, health.total_keys)
         }
+    }
+
+    // ── Scoped Emergency Pause Controls ──────────────────────────────
+
+    /// Pause a specific domain. Only the protocol wallet (admin) can pause.
+    ///
+    /// # Arguments
+    /// * `e` - Soroban environment
+    /// * `domain_id` - The pause domain to activate
+    /// * `duration` - Pause duration in seconds (0 = indefinite, requires manual unpause)
+    pub fn pause_domain(e: Env, domain_id: u32, duration: u64) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::ProtocolWallet)
+            .expect("Contract not initialized");
+        pause_control::pause_domain(&e, domain_id, &admin, duration);
+    }
+
+    /// Unpause a previously paused domain. Only the protocol wallet (admin) can unpause.
+    pub fn unpause_domain(e: Env, domain_id: u32) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::ProtocolWallet)
+            .expect("Contract not initialized");
+        pause_control::unpause_domain(&e, domain_id, &admin);
+    }
+
+    /// Check whether a specific domain is currently paused.
+    /// Returns `true` if the domain is paused and the pause has not expired.
+    pub fn is_domain_paused(e: Env, domain_id: u32) -> bool {
+        pause_control::check_not_paused(&e, domain_id);
+        pause_control::is_paused(&e, domain_id)
+    }
+
+    /// Get the full pause status for a domain, if set.
+    pub fn get_domain_pause_status(e: Env, domain_id: u32) -> Option<pause_control::PauseStatus> {
+        pause_control::get_pause_status(&e, domain_id)
     }
 }
 
@@ -2174,5 +2251,242 @@ mod tests {
             }])
             .try_propose_admin(&new_admin);
         assert!(res_prop.is_err());
+    }
+
+    // ── Pause Control Integration Tests ─────────────────────────
+
+    #[test]
+    fn pause_talos_creation_blocks_create_talos() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        client.initialize(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "pause_domain",
+                    args: (PAUSE_TALOS_CREATION, 0u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .pause_domain(&PAUSE_TALOS_CREATION, &0);
+
+        let name = s(&env, "Test");
+        let category = s(&env, "Test");
+        let description = s(&env, "Test");
+        let patron = patron(&env, &creator);
+        let kernel = kernel();
+        let pulse = pulse(&env);
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &creator,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_talos",
+                    args: (
+                        name.clone(),
+                        category.clone(),
+                        description.clone(),
+                        patron.clone(),
+                        kernel.clone(),
+                        pulse.clone(),
+                        admin.clone(),
+                    )
+                        .into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_create_talos(&name, &category, &description, &patron, &kernel, &pulse, &admin);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn pause_talos_update_blocks_update_patron() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        client.initialize(&admin);
+        let talos_id =
+            create_talos_with_auth(&env, &client, &contract_id, &creator, &admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "pause_domain",
+                    args: (PAUSE_TALOS_UPDATE, 0u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .pause_domain(&PAUSE_TALOS_UPDATE, &0);
+
+        let new_patron = patron(&env, &creator);
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &creator,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "update_patron",
+                    args: (talos_id, new_patron.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_update_patron(&talos_id, &new_patron);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn pause_protocol_config_blocks_set_protocol_fee() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "pause_domain",
+                    args: (PAUSE_PROTOCOL_CONFIG, 0u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .pause_domain(&PAUSE_PROTOCOL_CONFIG, &0);
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_protocol_fee",
+                    args: (500u32,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_set_protocol_fee(&500);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn unpause_restores_functionality() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        client.initialize(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "pause_domain",
+                    args: (PAUSE_TALOS_CREATION, 0u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .pause_domain(&PAUSE_TALOS_CREATION, &0);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "unpause_domain",
+                    args: (PAUSE_TALOS_CREATION,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .unpause_domain(&PAUSE_TALOS_CREATION);
+
+        create_talos_with_auth(&env, &client, &contract_id, &creator, &admin);
+    }
+
+    #[test]
+    fn pause_expiry_allows_write_after_expiration() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        client.initialize(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "pause_domain",
+                    args: (PAUSE_TALOS_CREATION, 1u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .pause_domain(&PAUSE_TALOS_CREATION, &1);
+
+        env.ledger().set_timestamp(100);
+        assert!(client.is_domain_paused(&PAUSE_TALOS_CREATION));
+
+        // After expiry, the pause should auto-expire and writes succeed
+        env.ledger().set_timestamp(200);
+        create_talos_with_auth(&env, &client, &contract_id, &creator, &admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "HostError")]
+    fn unauthorized_pause_rejected() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+        let attacker = Address::generate(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &attacker,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "pause_domain",
+                    args: (PAUSE_TALOS_CREATION, 0u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .pause_domain(&PAUSE_TALOS_CREATION, &0);
+    }
+
+    #[test]
+    fn pause_emits_event() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "pause_domain",
+                    args: (PAUSE_TALOS_CREATION, 0u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .pause_domain(&PAUSE_TALOS_CREATION, &0);
+
+        let events = env.events().all();
+        let (event_contract, topics, data) = events.get(events.len() - 1).unwrap();
+        assert_eq!(event_contract, contract_id);
+        assert_topic_symbol(&env, &topics, 0, symbol_short!("dom_paus"));
+        assert_topic_address(&env, &topics, 1, &admin);
+        let (got_domain, got_duration): (u32, u64) =
+            TryFromVal::try_from_val(&env, &data).unwrap();
+        assert_eq!(got_domain, PAUSE_TALOS_CREATION);
+        assert_eq!(got_duration, 0);
     }
 }
