@@ -87,6 +87,11 @@ export async function POST(
       );
     }
 
+    // Check quota BEFORE writing to DB so we never persist a record that
+    // would be rejected.  This also avoids orphaned rows when quota is exceeded.
+    const quotaResult = await checkAndIncrementQuota(db, id, "activity_writes");
+    if (!quotaResult.ok) return quotaExceededResponse(quotaResult);
+
     const [activity] = await db
       .insert(tlsActivities)
       .values({

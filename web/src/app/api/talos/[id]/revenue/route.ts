@@ -94,6 +94,9 @@ export async function POST(
     }
 
     // Record revenue in DB — all revenue stays in Agent Treasury
+    const quotaResult = await checkAndIncrementQuota(db, id, "revenue_writes");
+    if (!quotaResult.ok) return quotaExceededResponse(quotaResult);
+
     const [revenue] = await db
       .insert(tlsRevenues)
       .values({
