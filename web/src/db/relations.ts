@@ -27,6 +27,8 @@ export const talosRelations = relations(tlsTalos, ({ many, one }) => ({
   playbooks: many(tlsPlaybooks),
   auditLogs: many(tlsApiAuditLogs),
   tokenPurchases: many(tlsTokenPurchases),
+  webhookSubscriptions: many(tlsWebhookSubscriptions),
+  webhookDeliveries: many(tlsWebhookDeliveries),
 }));
 
 export const patronRelations = relations(tlsPatrons, ({ one }) => ({

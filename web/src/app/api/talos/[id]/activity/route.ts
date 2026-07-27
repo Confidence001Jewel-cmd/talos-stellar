@@ -98,6 +98,18 @@ export async function POST(
       })
       .returning();
 
+    // Fire webhook event (non-blocking)
+    emitWebhookEvent({
+      type: `activity.${type}`,
+      talosId: id,
+      payload: {
+        activityId: activity.id,
+        type,
+        channel,
+        status: activity.status,
+      },
+    }).catch(() => {});
+
     return Response.json(activity, { status: 201 });
   } catch {
     return Response.json({ error: "Internal server error" }, { status: 500 });

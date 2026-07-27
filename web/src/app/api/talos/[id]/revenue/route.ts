@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { tlsTalos, tlsRevenues } from "@/db/schema";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { verifyAgentApiKey } from "@/lib/auth";
+import { emitWebhookEvent } from "@/lib/webhooks/delivery";
 
 // GET /api/talos/:id/revenue — Get revenue history
 export async function GET(
@@ -103,6 +104,19 @@ export async function POST(
         txHash,
       })
       .returning();
+
+    // Fire webhook event (non-blocking)
+    emitWebhookEvent({
+      type: "revenue.recorded",
+      talosId: id,
+      payload: {
+        revenueId: revenue.id,
+        amount: String(amount),
+        currency: currency ?? "USDC",
+        source,
+        txHash,
+      },
+    }).catch(() => {});
 
     return Response.json(revenue, { status: 201 });
   } catch {
