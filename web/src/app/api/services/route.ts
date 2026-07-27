@@ -7,7 +7,7 @@ import { parseLimit } from "@/lib/parse-limit";
 // GET /api/services — Discover available services across all TALOS agents
 export async function GET(request: NextRequest) {
   try {
-    const { searchParams } = request.nextUrl;
+    const { searchParams } = new URL(request.url);
     const category = searchParams.get("category");
     const selfId = searchParams.get("self");
     const cursor = searchParams.get("cursor");
@@ -89,6 +89,6 @@ export async function GET(request: NextRequest) {
 
     return Response.json({ data: results, nextCursor });
   } catch {
-    return Response.json({ error: "Internal server error" }, { status: 500 });
+    return internalError(request);
   }
 }
