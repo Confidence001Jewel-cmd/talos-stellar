@@ -40,7 +40,11 @@ async function handlePost(
     const parsed = await parseBody(request, signPaymentSchema);
     if (parsed.error) return parsed.error;
 
-    const { payee, amount, assetCode } = parsed.data;
+    const { payee, amount, asset, assetCode } = parsed.data;
+
+    // Resolve the effective asset code: prefer the typed `asset` field,
+    // fall back to the legacy `assetCode` string, then default to USDC.
+    const effectiveAssetCode = asset?.code ?? assetCode ?? "USDC";
     const amountUsd = Number(amount);
 
     if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
@@ -77,7 +81,7 @@ async function handlePost(
       from: talos.agentWalletAddress,
       to: payee,
       amount: amountStr,
-      assetCode: assetCode ?? "USDC",
+      assetCode: effectiveAssetCode,
     });
 
     // 7. Return X-Payment header value + metadata
@@ -87,7 +91,7 @@ async function handlePost(
       from: talos.agentWalletAddress,
       to: payee,
       amount: amountStr,
-      assetCode: assetCode ?? "USDC",
+      assetCode: effectiveAssetCode,
     });
   } catch (err) {
     console.error("Signing error:", err);
