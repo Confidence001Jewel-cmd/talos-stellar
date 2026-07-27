@@ -23,6 +23,7 @@ _EXPORT_INTERVAL_MILLIS = 15000
 
 _configured = False
 _instruments: dict[str, object] = {}
+_provider: MeterProvider | None = None
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -67,19 +68,30 @@ def configure_metrics() -> None:
     reader = PeriodicExportingMetricReader(
         exporter, export_interval_millis=_EXPORT_INTERVAL_MILLIS
     )
-    provider = MeterProvider(resource=resource, metric_readers=[reader])
-    metrics.set_meter_provider(provider)
+    _provider = MeterProvider(resource=resource, metric_readers=[reader])
+    metrics.set_meter_provider(_provider)
     _build_instruments()
 
 
-def shutdown_metrics() -> None:
-    provider = metrics.get_meter_provider()
-    shutdown = getattr(provider, "shutdown", None)
-    if callable(shutdown):
+def force_flush_metrics() -> None:
+    if _provider is not None:
         try:
-            shutdown()
+            _provider.force_flush()
         except Exception:
             pass
+
+
+def shutdown_metrics() -> None:
+    if _provider is None:
+        return
+    try:
+        _provider.force_flush()
+    except Exception:
+        pass
+    try:
+        _provider.shutdown()
+    except Exception:
+        pass
 
 
 def _build_instruments() -> None:

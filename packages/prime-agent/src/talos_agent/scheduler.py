@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 from talos_agent import metrics
 from talos_agent.observability import log, setup as setup_observability
-from talos_agent.tracing import shutdown_tracing, traced_span
+from talos_agent.tracing import force_flush as force_flush_tracing, shutdown_tracing, traced_span
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -982,6 +982,8 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
         db.close()
         # Flush any spans/metrics buffered by the batch processors before exit
         # so a graceful shutdown doesn't drop the last few seconds of data.
+        force_flush_tracing()
+        metrics.force_flush_metrics()
         shutdown_tracing()
         metrics.shutdown_metrics()
         console.print("[bold]Agent stopped.[/bold]")

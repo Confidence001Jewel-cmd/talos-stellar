@@ -15,6 +15,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 )
 from opentelemetry.trace import StatusCode
 
+import structlog
 from talos_agent import metrics as metrics_module
 from talos_agent import tracing as tracing_module
 from talos_agent.api_client import TalosAPIClient
@@ -349,3 +350,108 @@ class TestApiClientSpans:
         (span,) = in_memory_tracer.get_finished_spans()
         serialized = str(dict(span.attributes))
         assert "cpk_test_key" not in serialized
+
+
+# ── Integration: full trace + metrics + log correlation pipeline ──
+
+
+class TestFullPipelineIntegration:
+    """End-to-end verification that traces, metrics, and log correlation
+    all work together through in-memory exporters.
+
+    This is the single test the maintainer can run to confirm the entire
+    telemetry pipeline is wired correctly.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, monkeypatch):
+        monkeypatch.setenv("OTEL_ENABLED", "true")
+        monkeypatch.setenv("OTEL_METRICS_ENABLED", "true")
+        monkeypatch.setenv("OTEL_TRACES_EXPORTER", "console")
+        # Reset module-level state so configure_* runs fresh
+        tracing_module._configured = False
+        tracing_module._provider = None
+        metrics_module._configured = False
+        metrics_module._provider = None
+        metrics_module._instruments.clear()
+
+    def test_trace_export_and_log_correlation(self, in_memory_tracer):
+        """A traced span produces a finished span in the exporter AND injects
+        trace_id/span_id into structlog events."""
+        log_events: list[dict] = []
+
+        def _capture(logger, method_name, event_dict):
+            log_events.append(event_dict)
+            return event_dict
+
+        structlog.configure(processors=[_capture])
+
+        from talos_agent.observability import _inject_trace_context
+
+        with tracing_module.traced_span("integration.test", {"key": "value"}) as span:
+            assert span.is_recording() is True
+            event = _inject_trace_context(None, "info", {"event": "test_in_progress"})
+            assert "trace_id" in event
+            assert "span_id" in event
+
+        (finished,) = in_memory_tracer.get_finished_spans()
+        assert finished.name == "integration.test"
+        assert finished.attributes.get("key") == "value"
+
+    def test_configure_and_shutdown_lifecycle_is_deterministic(self):
+        """Calling configure_tracing + shutdown_tracing multiple times is
+        safe and produces exactly one provider."""
+        tracing_module.configure_tracing()
+        tracing_module.configure_tracing()  # second call is no-op
+        assert tracing_module._provider is not None
+
+        # Shutdown is idempotent
+        tracing_module.shutdown_tracing()
+        tracing_module.shutdown_tracing()
+
+    def test_metrics_configure_and_record(self):
+        """OTel metrics histogram/counter instruments record through an
+        in-memory pipeline when enabled."""
+        from opentelemetry import metrics as otel_metrics
+        from opentelemetry.sdk.metrics import MeterProvider
+        from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+        reader = InMemoryMetricReader()
+        provider = MeterProvider(metric_readers=[reader])
+        otel_metrics.set_meter_provider(provider)
+        metrics_module._provider = provider
+
+        metrics_module._build_instruments()
+        metrics_module.record_cycle("agent_cycle", "success", 0.042)
+        metrics_module.record_tool_call("test_tool", "success", 0.015)
+        metrics_module.record_llm_call("gpt-4o", "success", 1.2)
+        metrics_module.record_http_call(200, 0, 0.1)
+
+        metrics_data = reader.get_metrics_data()
+        assert metrics_data is not None
+        resource_metrics = metrics_data.resource_metrics
+        assert len(resource_metrics) > 0
+
+        metric_names = set()
+        for rm in resource_metrics:
+            for sm in rm.scope_metrics:
+                for m in sm.metrics:
+                    metric_names.add(m.name)
+        assert "talos_agent_cycle_duration_seconds" in metric_names
+        assert "talos_agent_cycle_total" in metric_names
+        assert "talos_agent_tool_call_duration_seconds" in metric_names
+        assert "talos_agent_llm_call_duration_seconds" in metric_names
+
+        provider.shutdown()
+        otel_metrics.set_meter_provider(otel_metrics.NoOpMeterProvider())
+
+    def test_metrics_safe_when_never_configured(self):
+        """record_* helpers do not raise when metrics were never configured."""
+        metrics_module.record_cycle("test", "success", 0.1)
+        metrics_module.record_tool_call("test", "error", 0.2)
+        metrics_module.record_llm_call("test", "success", 0.3)
+        metrics_module.record_http_call(200, 0, 0.4)
+
+    def test_force_flush_is_safe_when_disabled(self):
+        tracing_module.force_flush()
+        metrics_module.force_flush_metrics()

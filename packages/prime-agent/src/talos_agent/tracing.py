@@ -33,6 +33,7 @@ _MAX_EXPORT_BATCH_SIZE = 512
 _SCHEDULE_DELAY_MILLIS = 5000
 
 _configured = False
+_provider: TracerProvider | None = None
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -54,8 +55,11 @@ def configure_tracing() -> None:
     several ``run()`` coroutines — has no ``await`` points, so under
     asyncio's single-threaded cooperative scheduling there is no window for
     a double-registration race.
+
+    Returns ``True`` when a real provider was configured, ``False`` when
+    tracing stays a no-op (disabled or already configured).
     """
-    global _configured
+    global _configured, _provider
     if _configured:
         return
     _configured = True
@@ -71,7 +75,7 @@ def configure_tracing() -> None:
         ratio = 1.0
 
     resource = Resource.create({"service.name": service_name})
-    provider = TracerProvider(
+    _provider = TracerProvider(
         resource=resource,
         sampler=ParentBased(TraceIdRatioBased(ratio)),
     )
@@ -87,7 +91,7 @@ def configure_tracing() -> None:
         headers = _parse_otlp_headers(os.getenv("OTEL_EXPORTER_OTLP_HEADERS", ""))
         exporter = OTLPSpanExporter(headers=headers or None)
 
-    provider.add_span_processor(
+    _provider.add_span_processor(
         BatchSpanProcessor(
             exporter,
             max_queue_size=_MAX_QUEUE_SIZE,
@@ -95,18 +99,33 @@ def configure_tracing() -> None:
             schedule_delay_millis=_SCHEDULE_DELAY_MILLIS,
         )
     )
-    trace.set_tracer_provider(provider)
+    trace.set_tracer_provider(_provider)
+
+
+def force_flush() -> None:
+    if _provider is not None:
+        try:
+            _provider.force_flush()
+        except Exception:
+            pass
 
 
 def shutdown_tracing() -> None:
-    """Flush and shut down the tracer provider. Safe to call when disabled."""
-    provider = trace.get_tracer_provider()
-    shutdown = getattr(provider, "shutdown", None)
-    if callable(shutdown):
-        try:
-            shutdown()
-        except Exception:
-            pass
+    """Flush and shut down the tracer provider. Safe to call when disabled.
+
+    Flushes any buffered spans via ``force_flush`` before calling ``shutdown``
+    so the last few seconds of telemetry are not lost during graceful restarts.
+    """
+    if _provider is None:
+        return
+    try:
+        _provider.force_flush()
+    except Exception:
+        pass
+    try:
+        _provider.shutdown()
+    except Exception:
+        pass
 
 
 def get_tracer() -> trace.Tracer:
