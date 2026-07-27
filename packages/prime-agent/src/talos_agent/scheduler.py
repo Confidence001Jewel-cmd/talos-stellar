@@ -713,6 +713,9 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
             except Exception as e:
                 console.print(f"[dim red]Polling error: {e}[/dim red]")
                 backoff.failure()
+                if backoff.terminal:
+                    logger.warning("polling_task: reached max_attempts — stopping task")
+                    break
 
             try:
                 await asyncio.wait_for(shutdown_event.wait(), timeout=backoff.next_delay())
@@ -730,6 +733,9 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
             except Exception as e:
                 logger.debug(f"Heartbeat error: {e}")
                 backoff.failure()
+                if backoff.terminal:
+                    logger.warning("heartbeat_task: reached max_attempts — stopping task")
+                    break
 
             try:
                 await asyncio.wait_for(shutdown_event.wait(), timeout=backoff.next_delay())
@@ -778,6 +784,9 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
             except Exception as e:
                 logger.debug(f"Activity flush error: {e}")
                 backoff.failure()
+                if backoff.terminal:
+                    logger.warning("activity_flush_task: reached max_attempts — stopping task")
+                    break
 
             try:
                 await asyncio.wait_for(shutdown_event.wait(), timeout=backoff.next_delay())
