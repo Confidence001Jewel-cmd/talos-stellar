@@ -37,25 +37,23 @@ from __future__ import annotations
 
 import errno
 import hashlib
-import io
 import json
 import os
 import shutil
 import sqlite3
 import stat
 import tempfile
-import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import structlog
 
 from talos_agent.config import APP_DIR
 from talos_agent.crypto import decrypt_with_password, encrypt_with_password
-from talos_agent.db import LocalDB, get_db_path
+from talos_agent.db import get_db_path
 
 log = structlog.get_logger(__name__)
 
@@ -298,7 +296,6 @@ def build_backup(
             # so we can patch size_bytes without including the body in the
             # hashing chain (deterministic: body order matches Manifest order).
             run_dict = dict(run.__dict__)
-            run_dict_body = body_bytes
             run_dict["manifest"]["size_bytes"] = -1  # placeholder, patched after
             # Sort file order to keep JSON deterministic.
             ordered_files = {k: body_bytes[k] for k in sorted(body_bytes.keys())}
@@ -402,15 +399,6 @@ def verify_backup(*, artifact_path: Path, password: str) -> BackupRun:
     # Compat: prefer `filesMeta`, accept legacy `files` produced by earlier
     # prototypes (none in source today, but cheap forward-compat).
     files_section = data.get("filesMeta") or data["files"]
-    expected_files = {k: v for k, v in files_section.items()}
-    # Validate manifest sha256 chain
-    manifest_inner = {
-        "encryption": data.get("encryption"),
-        "files": files_section,
-        "rowCountsSqlite": data.get("database", {}).get("rowCountsSqlite", {}),
-        "scope": data.get("scope"),
-        "schemaVersion": data.get("database", {}).get("signalVersion"),
-    }
     # Trust, but verify: actual sha256 of plaintext matches the manifest sha256 if present.
     sha = _sha256_bytes(plaintext)
     if "sha256" in data["manifest"]:
@@ -582,7 +570,6 @@ async def trigger_web_backup(
     Reuses the http retry helpers so a single 429 / 503 doesn't fail the
     backup call.
     """
-    import json  # local import keeps top-level minimal
 
     from talos_agent.http import request_with_retry
     import httpx

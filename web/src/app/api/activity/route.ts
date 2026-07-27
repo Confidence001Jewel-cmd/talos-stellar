@@ -4,6 +4,7 @@ import {
   fetchActivityTransactions,
   InvalidActivityCursorError,
 } from "./query";
+import { parseLimit } from "@/lib/parse-limit";
 
 export const dynamic = "force-dynamic";
 

@@ -165,7 +165,7 @@ jobs:
             pnpm tsx /tmp/dump.ts > ../artifacts/source-dump.json
           ls -la ../artifacts/source-dump.json
 
-      - name: Cross-language parity check: prime-agent CLI decrypts a TS-produced blob
+      - name: "Cross-language parity check: prime-agent CLI decrypts a TS-produced blob"
         env:
           BACKUP_PASSPHRASE: ci-passphrase-must-be-long-enough
         run: |
@@ -184,7 +184,7 @@ jobs:
           print("PYTHON_DECRYPT_OK")
           PY
 
-      - name: Cross-language parity check: Node decrypts a Python-produced blob
+      - name: "Cross-language parity check: Node decrypts a Python-produced blob"
         env:
           BACKUP_PASSPHRASE: ci-passphrase-must-be-long-enough
         run: |

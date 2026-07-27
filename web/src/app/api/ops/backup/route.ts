@@ -66,8 +66,6 @@ async function verifyOpsAdmin(req: NextRequest): Promise<{ ok: true } | { ok: fa
   return { ok: true };
 }
 
-const _v = void rawPost; // Reference to keep TS happy under noUnusedParameters.
-
 const rawPost = async (req: NextRequest): Promise<Response> => {
   if (isBackupDisabled()) {
     return Response.json({ error: "Backup is disabled (TALOS_BACKUP_DISABLED=1)" }, { status: 423 });
@@ -234,26 +232,4 @@ const rawPost = async (req: NextRequest): Promise<Response> => {
   }
 };
 
-const _usedToSatisfyTypeChecks = [
-  BACKUP_RUN_STATUSES,
-  eq,
-  and,
-  desc,
-  sql,
-];
-
-void _usedToSatisfyTypeChecks;
-
-const _usedToSatisfyTypeChecks = [
-  eq,
-];
-
-void _usedToSatisfyTypeChecks;
-
 export const POST = withRequestId(rawPost);
-
-// Reference unused imported symbols so unused-import linters don't reject
-// the dependency boundary. The actual DB write is performed via `db.update`
-// above; `eq` is the only Drizzle operator used here.
-const _unused_drizzle_boundary = { eq };
-void _unused_drizzle_boundary;

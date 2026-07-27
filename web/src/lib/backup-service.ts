@@ -30,6 +30,7 @@ import {
   encryptWithPassword,
 } from "./backup-crypto";
 import { sanitizeErrorMessage } from "./backup-types";
+import { logger } from "./logger";
 
 export const BACKUP_FORMAT_VERSION = "1.0";
 
@@ -207,7 +208,7 @@ export async function dumpTablesToJson(
       );
       const rows = dataRes.rows.map(jsonable);
       if (rows.length >= MAX_ROWS_PER_TABLE) {
-        log.warn(
+        logger.warn(
           {
             table: safeName,
             rowsFetched: rows.length,

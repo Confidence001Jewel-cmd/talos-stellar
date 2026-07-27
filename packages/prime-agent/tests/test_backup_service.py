@@ -16,11 +16,8 @@ Critical invariants checked:
 from __future__ import annotations
 
 import base64
-import json
-import os
 import stat
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -30,7 +27,6 @@ from talos_agent.backup_service import (
     BackupBusyError,
     BackupError,
     build_backup,
-    collect_agent_files,
     restore_backup,
     verify_backup,
 )
