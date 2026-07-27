@@ -15,7 +15,7 @@ export async function GET(request: NextRequest) {
     if (!parsedLimit.ok) return parsedLimit.response;
     const limit = parsedLimit.limit;
 
-    const conditions = [];
+    const conditions = [eq(tlsTalos.status, "Active")];
 
     // Exclude the requesting TALOS's own services
     if (selfId) {
