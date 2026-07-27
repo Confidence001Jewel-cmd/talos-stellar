@@ -11,6 +11,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
+from talos_agent.clock import ClockProtocol, SystemClock
+
 import structlog
 from rich.console import Console
 
@@ -259,6 +261,7 @@ class DurableBackoff:
         max_backoff: float = 300.0,
         jitter: float = 0.2,
         max_attempts: int = MAX_ATTEMPTS_DEFAULT,
+        clock: ClockProtocol | None = None,
     ):
         self.task_name = task_name
         self._db = db
@@ -267,6 +270,7 @@ class DurableBackoff:
         self.max_backoff = max_backoff
         self.jitter = jitter
         self.max_attempts = max_attempts
+        self._clock: ClockProtocol = clock if clock is not None else SystemClock()
 
         # In-memory state — restored from DB on construction
         self.fail_count: int = 0
@@ -299,7 +303,7 @@ class DurableBackoff:
 
     def _persist(self) -> None:
         """Write current in-memory state to the DB."""
-        next_at = self._next_attempt_at or datetime.now(timezone.utc)
+        next_at = self._next_attempt_at or self._clock.now()
         try:
             self._db.upsert_retry_state(
                 self.task_name,
@@ -321,7 +325,7 @@ class DurableBackoff:
         """Seconds until the next attempt is allowed (0 if overdue or no state)."""
         if self._next_attempt_at is None:
             return 0.0
-        remaining = (self._next_attempt_at - datetime.now(timezone.utc)).total_seconds()
+        remaining = (self._next_attempt_at - self._clock.now()).total_seconds()
         return max(remaining, 0.0)
 
     def next_delay(self) -> float:
@@ -370,7 +374,7 @@ class DurableBackoff:
             )
 
         delay = self.next_delay()
-        self._next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        self._next_attempt_at = self._clock.now() + timedelta(seconds=delay)
         self._persist()
 
 async def run(settings: Settings, agent_slot: int = 0) -> None:
@@ -604,7 +608,29 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
                             cycle_id=cycle_id,
                         )
                         context = AgentContext.from_db(db, talos_config)
-                        await agent_loop(
+
+                        # ── Replay recording (optional) ──────────────────────
+                        replay_recorder = None
+                        if settings.replay_enabled:
+                            from talos_agent.replay import ReplayRecorder
+                            replay_recorder = ReplayRecorder(
+                                session_id=cycle_id,
+                                db=db,
+                                talos_id=settings.talos_id,
+                                redact=settings.replay_redact_payloads,
+                            )
+                            replay_recorder.record(
+                                "agent_cycle_start",
+                                {
+                                    "talos_id": settings.talos_id,
+                                    "current_time": context.current_time,
+                                    "pending_approvals": context.pending_approvals,
+                                    "pending_jobs": context.pending_jobs,
+                                    "posts_today": context.posts_today,
+                                },
+                            )
+
+                        messages = await agent_loop(
                             settings=settings,
                             tools=tools,
                             talos_config=talos_config,
@@ -613,10 +639,38 @@ async def run(settings: Settings, agent_slot: int = 0) -> None:
                             shutdown_event=shutdown_event,
                         )
                         db.update_schedule("agent_cycle")
+
+                        # ── Record completion ────────────────────────────────
+                        if replay_recorder is not None:
+                            replay_recorder.record(
+                                "agent_cycle_complete",
+                                {"message_count": len(messages)},
+                            )
+                            db.finish_replay_session(cycle_id, status="completed")
+
                         log.info("agent_cycle_complete", cycle_id=cycle_id)
                 except Exception as e:
                     console.print(f"[red]Agent cycle error: {e}[/red]")
                     log.error("agent_cycle_error", error=str(e), cycle_id=cycle_id)
+
+                    # ── Record error ─────────────────────────────────────────
+                    if settings.replay_enabled:
+                        try:
+                            from talos_agent.replay import ReplayRecorder
+                            err_recorder = ReplayRecorder(
+                                session_id=cycle_id,
+                                db=db,
+                                talos_id=settings.talos_id,
+                                redact=settings.replay_redact_payloads,
+                            )
+                            err_recorder.record(
+                                "agent_cycle_error",
+                                {"error": str(e), "error_type": type(e).__name__},
+                            )
+                            db.finish_replay_session(cycle_id, status="error")
+                        except Exception:
+                            pass
+
                     try:
                         import sentry_sdk
 
