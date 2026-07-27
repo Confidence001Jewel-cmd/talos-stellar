@@ -118,11 +118,49 @@ fn emit_admin_accepted(env: &Env, new_admin: Address) {
     env.events().publish(topics, (new_admin,));
 }
 
-/// Emitted when the current admin cancels an in-progress transfer.
+/// Emitted when the current admin cancels an in-progress admin transfer.
 /// `cancelled` is the address whose nomination was revoked.
 fn emit_admin_cancelled(env: &Env, cancelled: Address) {
     let topics = (symbol_short!("adm_cnl"),);
     env.events().publish(topics, (cancelled,));
+}
+
+fn emit_asset_allowed(env: &Env, admin: &Address, asset: &Address) {
+    env.events()
+        .publish((symbol_short!("alw_add"), admin.clone()), asset.clone());
+}
+
+fn emit_asset_removed(env: &Env, admin: &Address, asset: &Address) {
+    env.events()
+        .publish((symbol_short!("alw_rem"), admin.clone()), asset.clone());
+}
+
+fn emit_protocol_fee_paid(
+    env: &Env,
+    token: &Address,
+    from: &Address,
+    to: &Address,
+    amount: i128,
+    fee: i128,
+) {
+    env.events().publish(
+        (symbol_short!("fee_pay"), token.clone()),
+        (from.clone(), to.clone(), amount, fee),
+    );
+}
+
+fn emit_revenue_reported(
+    env: &Env,
+    talos_id: u32,
+    payer: &Address,
+    token: &Address,
+    amount: i128,
+    currency: String,
+) {
+    env.events().publish(
+        (symbol_short!("rev_rep"), talos_id),
+        (payer.clone(), token.clone(), amount, currency),
+    );
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -539,6 +577,177 @@ impl TalosRegistry {
             .unwrap_or(PROTOCOL_FEE_BPS);
 
         amount * fee_bps as i128 / MAX_PROTOCOL_FEE_BPS as i128
+    }
+
+    // ── Asset allowlist ───────────────────────────────────────────────
+
+    /// Add an asset (token contract address) to the transfer allowlist.
+    ///
+    /// Only allowlisted assets may be used in `collect_protocol_fee` and
+    /// `report_revenue` — which are the value-transfer entry-points of the
+    /// registry contract. This prevents an attacker from supplying a
+    /// malicious/mintable token to siphon protocol fees.
+    ///
+    /// # Authorization
+    /// Requires the current admin (`ProtocolWallet`) to sign the transaction.
+    pub fn allow_asset(e: Env, asset: Address) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::ProtocolWallet)
+            .expect("Contract not initialized");
+
+        use crate::allowlist::AssetAllowlist;
+        AssetAllowlist::add(&e, &admin, &asset);
+        emit_asset_allowed(&e, &admin, &asset);
+    }
+
+    /// Remove an asset from the transfer allowlist.
+    ///
+    /// # Authorization
+    /// Requires the current admin (`ProtocolWallet`) to sign the transaction.
+    pub fn deny_asset(e: Env, asset: Address) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::ProtocolWallet)
+            .expect("Contract not initialized");
+
+        use crate::allowlist::AssetAllowlist;
+        AssetAllowlist::remove(&e, &admin, &asset);
+        emit_asset_removed(&e, &admin, &asset);
+    }
+
+    /// Query whether an asset is currently on the allowlist.
+    pub fn is_asset_allowed(e: Env, asset: Address) -> bool {
+        use crate::allowlist::AssetAllowlist;
+        AssetAllowlist::is_allowed(&e, &asset)
+    }
+
+    // ── Value-transfer entry points ───────────────────────────────────
+
+    /// Execute a token transfer that includes the protocol fee deduction.
+    ///
+    /// This is the **primary value-transfer entry-point** of the registry:
+    /// callers pass an allowlisted `asset`, a `from` payer, a `to`
+    /// recipient, and a gross `amount`. The contract:
+    ///
+    ///   1. Enforces `asset` is in the allowlist.
+    ///   2. Requires `from` authorization to move its tokens.
+    ///   3. Computes `fee = amount * fee_bps / 10_000`.
+    ///   4. Transfers `fee` tokens `from → ProtocolWallet`.
+    ///   5. Transfers `amount - fee` tokens `from → to`.
+    ///   6. Emits `fee_pay` with the final state.
+    ///
+    /// Returns `(net_amount_to_receiver, protocol_fee)` for integrators.
+    pub fn collect_protocol_fee(
+        e: Env,
+        asset: Address,
+        from: Address,
+        to: Address,
+        amount: i128,
+    ) -> (i128, i128) {
+        if amount <= 0 {
+            panic!("amount must be positive");
+        }
+
+        use crate::allowlist::AssetAllowlist;
+        AssetAllowlist::enforce(&e, &asset);
+
+        from.require_auth();
+
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::ProtocolWallet)
+            .expect("Contract not initialized");
+
+        let fee = Self::calculate_protocol_fee(e.clone(), amount);
+        let net = amount - fee;
+        if net < 0 {
+            panic!("fee exceeds amount");
+        }
+
+        let token_client =
+            soroban_sdk::token::TokenClient::new(&e, &asset);
+
+        if fee > 0 {
+            token_client.transfer(&from, &admin, &fee);
+        }
+        if net > 0 {
+            token_client.transfer(&from, &to, &net);
+        }
+
+        emit_protocol_fee_paid(&e, &asset, &from, &to, amount, fee);
+        (net, fee)
+    }
+
+    /// Report revenue paid to a Talos creator.
+    ///
+    /// Caller (payer) authorizes the transfer of `amount` of the allowlisted
+    /// `asset` from itself to the Talos creator of `talos_id`. This is the
+    /// **representative production-shaped path** used for
+    /// commerce / service payments through the registry.
+    ///
+    /// Steps:
+    ///   1. Look up Talos → assert active → load `creator` and `talos_id`.
+    ///   2. Enforce `asset` is allowlisted (otherwise panic).
+    ///   3. `payer.require_auth()` for the transfer.
+    ///   4. Compute protocol fee → send fee to protocol wallet → send net to
+    ///      Talos creator via Stellar token `transfer`.
+    ///   5. Emit `rev_rep` event with `currency` string (for off-chain ledger).
+    ///
+    /// Returns `(net_to_creator, protocol_fee)`.
+    pub fn report_revenue(
+        e: Env,
+        talos_id: u32,
+        payer: Address,
+        asset: Address,
+        amount: i128,
+        currency: String,
+    ) -> (i128, i128) {
+        if amount <= 0 {
+            panic!("amount must be positive");
+        }
+
+        let talos: Talos = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Talos(talos_id))
+            .expect("Talos not found");
+        if !talos.active {
+            panic!("Talos not active");
+        }
+
+        use crate::allowlist::AssetAllowlist;
+        AssetAllowlist::enforce(&e, &asset);
+
+        payer.require_auth();
+
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::ProtocolWallet)
+            .expect("Contract not initialized");
+
+        let fee = Self::calculate_protocol_fee(e.clone(), amount);
+        let net = amount - fee;
+        if net < 0 {
+            panic!("fee exceeds amount");
+        }
+
+        let token_client =
+            soroban_sdk::token::TokenClient::new(&e, &asset);
+
+        if fee > 0 {
+            token_client.transfer(&payer, &admin, &fee);
+        }
+        if net > 0 {
+            token_client.transfer(&payer, &talos.creator, &net);
+        }
+
+        emit_revenue_reported(&e, talos_id, &payer, &asset, amount, currency);
+        (net, fee)
     }
 }
 
@@ -1487,5 +1696,516 @@ mod tests {
         let (_, _, data) = cancel_events[0].clone();
         let (got_cancelled,): (Address,) = TryFromVal::try_from_val(&env, &data).unwrap();
         assert_eq!(got_cancelled, new_admin);
+    }
+
+    // ── Allowlist: authorization, events, storage ────────────────────
+
+    fn mock_allow(env: &Env, client: &TalosRegistryClient, contract_id: &Address, admin: &Address, asset: &Address) {
+        client
+            .mock_auths(&[MockAuth {
+                address: admin,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "allow_asset",
+                    args: (asset.clone(),).into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .allow_asset(asset);
+    }
+
+    fn mock_deny(env: &Env, client: &TalosRegistryClient, contract_id: &Address, admin: &Address, asset: &Address) {
+        client
+            .mock_auths(&[MockAuth {
+                address: admin,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "deny_asset",
+                    args: (asset.clone(),).into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .deny_asset(asset);
+    }
+
+    #[test]
+    fn allow_asset_admin_happy_path() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.initialize(&admin);
+        assert!(!client.is_asset_allowed(&token));
+
+        mock_allow(&env, &client, &contract_id, &admin, &token);
+        assert!(client.is_asset_allowed(&token));
+    }
+
+    #[test]
+    fn deny_asset_admin_happy_path() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.initialize(&admin);
+        mock_allow(&env, &client, &contract_id, &admin, &token);
+        assert!(client.is_asset_allowed(&token));
+
+        mock_deny(&env, &client, &contract_id, &admin, &token);
+        assert!(!client.is_asset_allowed(&token));
+    }
+
+    #[test]
+    fn allow_asset_unauthorized_update_panics() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let impostor = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &impostor,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "allow_asset",
+                    args: (token.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_allow_asset(&token);
+        assert!(res.is_err(), "non-admin must not be allowed to add assets");
+        assert!(!client.is_asset_allowed(&token));
+    }
+
+    #[test]
+    fn deny_asset_unauthorized_update_panics() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let impostor = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.initialize(&admin);
+        mock_allow(&env, &client, &contract_id, &admin, &token);
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &impostor,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "deny_asset",
+                    args: (token.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_deny_asset(&token);
+        assert!(res.is_err(), "non-admin must not be allowed to remove assets");
+        assert!(client.is_asset_allowed(&token), "asset should remain allowed on failed denial");
+    }
+
+    #[test]
+    fn allow_asset_emits_alw_add_event() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.initialize(&admin);
+        mock_allow(&env, &client, &contract_id, &admin, &token);
+
+        let events = env.events().all();
+        let alw: std::vec::Vec<_> = events
+            .iter()
+            .filter(|(a, t, _)| {
+                if *a != contract_id {
+                    return false;
+                }
+                if t.len() != 2 {
+                    return false;
+                }
+                let sym: Result<Symbol, _> = TryFromVal::try_from_val(&env, &t.get(0).unwrap());
+                sym.map(|s| s == symbol_short!("alw_add")).unwrap_or(false)
+            })
+            .collect();
+
+        assert_eq!(alw.len(), 1);
+        let (_, topics, data) = alw[0].clone();
+        assert_topic_address(&env, &topics, 1, &admin);
+        let asset_addr: Address = TryFromVal::try_from_val(&env, &data).unwrap();
+        assert_eq!(asset_addr, token);
+    }
+
+    #[test]
+    fn deny_asset_emits_alw_rem_event() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.initialize(&admin);
+        mock_allow(&env, &client, &contract_id, &admin, &token);
+        let _ = env.events().all();
+
+        mock_deny(&env, &client, &contract_id, &admin, &token);
+
+        let events = env.events().all();
+        let rem: std::vec::Vec<_> = events
+            .iter()
+            .filter(|(a, t, _)| {
+                if *a != contract_id {
+                    return false;
+                }
+                if t.len() != 2 {
+                    return false;
+                }
+                let sym: Result<Symbol, _> = TryFromVal::try_from_val(&env, &t.get(0).unwrap());
+                sym.map(|s| s == symbol_short!("alw_rem")).unwrap_or(false)
+            })
+            .collect();
+
+        assert_eq!(rem.len(), 1);
+        let (_, topics, data) = rem[0].clone();
+        assert_topic_address(&env, &topics, 1, &admin);
+        let asset_addr: Address = TryFromVal::try_from_val(&env, &data).unwrap();
+        assert_eq!(asset_addr, token);
+    }
+
+    // ── collect_protocol_fee: allowed vs denied + values ─────────────
+
+    use soroban_sdk::token::Client as TokenClient;
+
+    fn create_and_mint_token(env: &Env, admin: &Address) -> Address {
+        let id = env.register_contract_wasm(None, soroban_sdk::token::StellarAssetWASM::new(env));
+        let token = TokenClient::new(env, &id);
+        token.initialize(admin, &7u32, &s(env, "TEST"), &s(env, "Test USD"));
+        id
+    }
+
+    fn mint(env: &Env, asset: &Address, from: &Address, to: &Address, amount: i128) {
+        TokenClient::new(env, asset)
+            .mock_all_auths()
+            .mint(from, to, &amount);
+    }
+
+    fn mock_collect_fee(
+        env: &Env,
+        client: &TalosRegistryClient,
+        contract_id: &Address,
+        from: &Address,
+        asset: &Address,
+        to: &Address,
+        amount: i128,
+    ) -> (i128, i128) {
+        client
+            .mock_auths(&[MockAuth {
+                address: from,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "collect_protocol_fee",
+                    args: (asset.clone(), from.clone(), to.clone(), amount).into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .collect_protocol_fee(asset, from, to, &amount)
+    }
+
+    #[test]
+    fn collect_protocol_fee_allowed_sends_fee_and_net() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let receiver = Address::generate(&env);
+
+        client.initialize(&admin);
+        let asset = create_and_mint_token(&env, &admin);
+        mint(&env, &asset, &admin, &payer, 10_000);
+        mock_allow(&env, &client, &contract_id, &admin, &asset);
+
+        let token = TokenClient::new(&env, &asset);
+        let balance_before_payer = token.balance(&payer);
+        let balance_before_admin = token.balance(&admin);
+        let balance_before_receiver = token.balance(&receiver);
+
+        let (net, fee) = mock_collect_fee(&env, &client, &contract_id, &payer, &asset, &receiver, 10_000);
+        // default 300bps (3%) → fee 300, net 9_700
+        assert_eq!(fee, 300);
+        assert_eq!(net, 9_700);
+
+        assert_eq!(token.balance(&payer), balance_before_payer - 10_000);
+        assert_eq!(token.balance(&admin), balance_before_admin + 300);
+        assert_eq!(token.balance(&receiver), balance_before_receiver + 9_700);
+    }
+
+    #[test]
+    fn collect_protocol_fee_denied_panics_before_transfer() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let receiver = Address::generate(&env);
+
+        client.initialize(&admin);
+        let asset = create_and_mint_token(&env, &admin);
+        mint(&env, &asset, &admin, &payer, 10_000);
+
+        let token = TokenClient::new(&env, &asset);
+        let balance_before = token.balance(&payer);
+
+        // Asset NOT allowlisted → must panic.
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &payer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "collect_protocol_fee",
+                    args: (asset.clone(), payer.clone(), receiver.clone(), 10_000i128).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_collect_protocol_fee(&asset, &payer, &receiver, &10_000);
+        assert!(res.is_err(), "denied asset must not be transferrable");
+
+        // Balances must be unchanged because the enforce() runs before any transfer.
+        assert_eq!(token.balance(&payer), balance_before);
+    }
+
+    // ── report_revenue: allowed, denied, unauthorized payer ──────────
+
+    fn mock_report_revenue(
+        env: &Env,
+        client: &TalosRegistryClient,
+        contract_id: &Address,
+        payer: &Address,
+        talos_id: u32,
+        asset: &Address,
+        amount: i128,
+        currency: &str,
+    ) -> (i128, i128) {
+        client
+            .mock_auths(&[MockAuth {
+                address: payer,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "report_revenue",
+                    args: (talos_id, payer.clone(), asset.clone(), amount, s(env, currency)).into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .report_revenue(&talos_id, payer, asset, &amount, &s(env, currency))
+    }
+
+    #[test]
+    fn report_revenue_allowed_sends_fee_to_admin_and_net_to_creator() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let payer = Address::generate(&env);
+
+        client.initialize(&admin);
+        let id = create_talos_with_auth(&env, &client, &contract_id, &creator, &admin);
+
+        let asset = create_and_mint_token(&env, &admin);
+        mint(&env, &asset, &admin, &payer, 10_000);
+        mock_allow(&env, &client, &contract_id, &admin, &asset);
+
+        let token = TokenClient::new(&env, &asset);
+        let bal_admin_before = token.balance(&admin);
+        let bal_creator_before = token.balance(&creator);
+
+        let (net, fee) = mock_report_revenue(
+            &env, &client, &contract_id, &payer, id, &asset, 10_000, "USD",
+        );
+        assert_eq!(fee, 300);
+        assert_eq!(net, 9_700);
+        assert_eq!(token.balance(&admin), bal_admin_before + 300);
+        assert_eq!(token.balance(&creator), bal_creator_before + 9_700);
+    }
+
+    #[test]
+    fn report_revenue_denied_asset_panics_without_moving_funds() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let payer = Address::generate(&env);
+
+        client.initialize(&admin);
+        let id = create_talos_with_auth(&env, &client, &contract_id, &creator, &admin);
+
+        let asset = create_and_mint_token(&env, &admin);
+        mint(&env, &asset, &admin, &payer, 10_000);
+
+        let token = TokenClient::new(&env, &asset);
+        let bal_payer_before = token.balance(&payer);
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &payer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "report_revenue",
+                    args: (id, payer.clone(), asset.clone(), 10_000i128, s(&env, "USD")).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_report_revenue(&id, &payer, &asset, &10_000, &s(&env, "USD"));
+        assert!(res.is_err(), "denied asset must block revenue reporting");
+        assert_eq!(token.balance(&payer), bal_payer_before);
+    }
+
+    #[test]
+    fn report_revenue_unauthorized_payer_panics() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let impostor = Address::generate(&env);
+
+        client.initialize(&admin);
+        let id = create_talos_with_auth(&env, &client, &contract_id, &creator, &admin);
+        let asset = create_and_mint_token(&env, &admin);
+        mint(&env, &asset, &admin, &payer, 10_000);
+        mock_allow(&env, &client, &contract_id, &admin, &asset);
+
+        // Impostor tries to trigger the transfer on behalf of payer without
+        // payer's signature → must fail.
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &impostor,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "report_revenue",
+                    args: (id, payer.clone(), asset.clone(), 10_000i128, s(&env, "USD")).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_report_revenue(&id, &payer, &asset, &10_000, &s(&env, "USD"));
+        assert!(res.is_err(), "unauthorized payer signature must fail");
+    }
+
+    #[test]
+    fn report_revenue_emits_rev_rep_event() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let payer = Address::generate(&env);
+
+        client.initialize(&admin);
+        let id = create_talos_with_auth(&env, &client, &contract_id, &creator, &admin);
+        let asset = create_and_mint_token(&env, &admin);
+        mint(&env, &asset, &admin, &payer, 10_000);
+        mock_allow(&env, &client, &contract_id, &admin, &asset);
+        let _ = env.events().all();
+
+        let _ = mock_report_revenue(&env, &client, &contract_id, &payer, id, &asset, 10_000, "USD");
+
+        let events = env.events().all();
+        let rev: std::vec::Vec<_> = events
+            .iter()
+            .filter(|(a, t, _)| {
+                if *a != contract_id {
+                    return false;
+                }
+                if t.len() != 2 {
+                    return false;
+                }
+                let sym: Result<Symbol, _> = TryFromVal::try_from_val(&env, &t.get(0).unwrap());
+                sym.map(|s| s == symbol_short!("rev_rep")).unwrap_or(false)
+            })
+            .collect();
+
+        assert_eq!(rev.len(), 1);
+        let (_, topics, data) = rev[0].clone();
+        assert_topic_u32(&env, &topics, 1, id);
+        let (got_payer, got_token, got_amt, got_ccy): (Address, Address, i128, String) =
+            TryFromVal::try_from_val(&env, &data).unwrap();
+        assert_eq!(got_payer, payer);
+        assert_eq!(got_token, asset);
+        assert_eq!(got_amt, 10_000);
+        assert_eq!(got_ccy, s(&env, "USD"));
+    }
+
+    #[test]
+    fn collect_protocol_fee_emits_fee_pay_event() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let receiver = Address::generate(&env);
+
+        client.initialize(&admin);
+        let asset = create_and_mint_token(&env, &admin);
+        mint(&env, &asset, &admin, &payer, 10_000);
+        mock_allow(&env, &client, &contract_id, &admin, &asset);
+        let _ = env.events().all();
+
+        let _ = mock_collect_fee(&env, &client, &contract_id, &payer, &asset, &receiver, 10_000);
+
+        let events = env.events().all();
+        let fee: std::vec::Vec<_> = events
+            .iter()
+            .filter(|(a, t, _)| {
+                if *a != contract_id {
+                    return false;
+                }
+                if t.len() != 2 {
+                    return false;
+                }
+                let sym: Result<Symbol, _> = TryFromVal::try_from_val(&env, &t.get(0).unwrap());
+                sym.map(|s| s == symbol_short!("fee_pay")).unwrap_or(false)
+            })
+            .collect();
+
+        assert_eq!(fee.len(), 1);
+        let (_, topics, data) = fee[0].clone();
+        let asset_in_topic: Address = TryFromVal::try_from_val(&env, &topics.get(1).unwrap()).unwrap();
+        assert_eq!(asset_in_topic, asset);
+        let (got_from, got_to, got_amt, got_fee): (Address, Address, i128, i128) =
+            TryFromVal::try_from_val(&env, &data).unwrap();
+        assert_eq!(got_from, payer);
+        assert_eq!(got_to, receiver);
+        assert_eq!(got_amt, 10_000);
+        assert_eq!(got_fee, 300);
+    }
+
+    #[test]
+    fn allowlist_is_empty_by_default_after_init() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+        for _ in 0..5 {
+            assert!(!client.is_asset_allowed(&Address::generate(&env)));
+        }
+    }
+
+    #[test]
+    fn multiple_assets_allowed_then_removed() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let tokens: std::vec::Vec<Address> = (0..3).map(|_| Address::generate(&env)).collect();
+        for t in &tokens {
+            mock_allow(&env, &client, &contract_id, &admin, t);
+        }
+        for t in &tokens {
+            assert!(client.is_asset_allowed(t));
+        }
+
+        mock_deny(&env, &client, &contract_id, &admin, &tokens[1]);
+        assert!(client.is_asset_allowed(&tokens[0]));
+        assert!(!client.is_asset_allowed(&tokens[1]));
+        assert!(client.is_asset_allowed(&tokens[2]));
     }
 }
