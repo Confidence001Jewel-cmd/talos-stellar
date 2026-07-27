@@ -15,6 +15,7 @@ export const TERMINAL_JOB_STATUSES = [
   "rejected",
   "cancelled",
   "disputed",
+  "refunded",
 ];
 
 // Reusable type for a generic Drizzle postgres transaction
@@ -32,12 +33,13 @@ export type DbTx = PgTransaction<
 export async function ingestJobToLedger(jobId: string, tx?: any) {
   const dbOrTx = tx ?? db;
 
-  const job = await dbOrTx
+  const jobRows = await dbOrTx
     .select()
     .from(tlsCommerceJobs)
     .where(eq(tlsCommerceJobs.id, jobId))
-    .limit(1)
-    .then((r: any) => r[0] ?? null);
+    .limit(1);
+
+  const job = jobRows[0] ?? null;
 
   if (!job) {
     throw new Error(`Job ${jobId} not found`);
@@ -48,11 +50,22 @@ export async function ingestJobToLedger(jobId: string, tx?: any) {
     return null;
   }
 
-  // A job has a result if the result JSON is not null and not empty
-  const hasResult =
-    job.result != null &&
-    typeof job.result === "object" &&
-    Object.keys(job.result).length > 0;
+  // Extract signals while avoiding storing the whole payload/result
+  const payloadStr = job.payload ? JSON.stringify(job.payload) : "{}";
+  const resultStr = job.result ? JSON.stringify(job.result) : "{}";
+  
+  const payloadObj = typeof job.payload === "object" && job.payload !== null ? job.payload : {};
+  const resultObj = typeof job.result === "object" && job.result !== null ? job.result : {};
+
+  const hasResult = Object.keys(resultObj).length > 0;
+  
+  // Extract authoritative signals from the payload/result
+  // The exact keys depend on the service contract, but we look for common ones:
+  const rawDeadline = payloadObj.deadlineAt || payloadObj.deadline;
+  const deadlineAt = rawDeadline ? new Date(rawDeadline) : null;
+  
+  // E.g. { refundAmount: "50.00" } or { refund: { amount: "50.00" } }
+  const refundAmount = resultObj.refundAmount?.toString() || null;
 
   const [inserted] = await dbOrTx
     .insert(tlsReputationInputs)
@@ -63,6 +76,8 @@ export async function ingestJobToLedger(jobId: string, tx?: any) {
       status: job.status,
       jobCreatedAt: job.createdAt,
       jobUpdatedAt: job.updatedAt,
+      deadlineAt,
+      refundAmount,
       hasResult,
       txHash: job.txHash,
     })
@@ -71,6 +86,8 @@ export async function ingestJobToLedger(jobId: string, tx?: any) {
       set: {
         status: job.status,
         jobUpdatedAt: job.updatedAt,
+        deadlineAt,
+        refundAmount,
         hasResult,
         txHash: job.txHash,
         updatedAt: new Date(),
