@@ -113,24 +113,14 @@ pub fn emit_ttl_touched(env: &Env, class_name: &str, keys_touched: u32) {
 }
 
 /// Emit `ttl_warn` when entries are at risk.
-pub fn emit_ttl_warning(
-    env: &Env,
-    class_name: &str,
-    keys_below: u32,
-    max_age: u32,
-) {
+pub fn emit_ttl_warning(env: &Env, class_name: &str, keys_below: u32, max_age: u32) {
     let topics = (symbol_short!("ttl_warn"),);
     let name = soroban_sdk::String::from_str(env, class_name);
     env.events().publish(topics, (name, keys_below, max_age));
 }
 
 /// Emit `ttl_batch` after batch maintenance.
-pub fn emit_ttl_batch(
-    env: &Env,
-    total: u32,
-    touched: u32,
-    skipped: u32,
-) {
+pub fn emit_ttl_batch(env: &Env, total: u32, touched: u32, skipped: u32) {
     let topics = (symbol_short!("ttl_batch"),);
     env.events().publish(topics, (total, touched, skipped));
 }

@@ -102,25 +102,16 @@ fn emit_timelock_scheduled(
     proposer: Address,
 ) {
     let topics = (symbol_short!("tl_sch"), proposal_id);
-    env.events().publish(topics, (action.clone(), eta, proposer));
+    env.events()
+        .publish(topics, (action.clone(), eta, proposer));
 }
 
-fn emit_timelock_executed(
-    env: &Env,
-    proposal_id: u64,
-    action: &AdminAction,
-    executor: Address,
-) {
+fn emit_timelock_executed(env: &Env, proposal_id: u64, action: &AdminAction, executor: Address) {
     let topics = (symbol_short!("tl_exec"), proposal_id);
     env.events().publish(topics, (action.clone(), executor));
 }
 
-fn emit_timelock_cancelled(
-    env: &Env,
-    proposal_id: u64,
-    action: &AdminAction,
-    canceller: Address,
-) {
+fn emit_timelock_cancelled(env: &Env, proposal_id: u64, action: &AdminAction, canceller: Address) {
     let topics = (symbol_short!("tl_cnl"), proposal_id);
     env.events().publish(topics, (action.clone(), canceller));
 }
@@ -136,15 +127,10 @@ fn emit_timelock_config_changed(
         .publish(topics, (old_min_delay, new_min_delay, grace_period));
 }
 
-fn emit_name_fee_paid(
-    env: &Env,
-    talos_id: u32,
-    payer: &Address,
-    asset: &Address,
-    amount: i128,
-) {
+fn emit_name_fee_paid(env: &Env, talos_id: u32, payer: &Address, asset: &Address, amount: i128) {
     let topics = (symbol_short!("nm_fee"), talos_id);
-    env.events().publish(topics, (payer.clone(), asset.clone(), amount));
+    env.events()
+        .publish(topics, (payer.clone(), asset.clone(), amount));
 }
 
 const DEFAULT_GRACE_PERIOD: u64 = 604_800; // 7 days in seconds
@@ -298,12 +284,17 @@ impl TalosNameService {
             .persistent()
             .set(&DataKey::RegistryContract, &registry_id);
         e.storage().persistent().set(&DataKey::Admin, &admin);
-        e.storage().persistent().set(&DataKey::NameFeeAmount, &name_fee);
+        e.storage()
+            .persistent()
+            .set(&DataKey::NameFeeAmount, &name_fee);
     }
 
     /// Return the current name registration fee amount, or 0 if unconfigured.
     pub fn name_fee(e: Env) -> i128 {
-        e.storage().persistent().get(&DataKey::NameFeeAmount).unwrap_or(0)
+        e.storage()
+            .persistent()
+            .get(&DataKey::NameFeeAmount)
+            .unwrap_or(0)
     }
 
     /// Return the configured admin, if any.
@@ -316,9 +307,15 @@ impl TalosNameService {
         if new_fee < 0 {
             panic!("name_fee must be non-negative");
         }
-        let admin: Address = e.storage().persistent().get(&DataKey::Admin).expect("admin not set");
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("admin not set");
         admin.require_auth();
-        e.storage().persistent().set(&DataKey::NameFeeAmount, &new_fee);
+        e.storage()
+            .persistent()
+            .set(&DataKey::NameFeeAmount, &new_fee);
     }
 
     /// Register a name AND pay the registration fee with an allowlisted asset.
@@ -343,7 +340,11 @@ impl TalosNameService {
         // First run the plain name registration logic.
         Self::register_name(e.clone(), owner.clone(), talos_id, name.clone());
 
-        let fee: i128 = e.storage().persistent().get(&DataKey::NameFeeAmount).unwrap_or(0);
+        let fee: i128 = e
+            .storage()
+            .persistent()
+            .get(&DataKey::NameFeeAmount)
+            .unwrap_or(0);
         if fee <= 0 {
             return;
         }
@@ -353,7 +354,11 @@ impl TalosNameService {
             .persistent()
             .get(&DataKey::RegistryContract)
             .expect("Registry contract not initialized");
-        let admin: Address = e.storage().persistent().get(&DataKey::Admin).expect("admin not set");
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("admin not set");
 
         // Cross-contract call: verify asset is allowlisted in TalosRegistry.
         let allowed: bool = e.invoke_contract(
@@ -528,9 +533,7 @@ impl TalosNameService {
                 Self::set_registry_contract_internal(&e, new_registry_id.clone());
             }
             AdminAction::SetAdmin(new_admin) => {
-                e.storage()
-                    .persistent()
-                    .set(&DataKey::Admin, new_admin);
+                e.storage().persistent().set(&DataKey::Admin, new_admin);
             }
         }
 
@@ -654,13 +657,23 @@ impl TalosNameService {
             e.storage().persistent().set(&DataKey::Admin, &addr);
             touched += 1;
         }
-        if let Some(reg) = e.storage().persistent().get::<_, Address>(&DataKey::RegistryContract) {
-            e.storage().persistent().set(&DataKey::RegistryContract, &reg);
+        if let Some(reg) = e
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::RegistryContract)
+        {
+            e.storage()
+                .persistent()
+                .set(&DataKey::RegistryContract, &reg);
             touched += 1;
         }
 
         for tid in 1..=max_talos_id {
-            if let Some(name) = e.storage().persistent().get::<_, String>(&DataKey::TalosName(tid)) {
+            if let Some(name) = e
+                .storage()
+                .persistent()
+                .get::<_, String>(&DataKey::TalosName(tid))
+            {
                 let last_touched: u32 = e
                     .storage()
                     .persistent()
@@ -671,7 +684,9 @@ impl TalosNameService {
                     if let Some(rec_id) = e.storage().persistent().get::<_, u32>(&name_key) {
                         e.storage().persistent().set(&name_key, &rec_id);
                     }
-                    e.storage().persistent().set(&DataKey::TalosName(tid), &name);
+                    e.storage()
+                        .persistent()
+                        .set(&DataKey::TalosName(tid), &name);
                     e.storage()
                         .persistent()
                         .set(&DataKey::LastTouched(tid), &current_ledger);
@@ -705,12 +720,23 @@ impl TalosNameService {
         }
 
         if health.needs_immediate_attention() {
-            ttl_manager::emit_ttl_warning(&e, "name_record", health.keys_below_crit, health.max_age);
+            ttl_manager::emit_ttl_warning(
+                &e,
+                "name_record",
+                health.keys_below_crit,
+                health.max_age,
+            );
         }
         if health.is_empty() {
             (0, 0, 0, 0, 0)
         } else {
-            (health.min_age, health.max_age, health.keys_below_warn, health.keys_below_crit, health.total_keys)
+            (
+                health.min_age,
+                health.max_age,
+                health.keys_below_warn,
+                health.keys_below_crit,
+                health.total_keys,
+            )
         }
     }
 }
@@ -767,7 +793,10 @@ mod property_tests {
             !chars.is_empty() && chars[0] != b'-' && chars[chars.len() - 1] != b'-'
         })
         .prop_filter("must not contain consecutive hyphens", |chars| {
-            chars.iter().zip(chars.iter().skip(1)).all(|(a, b)| !(a == &b'-' && b == &b'-'))
+            chars
+                .iter()
+                .zip(chars.iter().skip(1))
+                .all(|(a, b)| !(a == &b'-' && b == &b'-'))
         })
         .prop_map(|chars| StdString::from_utf8(chars).unwrap())
     }
@@ -836,61 +865,84 @@ mod property_tests {
         let (env, registry_contract, contract_id, _admin, registry_client, client) = setup();
         let owner = Address::generate(&env);
         let protocol_wallet = Address::generate(&env);
-        let talos_id = create_talos_with_auth(&env, &registry_client, &registry_contract, &owner, &protocol_wallet);
+        let talos_id = create_talos_with_auth(
+            &env,
+            &registry_client,
+            &registry_contract,
+            &owner,
+            &protocol_wallet,
+        );
 
         let mut runner = TestRunner::new(ProptestConfig::with_cases(8));
         let strategy = prop::collection::vec(valid_name_strategy(), 1..=3);
-        runner.run(&strategy, |names| {
-            let mut model = std::collections::BTreeMap::<StdString, u32>::new();
-            let mut talos_to_name = std::collections::BTreeMap::<u32, StdString>::new();
+        runner
+            .run(&strategy, |names| {
+                let mut model = std::collections::BTreeMap::<StdString, u32>::new();
+                let mut talos_to_name = std::collections::BTreeMap::<u32, StdString>::new();
 
-            for name in names.iter() {
-                let soroban_name = soroban_string(&env, name.as_str());
+                for name in names.iter() {
+                    let soroban_name = soroban_string(&env, name.as_str());
 
-                let result = client
-                    .mock_auths(&[MockAuth {
-                        address: &owner,
-                        invoke: &MockAuthInvoke {
-                            contract: &contract_id,
-                            fn_name: "register_name",
-                            args: (owner.clone(), talos_id, soroban_name.clone()).into_val(&env),
-                            sub_invokes: &[MockAuthInvoke {
-                                contract: &registry_contract,
-                                fn_name: "creator_of",
-                                args: (talos_id,).into_val(&env),
-                                sub_invokes: &[],
-                            }],
-                        },
-                    }])
-                    .try_register_name(&owner, &talos_id, &soroban_name);
+                    let result = client
+                        .mock_auths(&[MockAuth {
+                            address: &owner,
+                            invoke: &MockAuthInvoke {
+                                contract: &contract_id,
+                                fn_name: "register_name",
+                                args: (owner.clone(), talos_id, soroban_name.clone())
+                                    .into_val(&env),
+                                sub_invokes: &[MockAuthInvoke {
+                                    contract: &registry_contract,
+                                    fn_name: "creator_of",
+                                    args: (talos_id,).into_val(&env),
+                                    sub_invokes: &[],
+                                }],
+                            },
+                        }])
+                        .try_register_name(&owner, &talos_id, &soroban_name);
 
-                let expected_success = !model.contains_key(name) && !name.contains("--") && !name.starts_with('-') && !name.ends_with('-');
-                assert_eq!(result.is_ok(), expected_success, "name={name:?}, talos_id={talos_id}");
+                    let expected_success = !model.contains_key(name)
+                        && !name.contains("--")
+                        && !name.starts_with('-')
+                        && !name.ends_with('-');
+                    assert_eq!(
+                        result.is_ok(),
+                        expected_success,
+                        "name={name:?}, talos_id={talos_id}"
+                    );
 
-                if result.is_ok() {
-                    if let Some(old_name) = talos_to_name.remove(&talos_id) {
-                        model.remove(&old_name);
+                    if result.is_ok() {
+                        if let Some(old_name) = talos_to_name.remove(&talos_id) {
+                            model.remove(&old_name);
+                        }
+                        model.insert(name.clone(), talos_id);
+                        talos_to_name.insert(talos_id, name.clone());
                     }
-                    model.insert(name.clone(), talos_id);
-                    talos_to_name.insert(talos_id, name.clone());
+
+                    let resolved = client.resolve_name(&soroban_name);
+                    let expected_resolved = model.get(name).copied();
+                    assert_eq!(
+                        resolved, expected_resolved,
+                        "name={name:?}, talos_id={talos_id}"
+                    );
+                    assert_eq!(
+                        client.is_name_available(&soroban_name),
+                        expected_resolved.is_none()
+                    );
+
+                    let expected_name_for_talos = talos_to_name.get(&talos_id).cloned();
+                    let actual_name_for_talos = client.name_of(&talos_id);
+                    assert_eq!(
+                        actual_name_for_talos,
+                        expected_name_for_talos
+                            .as_ref()
+                            .map(|value| soroban_string(&env, value.as_str()))
+                    );
                 }
 
-                let resolved = client.resolve_name(&soroban_name);
-                let expected_resolved = model.get(name).copied();
-                assert_eq!(resolved, expected_resolved, "name={name:?}, talos_id={talos_id}");
-                assert_eq!(client.is_name_available(&soroban_name), expected_resolved.is_none());
-
-                let expected_name_for_talos = talos_to_name.get(&talos_id).cloned();
-                let actual_name_for_talos = client.name_of(&talos_id);
-                assert_eq!(
-                    actual_name_for_talos,
-                    expected_name_for_talos.as_ref().map(|value| soroban_string(&env, value.as_str()))
-                );
-            }
-
-            Ok(())
-        })
-        .unwrap();
+                Ok(())
+            })
+            .unwrap();
     }
 }
 
@@ -1228,7 +1280,9 @@ mod tests {
     #[test]
     fn initialize_guard_rejects_reinitialization() {
         let (_env, registry_contract, _contract_id, admin, _registry_client, client) = setup();
-        assert!(client.try_initialize(&registry_contract, &admin, &0i128).is_err());
+        assert!(client
+            .try_initialize(&registry_contract, &admin, &0i128)
+            .is_err());
     }
 
     #[test]
@@ -1334,10 +1388,7 @@ mod tests {
                 }])
                 .try_register_name(&owner, &1, &invalid_name);
 
-            assert!(
-                result.is_err(),
-                "expected invalid name to be rejected"
-            );
+            assert!(result.is_err(), "expected invalid name to be rejected");
         }
     }
 
@@ -1450,9 +1501,21 @@ mod tests {
 
     #[test]
     fn name_service_timelock_schedule_execute_registry_update() {
-        let (env, _registry_contract, contract_id, _admin, _registry_client, client) = setup();
+        let (env, _registry_contract, contract_id, existing_admin, _registry_client, client) =
+            setup();
         let admin = Address::generate(&env);
-        client.set_admin(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &existing_admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_admin",
+                    args: (admin.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_admin(&admin);
 
         client
             .mock_auths(&[MockAuth {
@@ -1499,9 +1562,21 @@ mod tests {
 
     #[test]
     fn name_service_timelock_direct_call_guarded() {
-        let (env, _registry_contract, contract_id, _admin, _registry_client, client) = setup();
+        let (env, _registry_contract, contract_id, existing_admin, _registry_client, client) =
+            setup();
         let admin = Address::generate(&env);
-        client.set_admin(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &existing_admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_admin",
+                    args: (admin.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_admin(&admin);
 
         client
             .mock_auths(&[MockAuth {
@@ -1533,9 +1608,21 @@ mod tests {
 
     #[test]
     fn name_service_timelock_cancellation() {
-        let (env, _registry_contract, contract_id, _admin, _registry_client, client) = setup();
+        let (env, _registry_contract, contract_id, existing_admin, _registry_client, client) =
+            setup();
         let admin = Address::generate(&env);
-        client.set_admin(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &existing_admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_admin",
+                    args: (admin.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_admin(&admin);
 
         let new_registry = Address::generate(&env);
         let action = AdminAction::SetRegistryContract(new_registry);
@@ -1616,14 +1703,28 @@ mod tests {
         let name = s(&env, "marketbot");
 
         let talos_id = create_talos_with_auth(
-            &env, &registry_client, &registry_contract, &owner, &protocol_wallet,
+            &env,
+            &registry_client,
+            &registry_contract,
+            &owner,
+            &protocol_wallet,
         );
         let second_talos_id = create_talos_with_auth(
-            &env, &registry_client, &registry_contract, &second_owner, &protocol_wallet,
+            &env,
+            &registry_client,
+            &registry_contract,
+            &second_owner,
+            &protocol_wallet,
         );
 
         register_name_with_auth(
-            &env, &client, &contract_id, &registry_contract, &owner, talos_id, &name,
+            &env,
+            &client,
+            &contract_id,
+            &registry_contract,
+            &owner,
+            talos_id,
+            &name,
         );
 
         let before = snapshot(&client, &name, talos_id);
@@ -1663,7 +1764,11 @@ mod tests {
         let name = s(&env, "marketbot");
 
         let talos_id = create_talos_with_auth(
-            &env, &registry_client, &registry_contract, &creator, &protocol_wallet,
+            &env,
+            &registry_client,
+            &registry_contract,
+            &creator,
+            &protocol_wallet,
         );
 
         let before = snapshot(&client, &name, talos_id);
@@ -1704,7 +1809,11 @@ mod tests {
         let invalid_name = s(&env, "Bad--Name-");
 
         let talos_id = create_talos_with_auth(
-            &env, &registry_client, &registry_contract, &owner, &protocol_wallet,
+            &env,
+            &registry_client,
+            &registry_contract,
+            &owner,
+            &protocol_wallet,
         );
 
         let before = snapshot(&client, &invalid_name, talos_id);
@@ -1813,19 +1922,39 @@ mod tests {
         let name2 = s(&env, "second-name");
 
         let talos_a = create_talos_with_auth(
-            &env, &registry_client, &registry_contract, &owner_a, &protocol_wallet,
+            &env,
+            &registry_client,
+            &registry_contract,
+            &owner_a,
+            &protocol_wallet,
         );
         let talos_b = create_talos_with_auth(
-            &env, &registry_client, &registry_contract, &owner_b, &protocol_wallet,
+            &env,
+            &registry_client,
+            &registry_contract,
+            &owner_b,
+            &protocol_wallet,
         );
 
         register_name_with_auth(
-            &env, &client, &contract_id, &registry_contract, &owner_a, talos_a, &name1,
+            &env,
+            &client,
+            &contract_id,
+            &registry_contract,
+            &owner_a,
+            talos_a,
+            &name1,
         );
         assert_eq!(client.resolve_name(&name1), Some(talos_a));
 
         register_name_with_auth(
-            &env, &client, &contract_id, &registry_contract, &owner_a, talos_a, &name2,
+            &env,
+            &client,
+            &contract_id,
+            &registry_contract,
+            &owner_a,
+            talos_a,
+            &name2,
         );
         assert_eq!(client.resolve_name(&name1), None);
         assert!(client.is_name_available(&name1));
@@ -1833,7 +1962,13 @@ mod tests {
         assert_eq!(client.name_of(&talos_a), Some(name2.clone()));
 
         register_name_with_auth(
-            &env, &client, &contract_id, &registry_contract, &owner_b, talos_b, &name1,
+            &env,
+            &client,
+            &contract_id,
+            &registry_contract,
+            &owner_b,
+            talos_b,
+            &name1,
         );
 
         assert_eq!(client.resolve_name(&name1), Some(talos_b));
@@ -1849,7 +1984,11 @@ mod tests {
         let owner = Address::generate(&env);
         let protocol_wallet = Address::generate(&env);
         let talos_id = create_talos_with_auth(
-            &env, &registry_client, &registry_contract, &owner, &protocol_wallet,
+            &env,
+            &registry_client,
+            &registry_contract,
+            &owner,
+            &protocol_wallet,
         );
 
         let names: [&str; 4] = ["alpha-one", "beta-two", "gamma-three", "delta-four"];
@@ -1858,15 +1997,28 @@ mod tests {
         for raw in names {
             let name = s(&env, raw);
             register_name_with_auth(
-                &env, &client, &contract_id, &registry_contract, &owner, talos_id, &name,
+                &env,
+                &client,
+                &contract_id,
+                &registry_contract,
+                &owner,
+                talos_id,
+                &name,
             );
 
             assert_eq!(client.resolve_name(&name), Some(talos_id));
             assert_eq!(client.name_of(&talos_id), Some(name.clone()));
 
             if let Some(old) = previous {
-                assert_eq!(client.resolve_name(&old), None, "old name must be freed: {raw}");
-                assert!(client.is_name_available(&old), "old name must be available: {raw}");
+                assert_eq!(
+                    client.resolve_name(&old),
+                    None,
+                    "old name must be freed: {raw}"
+                );
+                assert!(
+                    client.is_name_available(&old),
+                    "old name must be available: {raw}"
+                );
             }
             previous = Some(name);
         }

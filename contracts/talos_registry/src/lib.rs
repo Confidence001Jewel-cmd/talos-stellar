@@ -175,25 +175,16 @@ fn emit_timelock_scheduled(
     proposer: Address,
 ) {
     let topics = (symbol_short!("tl_sch"), proposal_id);
-    env.events().publish(topics, (action.clone(), eta, proposer));
+    env.events()
+        .publish(topics, (action.clone(), eta, proposer));
 }
 
-fn emit_timelock_executed(
-    env: &Env,
-    proposal_id: u64,
-    action: &AdminAction,
-    executor: Address,
-) {
+fn emit_timelock_executed(env: &Env, proposal_id: u64, action: &AdminAction, executor: Address) {
     let topics = (symbol_short!("tl_exec"), proposal_id);
     env.events().publish(topics, (action.clone(), executor));
 }
 
-fn emit_timelock_cancelled(
-    env: &Env,
-    proposal_id: u64,
-    action: &AdminAction,
-    canceller: Address,
-) {
+fn emit_timelock_cancelled(env: &Env, proposal_id: u64, action: &AdminAction, canceller: Address) {
     let topics = (symbol_short!("tl_cnl"), proposal_id);
     env.events().publish(topics, (action.clone(), canceller));
 }
@@ -987,7 +978,13 @@ impl TalosRegistry {
         if health.is_empty() {
             (0, 0, 0, 0, 0)
         } else {
-            (health.min_age, health.max_age, health.keys_below_warn, health.keys_below_crit, health.total_keys)
+            (
+                health.min_age,
+                health.max_age,
+                health.keys_below_warn,
+                health.keys_below_crit,
+                health.total_keys,
+            )
         }
     }
 }
@@ -1894,8 +1891,7 @@ mod tests {
                 if t.len() == 0 {
                     return false;
                 }
-                let sym: Result<Symbol, _> =
-                    TryFromVal::try_from_val(&env, &t.get(0).unwrap());
+                let sym: Result<Symbol, _> = TryFromVal::try_from_val(&env, &t.get(0).unwrap());
                 sym.map(|s| s == symbol_short!("adm_acc")).unwrap_or(false)
             })
             .collect();
@@ -1927,8 +1923,7 @@ mod tests {
                 if t.len() == 0 {
                     return false;
                 }
-                let sym: Result<Symbol, _> =
-                    TryFromVal::try_from_val(&env, &t.get(0).unwrap());
+                let sym: Result<Symbol, _> = TryFromVal::try_from_val(&env, &t.get(0).unwrap());
                 sym.map(|s| s == symbol_short!("adm_cnl")).unwrap_or(false)
             })
             .collect();
