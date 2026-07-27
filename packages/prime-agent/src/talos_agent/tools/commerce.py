@@ -139,7 +139,6 @@ async def purchase_service(talos_id: str, service_type: str = "", payload: str =
         asset_issuer=USDC_TESTNET_ISSUER,
     )
 
-
     if "error" in sign_result:
         return sign_result
 
