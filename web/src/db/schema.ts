@@ -161,6 +161,34 @@ export const tlsActivities = pgTable(
   ],
 );
 
+/*
+export const tlsReputationInputs = pgTable(
+  "tls_reputation_inputs",
+  {
+    id: text("id").primaryKey().$defaultFn(() => createId()),
+    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "cascade" }),
+    jobId: text("jobId").notNull().unique(), // Unique to ensure idempotency per job
+    requesterTalosId: text("requesterTalosId").notNull(),
+    status: text("status").notNull(),
+    
+    // Explicit boundary signals
+    jobCreatedAt: timestamp("jobCreatedAt", { mode: "date", precision: 3 }).notNull(),
+    jobUpdatedAt: timestamp("jobUpdatedAt", { mode: "date", precision: 3 }),
+    deadlineAt: timestamp("deadlineAt", { mode: "date", precision: 3 }),
+    refundAmount: numeric("refundAmount", { precision: 18, scale: 6 }),
+    hasResult: boolean("hasResult").notNull().default(false),
+    txHash: text("txHash"), // Cryptographically linked outcome (if any)
+
+    createdAt: timestamp("createdAt", { mode: "date", precision: 3 }).notNull().defaultNow(),
+    updatedAt: timestamp("updatedAt", { mode: "date", precision: 3 }).notNull().$onUpdate(() => new Date()),
+  },
+  (t) => [
+    index("tls_reputation_inputs_talosId_jobCreatedAt_idx").on(t.talosId, t.jobCreatedAt),
+    index("tls_reputation_inputs_talosId_requester_idx").on(t.talosId, t.requesterTalosId),
+  ],
+);
+*/
+
 // ─── Approval Request ─────────────────────────────────────────────
 
 export const tlsApprovals = pgTable(
@@ -490,6 +518,7 @@ export const tlsApiAuditLogs = pgTable(
   ],
 );
 
+
 // ─── Lifecycle Event Log ──────────────────────────────────────────
 //
 // Append-only, canonical record of every governed lifecycle transition.
@@ -604,5 +633,33 @@ export const tlsProvisioningJobs = pgTable(
     uniqueIndex("tls_provisioning_jobs_talosId_idempotencyKey_unique").on(t.talosId, t.idempotencyKey),
     index("tls_provisioning_jobs_status_idx").on(t.status, t.leaseExpiresAt),
     index("tls_provisioning_jobs_talosId_createdAt_idx").on(t.talosId, t.createdAt),
+  ],
+);
+
+// ─── Reputation Input Ledger ──────────────────────────────────────
+
+export const tlsReputationInputs = pgTable(
+  "tls_reputation_inputs",
+  {
+    id: text("id").primaryKey().$defaultFn(() => createId()),
+    talosId: text("talosId").notNull().references(() => tlsTalos.id, { onDelete: "cascade" }),
+    jobId: text("jobId").notNull().unique(), // Unique to ensure idempotency per job
+    requesterTalosId: text("requesterTalosId").notNull(),
+    status: text("status").notNull(),
+    
+    // Explicit boundary signals
+    jobCreatedAt: timestamp("jobCreatedAt", { mode: "date", precision: 3 }).notNull(),
+    jobUpdatedAt: timestamp("jobUpdatedAt", { mode: "date", precision: 3 }),
+    deadlineAt: timestamp("deadlineAt", { mode: "date", precision: 3 }),
+    refundAmount: numeric("refundAmount", { precision: 18, scale: 6 }),
+    hasResult: boolean("hasResult").notNull().default(false),
+    txHash: text("txHash"), // Cryptographically linked outcome (if any)
+
+    createdAt: timestamp("createdAt", { mode: "date", precision: 3 }).notNull().defaultNow(),
+    updatedAt: timestamp("updatedAt", { mode: "date", precision: 3 }).notNull().$onUpdate(() => new Date()),
+  },
+  (t) => [
+    index("tls_reputation_inputs_talosId_jobCreatedAt_idx").on(t.talosId, t.jobCreatedAt),
+    index("tls_reputation_inputs_talosId_requester_idx").on(t.talosId, t.requesterTalosId),
   ],
 );

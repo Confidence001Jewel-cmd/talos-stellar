@@ -4,6 +4,7 @@ import { withTransactionRetry } from "@/db/db-retry";
 import { tlsTalos, tlsCommerceJobs, tlsRevenues, tlsCommerceServices } from "@/db/schema";
 import { eq, and } from "drizzle-orm";
 import { logger } from "@/lib/logger";
+import { ingestJobToLedger } from "@/lib/reputation-ledger";
 
 async function resolveCallerTalos(request: NextRequest): Promise<string | null> {
   const authHeader = request.headers.get("authorization");
@@ -120,6 +121,9 @@ export async function POST(
           source: "commerce",
           txHash: job.txHash,
         });
+
+        // Record terminal status to the reputation input ledger idempotently
+        await ingestJobToLedger(job.id, tx);
 
         return updatedJob;
       },
