@@ -23,15 +23,15 @@ describe("reputation-ledger", () => {
 
   describe("ingestJobToLedger", () => {
     it("throws if job not found", async () => {
-      vi.mocked(db.limit).mockResolvedValueOnce([]);
+      vi.mocked((db as any).limit).mockResolvedValueOnce([]);
       await expect(ingestJobToLedger("missing")).rejects.toThrow("Job missing not found");
     });
 
     it("returns null for non-terminal jobs (e.g. pending)", async () => {
-      vi.mocked(db.limit).mockResolvedValueOnce([{ id: "job1", status: "pending" }] as any);
+      vi.mocked((db as any).limit).mockResolvedValueOnce([{ id: "job1", status: "pending" }] as any);
       const res = await ingestJobToLedger("job1");
       expect(res).toBeNull();
-      expect(db.insert).not.toHaveBeenCalled();
+      expect((db as any).insert).not.toHaveBeenCalled();
     });
 
     it("ingests a terminal job idempotently with basic signals", async () => {
@@ -47,13 +47,13 @@ describe("reputation-ledger", () => {
       };
 
       const mockInserted = { ...mockJob, hasResult: true, deadlineAt: null, refundAmount: null };
-      vi.mocked(db.limit).mockResolvedValueOnce([mockJob]);
-      vi.mocked(db.returning).mockResolvedValueOnce([mockInserted] as any);
+      vi.mocked((db as any).limit).mockResolvedValueOnce([mockJob]);
+      vi.mocked((db as any).returning).mockResolvedValueOnce([mockInserted] as any);
 
       const res = await ingestJobToLedger("job2");
       expect(res).toEqual(mockInserted);
-      expect(db.insert).toHaveBeenCalled();
-      expect(db.onConflictDoUpdate).toHaveBeenCalled();
+      expect((db as any).insert).toHaveBeenCalled();
+      expect((db as any).onConflictDoUpdate).toHaveBeenCalled();
     });
 
     it("extracts and persists deadlines and refunds correctly", async () => {
@@ -76,13 +76,13 @@ describe("reputation-ledger", () => {
         refundAmount: "50.00" 
       };
       
-      vi.mocked(db.limit).mockResolvedValueOnce([mockJob]);
-      vi.mocked(db.values).mockImplementationOnce((vals: any) => {
+      vi.mocked((db as any).limit).mockResolvedValueOnce([mockJob]);
+      vi.mocked((db as any).values).mockImplementationOnce((vals: any) => {
         expect(vals.deadlineAt).toEqual(new Date("2024-01-01T00:00:00.000Z"));
         expect(vals.refundAmount).toEqual("50.00");
         return { onConflictDoUpdate: vi.fn().mockReturnThis(), returning: vi.fn().mockResolvedValueOnce([mockInserted]) } as any;
       });
-      vi.mocked(db.returning).mockResolvedValueOnce([mockInserted] as any);
+      vi.mocked((db as any).returning).mockResolvedValueOnce([mockInserted] as any);
 
       const res = await ingestJobToLedger("job3");
       expect(res).toEqual(mockInserted);
@@ -107,14 +107,14 @@ describe("reputation-ledger", () => {
         deadlineAt: null, 
         refundAmount: null 
       };
-            vi.mocked(db.limit).mockResolvedValueOnce([mockJob] as any);
-      vi.mocked(db.values).mockImplementationOnce((vals: any) => {
+      vi.mocked((db as any).limit).mockResolvedValueOnce([mockJob] as any);
+      vi.mocked((db as any).values).mockImplementationOnce((vals: any) => {
         expect(vals).not.toHaveProperty("payload");
         expect(vals).not.toHaveProperty("result");
         expect(vals.requesterTalosId).toBe("buyer1");
         return { onConflictDoUpdate: vi.fn().mockReturnThis(), returning: vi.fn().mockResolvedValueOnce([mockInserted]) } as any;
       });
-      vi.mocked(db.returning).mockResolvedValueOnce([mockInserted] as any);
+      vi.mocked((db as any).returning).mockResolvedValueOnce([mockInserted] as any);
 
       await ingestJobToLedger("job4");
     });

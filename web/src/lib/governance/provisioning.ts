@@ -508,7 +508,6 @@ async function compensate(
   for (let i = failedIndex; i >= 0; i--) {
     const record = steps[i];
     if (record.status !== "completed" && record.status !== "failed") continue;
-    if (record.status === "compensated") continue;
 
     try {
       await withTimeout(
