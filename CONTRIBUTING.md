@@ -113,6 +113,7 @@ If you deploy new contracts, update the contract IDs in `web/.env.local` with th
 - `X_USERNAME`, `X_PASSWORD`, and `X_EMAIL`
 - `BROWSER_HEADLESS`
 - agent timing and approval settings such as `AGENT_CYCLE_INTERVAL`, `POLLING_INTERVAL`, and `APPROVAL_THRESHOLD`
+- opt-in durable job inbox/outbox settings under `TALOS_DURABLE_JOB_EFFECTS_*` and `TALOS_JOB_EFFECT_*`
 
 ### Contracts env
 
@@ -186,6 +187,9 @@ cargo test --target wasm32-unknown-unknown
 - Do not commit secrets, keys, or generated `.env` files
 - For TypeScript and React, run `pnpm lint` and the relevant `pnpm test:*` command before opening a PR
 - For Python, prefer explicit types and validate changes with `uv run pytest`
+- For provider job-effect changes, also run
+  `uv run pytest tests/test_durable_job_effects.py` and follow the
+  [durable job effects runbook](./docs/prime-agent-durable-job-effects.md).
 - For Rust, keep formatting standard with `cargo fmt` and validate with `cargo test`
 
 ## Database Transaction Retry & Serialization Hardening

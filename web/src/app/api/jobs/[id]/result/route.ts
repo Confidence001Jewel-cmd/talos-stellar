@@ -99,6 +99,7 @@ export async function POST(
             and(
               eq(tlsCommerceJobs.id, id),
               eq(tlsCommerceJobs.fencingToken, effectiveFencingToken),
+              eq(tlsCommerceJobs.status, "pending"),
             ),
           )
           .returning();

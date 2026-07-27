@@ -172,6 +172,115 @@ def encrypt_keys(env_file: str):
     console.print(f"[green]Encrypted {changed} values. Original saved to {backup}[/green]")
 
 
+@main.group()
+def jobs():
+    """Inspect and safely requeue durable job effects."""
+
+
+def _job_store(db_path: str | None, talos_id: str):
+    from pathlib import Path
+
+    from talos_agent.db import LocalDB
+    from talos_agent.job_effects import JobEffectLimits, JobEffectStore
+
+    settings = Settings()
+    limits = JobEffectLimits(
+        max_inbox_records=settings.talos_job_effect_max_inbox_records,
+        max_outbox_records=settings.talos_job_effect_max_outbox_records,
+        max_payload_bytes=settings.talos_job_effect_max_payload_bytes,
+        max_result_bytes=settings.talos_job_effect_max_result_bytes,
+        batch_size=settings.talos_job_effect_batch_size,
+        lease_seconds=settings.talos_job_effect_lease_seconds,
+        max_attempts=settings.talos_job_effect_max_attempts,
+        retry_base_seconds=settings.talos_job_effect_retry_base_seconds,
+        dispatch_timeout_seconds=settings.talos_job_effect_dispatch_timeout_seconds,
+        remote_lease_ttl_seconds=settings.job_lease_ttl,
+        busy_timeout_ms=settings.talos_job_effect_db_timeout_ms,
+    )
+    db = LocalDB(path=Path(db_path)) if db_path else LocalDB()
+    return db, JobEffectStore(db, owner_talos_id=talos_id, limits=limits)
+
+
+@jobs.command(name="inspect")
+@click.option("--talos-id", required=True, help="Talos scope whose effects may be inspected")
+@click.option("--db-path", default=None, type=click.Path(dir_okay=False))
+@click.option(
+    "--status",
+    default=None,
+    type=click.Choice(
+        [
+            "pending",
+            "dispatching",
+            "succeeded",
+            "retryable",
+            "indeterminate",
+            "conflict",
+            "dead",
+        ],
+        case_sensitive=True,
+    ),
+)
+@click.option("--limit", default=50, type=click.IntRange(1, 200))
+@click.option("--json", "as_json", is_flag=True, help="Emit metadata as JSON")
+def inspect_jobs(
+    talos_id: str,
+    db_path: str | None,
+    status: str | None,
+    limit: int,
+    as_json: bool,
+):
+    """List replay metadata without printing payloads or results."""
+    from talos_agent.job_effects import JobEffectError
+
+    db = None
+    try:
+        db, store = _job_store(db_path, talos_id)
+        rows = store.inspect(status=status, limit=limit)
+        if as_json:
+            console.print_json(json.dumps({"effects": rows, "count": len(rows)}))
+            return
+        if not rows:
+            console.print("[dim]No matching durable job effects.[/dim]")
+            return
+        for row in rows:
+            console.print(
+                f"{row['effect_id']} job={row['job_id']} state={row['state']} "
+                f"attempts={row['attempt_count']} "
+                f"error={row['last_error_code'] or '-'}"
+            )
+    except JobEffectError as exc:
+        raise click.ClickException(f"{exc.code}: {exc}") from exc
+    finally:
+        if db is not None:
+            db.close()
+
+
+@jobs.command(name="retry")
+@click.argument("effect_id")
+@click.option("--talos-id", required=True, help="Talos scope that owns the effect")
+@click.option("--db-path", default=None, type=click.Path(dir_okay=False))
+@click.option("--expected-attempt", required=True, type=click.IntRange(min=0))
+def retry_job_effect(
+    effect_id: str,
+    talos_id: str,
+    db_path: str | None,
+    expected_attempt: int,
+):
+    """Requeue one failed effect with a stale-decision guard."""
+    from talos_agent.job_effects import JobEffectError
+
+    db = None
+    try:
+        db, store = _job_store(db_path, talos_id)
+        result = store.requeue(effect_id, expected_attempt=expected_attempt)
+        console.print_json(json.dumps(result))
+    except JobEffectError as exc:
+        raise click.ClickException(f"{exc.code}: {exc}") from exc
+    finally:
+        if db is not None:
+            db.close()
+
+
 @main.command()
 def status():
     """Show agent status."""

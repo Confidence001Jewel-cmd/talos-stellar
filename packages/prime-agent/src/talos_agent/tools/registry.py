@@ -281,6 +281,8 @@ def build_all_tools(
     _commerce_mod._api = api
     _commerce_mod._db = db
     _commerce_mod._settings = settings
+    _commerce_mod._job_effect_store = job_effect_store
+    _commerce_mod._job_effect_dispatcher = job_effect_dispatcher
     _stellar_mod._settings = settings
     _stellar_mod._api = api
     _learning_mod._db = db
