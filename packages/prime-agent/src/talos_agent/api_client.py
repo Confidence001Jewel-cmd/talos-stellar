@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
+from talos_agent import metrics
 from talos_agent.config import Settings
-from talos_agent.http import request_with_retry
+from talos_agent.http import RetryableHTTPError, request_with_retry
+from talos_agent.tracing import inject_trace_headers, traced_span
+from opentelemetry.trace import SpanKind
 
 
 class TalosAPIClient:
@@ -29,7 +34,55 @@ class TalosAPIClient:
         headers.update(supplied or {})
         return headers
 
-    # ── Retry-wrapped HTTP verbs ──────────────────────────
+    # ── Retry-wrapped, traced HTTP verbs ──────────────────
+
+    async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        """Single choke point for all Web API calls: span + trace-header
+        injection + retry-count/status metrics, on top of the existing
+        request_with_retry backoff. Every public method below funnels
+        through this instead of calling httpx directly.
+        """
+        path = urlsplit(url).path or url
+        start = time.monotonic()
+        retry_count = 0
+
+        with traced_span(
+            f"web_api.{method} {path}",
+            {"http.request.method": method, "url.path": path},
+            kind=SpanKind.CLIENT,
+        ) as span:
+            # Inject only after the span above is current, so the
+            # traceparent we send actually points at *this* span.
+            headers = dict(kwargs.pop("headers", None) or {})
+            inject_trace_headers(headers)
+            kwargs["headers"] = headers
+
+            send = getattr(self._client, method.lower())
+            response: httpx.Response | None = None
+            status_code = 0
+            try:
+
+                async def _do_send() -> httpx.Response:
+                    nonlocal retry_count
+                    if retry_count > 0:
+                        span.add_event("http.retry", {"http.retry.count": retry_count})
+                    retry_count += 1
+                    return await send(url, **kwargs)
+
+                response = await request_with_retry(_do_send)
+                status_code = response.status_code
+                span.set_attribute("http.response.status_code", status_code)
+                span.set_attribute("http.retry.count", max(0, retry_count - 1))
+                return response
+            except RetryableHTTPError as exc:
+                status_code = exc.status_code
+                span.set_attribute("http.response.status_code", status_code)
+                span.set_attribute("http.retry.count", max(0, retry_count - 1))
+                raise
+            finally:
+                metrics.record_http_call(
+                    status_code, max(0, retry_count - 1), time.monotonic() - start
+                )
 
     async def _get(self, url: str, **kwargs: Any) -> httpx.Response:
         return await request_with_retry(lambda: self._client.get(url, **kwargs), provider="talos_web_api")

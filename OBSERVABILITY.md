@@ -55,6 +55,38 @@ Every web API response includes an `X-Request-Id` header (UUID). When the agent 
 
 To cross-reference: filter both log streams by the same ID.
 
+## Distributed Tracing (OpenTelemetry)
+
+End-to-end tracing across scheduler → LLM → tool → Web API → Stellar/Horizon
+→ fulfillment. Full design in **[docs/TRACING.md](docs/TRACING.md)** —
+span taxonomy, sampling, redaction policy, exporter config, and known
+limitations. Summary:
+
+- **Disabled by default.** No behavior or performance change unless you
+  opt in.
+- **Agent**: set `OTEL_ENABLED=true` in `packages/prime-agent/.env`, plus
+  either `OTEL_TRACES_EXPORTER=console` (prints spans to stdout, no
+  infrastructure needed) or `OTEL_EXPORTER_OTLP_ENDPOINT=...` for a real
+  collector.
+- **Web**: rides on Sentry's already-registered OpenTelemetry provider — no
+  separate setup. Spans only export somewhere when `SENTRY_DSN` /
+  `NEXT_PUBLIC_SENTRY_DSN` is configured, matching the existing web
+  observability posture.
+- **Local verification** (agent):
+  ```bash
+  cd packages/prime-agent
+  OTEL_ENABLED=true OTEL_TRACES_EXPORTER=console talos-agent start
+  ```
+  Look for `agent.cycle`, `llm.chat_completion`, `tool.<name>`, and
+  `web_api.<METHOD> <path>` spans printed to stdout, sharing one `trace_id`
+  per cycle.
+- **Rollback**: unset `OTEL_ENABLED` (or set it to `false`) and restart.
+  Nothing is persisted to a database, so there is no data-layer state to
+  reverse — see `docs/TRACING.md#persistence--migration-analysis`.
+- Structured logs on both sides now include `trace_id`/`span_id` fields
+  whenever a span is active (alongside the existing `cycle_id`/
+  `X-Request-Id`), so you can pivot from a log line straight into a trace.
+
 ## Where to find logs
 
 | Layer | Where |

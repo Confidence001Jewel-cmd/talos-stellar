@@ -11,9 +11,11 @@ import os
 from typing import Any
 
 import httpx
+from opentelemetry.trace import SpanKind
 from rich.console import Console
 
 from talos_agent.http import request_with_retry
+from talos_agent.tracing import traced_span
 
 _HORIZON_URL = os.getenv("STELLAR_HORIZON_URL", "https://horizon-testnet.stellar.org")
 

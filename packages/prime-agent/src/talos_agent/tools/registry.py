@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, get_type_hints
 
@@ -152,13 +153,22 @@ class ToolRegistry:
                 pass  # policy check failure must not block tool execution
         # ─────────────────────────────────────────────────────────────
 
+        start = time.monotonic()
+        outcome = "success"
         try:
-            result = tool.fn(**arguments)
-            if inspect.isawaitable(result):
-                result = await result
-            return result
+            with traced_span(
+                f"tool.{name}",
+                {"tool.name": name, "tool.arg_keys": list(arguments.keys())},
+            ):
+                result = tool.fn(**arguments)
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
         except Exception as e:
+            outcome = "error"
             return {"error": f"{type(e).__name__}: {e}"}
+        finally:
+            metrics.record_tool_call(name, outcome, time.monotonic() - start)
 
 
 # Global registry instance

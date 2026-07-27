@@ -49,7 +49,7 @@ export async function GET(
 
 // POST /api/talos/:id/revenue — Report revenue (from Local Agent)
 // All revenue stays in Agent Treasury. No distribution to external wallets.
-export async function POST(
+async function handlePost(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
@@ -126,3 +126,5 @@ export async function POST(
     return Response.json({ error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const POST = withTraceContext(handlePost);

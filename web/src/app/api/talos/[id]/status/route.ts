@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { tlsTalos, tlsCommerceJobs } from "@/db/schema";
 import { eq, and } from "drizzle-orm";
 import { verifyAgentApiKey } from "@/lib/auth";
+import { withTraceContext } from "@/lib/tracing";
 
 const VALID_LIFECYCLE_STATUSES = new Set(["Active", "Paused", "Retired"]);
 
@@ -15,7 +16,7 @@ function normalizeLifecycleStatus(value: unknown): string | null {
 }
 
 // PATCH /api/talos/:id/status — Agent status update (online/offline)
-export async function PATCH(
+async function handlePatch(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
@@ -106,3 +107,5 @@ export async function PATCH(
     return Response.json({ error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const PATCH = withTraceContext(handlePatch);

@@ -1,3 +1,4 @@
+import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { tlsTalos } from "@/db/schema";
 import { eq } from "drizzle-orm";
@@ -37,3 +38,5 @@ export async function GET(
     return internalError(request);
   }
 }
+
+export const GET = withTraceContext(handleGet);

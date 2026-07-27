@@ -6,7 +6,7 @@ import { recordApprovalOnChain, verifyStellarSignature } from "@/lib/stellar";
 import { emitWebhookEvent } from "@/lib/webhooks/delivery";
 
 // PATCH /api/talos/:id/approvals/:approvalId — Approve/reject
-export async function PATCH(
+async function handlePatch(
   request: NextRequest,
   { params }: { params: Promise<{ id: string; approvalId: string }> }
 ) {
@@ -127,3 +127,5 @@ export async function PATCH(
     return Response.json({ error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const PATCH = withTraceContext(handlePatch);
