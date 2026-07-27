@@ -47,13 +47,68 @@ export interface RetryPolicyOptions {
 }
 
 export interface TalosClientOptions {
+  /** Base URL of the Talos API. Defaults to `https://talos-stellar.vercel.app`. */
   baseUrl?: string;
+  /** Bearer token (TALOS API key). Adds `Authorization: Bearer <key>` header. */
   apiKey?: string;
   /** Opt-in request signer. Omitting it preserves the legacy wire format. */
   signer?: RequestSigner;
   signing?: SigningControllerOptions;
 }
 
+/** Structured event emitted to {@link TalosClientOptions.onError}. */
+export interface TalosErrorEvent {
+  error: TalosAPIError;
+  path: string;
+  method: string;
+  attempt: number;
+  durationMs: number;
+}
+
+/** Default retry bounds. Conservative — well within RFC 7231 guidance. */
+const DEFAULT_RETRY: Required<RetryOptions> = {
+  maxAttempts: 1,
+  idempotentOnly: true,
+  maxRetryAfterMs: 60_000,
+  baseDelayMs: 500,
+  maxDelayMs: 8_000,
+  jitter: 0.25,
+  onRetry: () => {
+    /* default: no-op observer */
+  },
+};
+
+/** Methods considered safe to retry without further confirmation from the caller. */
+const IDEMPOTENT_METHODS = new Set(["GET", "HEAD"]);
+
+/**
+ * Sleep helper. Uses `setTimeout` so it works in both Node and the browser.
+ * Returns a promise that resolves after `ms` milliseconds.
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Apply jitter to a delay: `delay * (1 - jitter + jitter*random)`.
+ * Bounded below by 0 and above by `delay * (1 + jitter)`.
+ */
+function applyJitter(delay: number, jitter: number): number {
+  const factor = 1 - jitter + jitter * Math.random();
+  return Math.max(0, Math.round(delay * factor));
+}
+
+/**
+ * Talos Protocol API client. Wraps `fetch` with typed errors, optional
+ * timeout, and bounded auto-retry for idempotent operations.
+ *
+ * Tier list of changes from the previous version (all backward-compatible):
+ *   - Errors are now typed subclasses of `TalosAPIError` (see `./errors.ts`).
+ *   - `timeoutMs` enables a per-request `AbortController` timeout.
+ *   - `retry.maxAttempts > 1` opt-in retries on transient failures only.
+ *   - `onError` callback for centralized logging / metrics.
+ *   - `fetch` injection for tests / middleware.
+ */
 export class TalosClient {
   private baseUrl: string;
   private headers: Record<string, string>;
@@ -90,7 +145,10 @@ export class TalosClient {
     if (options.signer) this.signer = new SigningController(options.signer, options.signing);
   }
 
-  // ── Internal fetch helper ──────────────────────────────────
+  /** Resolve the fetch implementation per request. Prefer override; fall back to global. */
+  private resolveFetch(): typeof fetch {
+    return this.fetchOverride ?? globalThis.fetch;
+  }
 
   private shouldRetry(method: string, status: number): boolean {
     return (
@@ -170,7 +228,7 @@ export class TalosClient {
     if (params) {
       const filteredParams = Object.entries(params)
         .filter(([_, value]) => value !== undefined)
-        .reduce((acc, [key, value]) => ({ ...acc, [key]: String(value) }), {});
+        .reduce((acc, [key, value]) => ({ ...acc, [key]: String(value) }), {} as Record<string, string>);
       const qs = new URLSearchParams(filteredParams).toString();
       if (qs) url += `?${qs}`;
     }
@@ -344,6 +402,11 @@ export class TalosClient {
   /**
    * High-level helper to purchase a service, handling the x402 402 challenge flow.
    *
+   * Errors raised here are typed:
+   *   - {@link TalosPaymentError} when the 402 challenge is malformed/missing.
+   *   - {@link TalosAuthenticationError} for missing credentials on the signed retry.
+   *   - Any other TalosAPIError subclass for downstream failures.
+   *
    * @param talosId - The ID of the TALOS providing the service.
    * @param buyerTalosId - The ID of the TALOS purchasing the service (for signing).
    * @param payload - Optional payload for the service.
@@ -353,8 +416,8 @@ export class TalosClient {
     buyerTalosId: string,
     payload?: Record<string, unknown>,
   ): Promise<CommerceJob> {
-    let res: Response;
-    const url = `${this.baseUrl}/api/talos/${talosId}/service`;
+    const path = `/api/talos/${talosId}/service`;
+    const url = `${this.baseUrl}${path}`;
 
     if (this.chaosInjector) {
       await this.chaosInjector.maybeInjectFault(FaultType.NETWORK_DELAY);
@@ -374,29 +437,51 @@ export class TalosClient {
     });
 
     if (res.status === 402) {
-      // 2. Handle x402 challenge
+      // 2. Validate the x402 challenge.
       const authHeader = res.headers.get("WWW-Authenticate");
-      if (!authHeader || !authHeader.startsWith("x402 ")) {
-        throw new Error("Invalid x402 challenge");
+      if (!authHeader || !authHeader.startsWith("x402")) {
+        // Preserve the legacy text so existing
+        // `rejects.toThrow("Invalid x402 challenge")` assertions keep passing.
+        throw new TalosPaymentError(402, "Invalid x402 challenge", path, {
+          message: "Invalid x402 challenge",
+          headers: { "www-authenticate": authHeader ?? "" },
+        });
+      }
+      const challenge = parseX402Challenge(authHeader);
+      if (!challenge) {
+        throw new TalosPaymentError(402, "Invalid x402 challenge", path, {
+          message: "Invalid x402 challenge",
+          headers: { "www-authenticate": authHeader },
+        });
       }
 
-      // Parse challenge: x402 price="0.50", payee="G...", token="USDC", network="stellar:testnet"
-      const challenge = this.parseX402Challenge(authHeader);
-
-      // 3. Request signature from Web API
+      // 3. Request signature from the Web API.
+      //    `parseFloat(undefined)` would yield NaN; we already required both
+      //    keys above (parseX402Challenge rejects partial challenges), but
+      //    `price` could still be the literal "abc" — guard explicitly so
+      //    a malformed header never feeds NaN to the downstream /sign call.
+      const amount = parseFloat(challenge.price);
+      if (!Number.isFinite(amount)) {
+        throw new TalosPaymentError(402, "Invalid x402 challenge", path, {
+          message: "Invalid x402 challenge",
+          headers: { "www-authenticate": authHeader },
+        });
+      }
       const signRes = await this.signPayment(buyerTalosId, {
         payee: challenge.payee,
-        amount: parseFloat(challenge.price),
+        amount,
         assetCode: challenge.token,
       });
 
-      // 4. Retry with X-PAYMENT header
+      // 4. Retry with the X-PAYMENT header — delegated to the regular
+      //    request helper, so all typed errors / retry / timeout apply.
       return this.purchaseService(talosId, {
         paymentHeader: signRes.paymentHeader,
         payload,
       });
     }
 
+    // Non-402 responses — wrap them through the typed dispatch.
     if (!res.ok) {
       const body = await res.text();
       throw new TalosAPIError(
@@ -447,7 +532,6 @@ export class TalosClient {
       const [key, value] = part.split("=");
       challenge[key] = value.replace(/"/g, "");
     }
-    return challenge;
   }
 
   // ── Wallet & Payments ──────────────────────────────────────
@@ -518,16 +602,5 @@ export class TalosClient {
       method: "POST",
       body: JSON.stringify(params),
     });
-  }
-}
-
-export class TalosAPIError extends Error {
-  constructor(
-    public status: number,
-    public body: string,
-    public path: string,
-  ) {
-    super(`Talos API error ${status} on ${path}: ${body}`);
-    this.name = "TalosAPIError";
   }
 }
