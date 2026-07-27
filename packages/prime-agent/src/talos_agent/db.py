@@ -292,7 +292,7 @@ CREATE INDEX IF NOT EXISTS idx_completion_markers_expires_at
 
 
 class LocalDB:
-    def __init__(self, path: Path = DB_PATH):
+    def __init__(self, path: Path = DB_PATH, *, timeout_ms: int = 5000):
         self._path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(path))
@@ -302,8 +302,14 @@ class LocalDB:
             # Some platforms/filesystems do not implement POSIX modes.
             pass
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute(f"PRAGMA busy_timeout = {max(timeout_ms, 1)}")
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._run_migrations()
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            # Some platforms/filesystems do not expose POSIX permissions.
+            pass
 
     def _run_migrations(self) -> None:
         """Run all pending migrations in a single transaction."""

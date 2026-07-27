@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
 import json
 import os
 import re
 import sys
+import uuid
 
 import click
 from rich.console import Console
@@ -32,8 +34,6 @@ main.add_command(checkpoint)
 @click.option("--env-file", default=".env", help="Path to .env file")
 def start(talos_id: str | None, env_file: str):
     """Start the Prime Agent for a Talos."""
-    from pathlib import Path
-
     ensure_app_dir()
 
     # Load .env into os.environ so child processes (Stagehand SEA) inherit them
@@ -103,6 +103,11 @@ def start(talos_id: str | None, env_file: str):
 @click.option("--openai-key", prompt="OpenAI API Key", help="OpenAI API key")
 def config(api_key: str, openai_key: str):
     """Configure agent credentials (saved to ~/.talos-agent/config.json)."""
+    if Settings().secret_rotation_enabled:
+        raise click.ClickException(
+            "plaintext config writes are disabled while secret rotation is enabled; "
+            "use `talos-agent secrets rotate`"
+        )
     ensure_app_dir()
     cfg_path = APP_DIR / "config.json"
 

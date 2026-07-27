@@ -262,14 +262,77 @@ def build_all_tools(
     from talos_agent.tools import a2a_composition as _a2a_composition_mod  # noqa: F401
 
     # Build the channel adapter registry with all configured adapters
+    from talos_agent.adapters.capability import (
+        AdapterResourceLimits,
+        AdapterSandbox,
+        default_manifests,
+        load_manifests,
+    )
+    from talos_agent.adapters.discord import DiscordAdapter, DiscordAdapterConfig
     from talos_agent.adapters.registry import AdapterRegistry
-    from talos_agent.adapters.x import XAdapter
-    from talos_agent.adapters.discord import DiscordAdapter
+    from talos_agent.adapters.telegram import TelegramAdapter, TelegramAdapterConfig
+    from talos_agent.adapters.x import XAdapter, XAdapterConfig
 
-    adapter_registry = AdapterRegistry()
-    adapter_registry.register(XAdapter(browser, settings))
-    if settings.discord_webhook_url or settings.discord_bot_token:
-        adapter_registry.register(DiscordAdapter(settings))
+    if settings.adapter_sandbox_enabled:
+        limits = AdapterResourceLimits(
+            timeout_seconds=settings.adapter_timeout_seconds,
+            max_concurrency=settings.adapter_max_concurrency,
+            max_input_bytes=settings.adapter_max_input_bytes,
+            max_output_bytes=settings.adapter_max_output_bytes,
+            max_network_requests=settings.adapter_max_network_requests,
+            invocation_lease_seconds=settings.adapter_invocation_lease_seconds,
+            max_invocation_records=settings.adapter_max_invocation_records,
+        )
+        manifests = load_manifests(
+            settings.adapter_capability_manifests,
+            defaults=default_manifests(limits),
+        )
+        sandbox = AdapterSandbox(
+            manifests=manifests,
+            db=db,
+            secret_resolver=settings.secret_value,
+        )
+        adapter_registry = AdapterRegistry(sandbox)
+        adapter_registry.register(
+            XAdapter(
+                sandbox.browser("x", browser),
+                XAdapterConfig(username=settings.x_username, email=settings.x_email),
+                secrets=sandbox.secrets("x"),
+            )
+        )
+        if (
+            resolve_setting_secret(settings, "discord_webhook_url")
+            or resolve_setting_secret(settings, "discord_bot_token")
+        ):
+            adapter_registry.register(
+                DiscordAdapter(
+                    DiscordAdapterConfig(
+                        channel_id=settings.discord_channel_id,
+                        guild_id=settings.discord_guild_id,
+                    ),
+                    secrets=sandbox.secrets("discord"),
+                    http=sandbox.http("discord"),
+                )
+            )
+        if (
+            resolve_setting_secret(settings, "telegram_bot_token")
+            and settings.telegram_chat_id
+        ):
+            adapter_registry.register(
+                TelegramAdapter(
+                    TelegramAdapterConfig(chat_id=settings.telegram_chat_id),
+                    secrets=sandbox.secrets("telegram"),
+                    http=sandbox.http("telegram"),
+                )
+            )
+    else:
+        adapter_registry = AdapterRegistry()
+        adapter_registry.register(XAdapter(browser, settings))
+        if (
+            resolve_setting_secret(settings, "discord_webhook_url")
+            or resolve_setting_secret(settings, "discord_bot_token")
+        ):
+            adapter_registry.register(DiscordAdapter(settings))
 
     # Inject dependencies into tool modules
     _internal_mod._db = db
