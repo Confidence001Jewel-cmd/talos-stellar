@@ -156,6 +156,13 @@ if (isValidPublicKey(publicKey)) {
 }
 ```
 
+### Pluggable request signing
+
+Pass a `RequestSigner` to sign SDK HTTP requests with a local key, hardware
+wallet, custody service, or custom provider. Signing is opt-in and existing
+clients are unchanged. See [the request-signing operations guide](../../docs/sdk-request-signing.md)
+for canonicalization, limits, observability, rollout, and rollback.
+
 ## API Reference
 
 ### Talos Management

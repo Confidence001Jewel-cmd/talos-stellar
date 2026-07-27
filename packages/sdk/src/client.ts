@@ -28,8 +28,13 @@ import type {
   ActivityPage,
   ActivityPageOptions,
 } from "./types.js";
-import type { ChaosInjector } from "./chaos.js";
-import { FaultType } from "./chaos.js";
+import {
+  SigningController,
+  canonicalizeRequest,
+  encodeSignature,
+  type RequestSigner,
+  type SigningControllerOptions,
+} from "./signing.js";
 
 export interface RetryPolicyOptions {
   maxAttempts?: number;
@@ -44,15 +49,15 @@ export interface RetryPolicyOptions {
 export interface TalosClientOptions {
   baseUrl?: string;
   apiKey?: string;
-  retryPolicy?: RetryPolicyOptions;
-  chaosInjector?: ChaosInjector;
+  /** Opt-in request signer. Omitting it preserves the legacy wire format. */
+  signer?: RequestSigner;
+  signing?: SigningControllerOptions;
 }
 
 export class TalosClient {
   private baseUrl: string;
   private headers: Record<string, string>;
-  private readonly retryPolicy: Required<RetryPolicyOptions>;
-  private readonly chaosInjector?: ChaosInjector;
+  private signer?: SigningController;
 
   constructor(options: TalosClientOptions = {}) {
     const normalizedRetryMethods = options.retryPolicy?.retryMethods?.map(
@@ -82,7 +87,7 @@ export class TalosClient {
     if (options.apiKey) {
       this.headers["Authorization"] = `Bearer ${options.apiKey}`;
     }
-    this.chaosInjector = options.chaosInjector;
+    if (options.signer) this.signer = new SigningController(options.signer, options.signing);
   }
 
   // ── Internal fetch helper ──────────────────────────────────
@@ -169,39 +174,38 @@ export class TalosClient {
       const qs = new URLSearchParams(filteredParams).toString();
       if (qs) url += `?${qs}`;
     }
-
-    const method = requestInit.method?.toString().toUpperCase() ?? "GET";
-
-    for (
-      let attempt = 1;
-      attempt <= this.retryPolicy.maxAttempts;
-      attempt += 1
-    ) {
-      if (this.chaosInjector) {
-        await this.chaosInjector.maybeInjectFault(FaultType.NETWORK_DELAY);
-        await this.chaosInjector.maybeInjectFault(FaultType.NETWORK_DROP);
-        await this.chaosInjector.maybeInjectFault(FaultType.API_TIMEOUT);
-      }
-
-      const res = await fetch(url, {
-        ...requestInit,
-        ...(normalizedSignal ? { signal: normalizedSignal } : {}),
-        headers: { ...this.headers, ...requestInit.headers },
+    const headers = { ...this.headers, ...init?.headers };
+    if (this.signer) {
+      const timestamp = new Date().toISOString();
+      const nonce = globalThis.crypto.randomUUID();
+      const bytes = await canonicalizeRequest({
+        method: init?.method ?? "GET",
+        url,
+        headers,
+        body: init?.body,
+        timestamp,
+        nonce,
       });
-
-      if (res.ok) {
-        return res.json() as Promise<T>;
-      }
-
-      const shouldRetry = this.shouldRetry(method, res.status);
-      if (!shouldRetry || attempt === this.retryPolicy.maxAttempts) {
-        const body = await res.text();
-        throw new TalosAPIError(res.status, body, path);
-      }
-
-      const retryAfterHeader = res.headers.get("Retry-After");
-      const delay = this.getRetryDelay(attempt, retryAfterHeader);
-      await this.wait(delay, normalizedSignal);
+      const signed = await this.signer.sign(
+        { kind: "http-request-v1", bytes },
+        { signal: init?.signal ?? undefined, requestId: nonce },
+      );
+      Object.assign(headers, {
+        "X-Talos-Signature-Version": "talos-request-v1",
+        "X-Talos-Key-Id": signed.keyId,
+        "X-Talos-Algorithm": signed.algorithm,
+        "X-Talos-Timestamp": timestamp,
+        "X-Talos-Nonce": nonce,
+        "X-Talos-Signature": encodeSignature(signed.signature),
+      });
+    }
+    const res = await fetch(url, {
+      ...init,
+      headers,
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new TalosAPIError(res.status, body, path);
     }
 
     throw new Error("Unexpected retry failure");
@@ -359,9 +363,13 @@ export class TalosClient {
     }
 
     // 1. Try initial request
+    const initialHeaders = await this.signedHeaders(url, {
+      method: "POST",
+      body: JSON.stringify({ payload }),
+    });
     res = await fetch(url, {
       method: "POST",
-      headers: this.headers,
+      headers: initialHeaders,
       body: JSON.stringify({ payload }),
     });
 
@@ -399,6 +407,37 @@ export class TalosClient {
     }
 
     return res.json() as Promise<CommerceJob>;
+  }
+
+  private async signedHeaders(url: string, init: RequestInit): Promise<Record<string, string>> {
+    if (!this.signer && !init.headers) return { ...this.headers };
+    const merged = new Headers(this.headers);
+    new Headers(init.headers).forEach((value, key) => merged.set(key, value));
+    const headers = Object.fromEntries(merged.entries());
+    if (!this.signer) return headers;
+    const timestamp = new Date().toISOString();
+    const nonce = globalThis.crypto.randomUUID();
+    const bytes = await canonicalizeRequest({
+      method: init.method ?? "GET",
+      url,
+      headers,
+      body: init.body,
+      timestamp,
+      nonce,
+    });
+    const signed = await this.signer.sign(
+      { kind: "http-request-v1", bytes },
+      { signal: init.signal ?? undefined, requestId: nonce },
+    );
+    return {
+      ...headers,
+      "X-Talos-Signature-Version": "talos-request-v1",
+      "X-Talos-Key-Id": signed.keyId,
+      "X-Talos-Algorithm": signed.algorithm,
+      "X-Talos-Timestamp": timestamp,
+      "X-Talos-Nonce": nonce,
+      "X-Talos-Signature": encodeSignature(signed.signature),
+    };
   }
 
   private parseX402Challenge(header: string): Record<string, string> {
