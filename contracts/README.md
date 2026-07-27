@@ -2,6 +2,8 @@
 
 Stellar-based smart contracts for the Talos Protocol, built with Rust and the Soroban SDK.
 
+See [EVENTS.md](./EVENTS.md) for the full contract event indexing specification.
+
 ## Contracts
 
 ### 1. TalosRegistry
@@ -475,6 +477,14 @@ Both `TalosRegistry` and `TalosNameService` implement a proposal-based timelock 
 ```
 
 A proposal in `Executed` or `Cancelled` state is permanently terminal — no re-execution.
+
+### Property-based fuzzing
+
+The contract test suite includes a deterministic property-based state-machine test for the name service. It exercises randomized name-registration sequences against an in-memory model to verify invariants around availability, resolution, and ownership updates. Run it with:
+
+```bash
+cargo test -p talos-name-service
+```
 
 ### Entry-points
 

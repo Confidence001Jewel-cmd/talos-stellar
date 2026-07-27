@@ -628,6 +628,182 @@ impl TalosNameService {
 
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
+mod property_tests {
+    use super::*;
+    use proptest::{prelude::*, test_runner::TestRunner};
+    use soroban_sdk::{
+        testutils::{Address as _, MockAuth, MockAuthInvoke},
+        Address, Env, IntoVal,
+    };
+    use std::string::String as StdString;
+
+    fn setup() -> (
+        Env,
+        Address,
+        Address,
+        talos_registry::TalosRegistryClient<'static>,
+        TalosNameServiceClient<'static>,
+    ) {
+        let env = Env::default();
+        let registry_contract = env.register_contract(None, talos_registry::TalosRegistry);
+        let name_service_contract = env.register_contract(None, TalosNameService);
+        let name_service_client = TalosNameServiceClient::new(&env, &name_service_contract);
+        name_service_client.initialize(&registry_contract);
+        let registry_client = talos_registry::TalosRegistryClient::new(&env, &registry_contract);
+        (
+            env,
+            registry_contract,
+            name_service_contract,
+            registry_client,
+            name_service_client,
+        )
+    }
+
+    fn soroban_string(env: &Env, value: &str) -> String {
+        String::from_str(env, value)
+    }
+
+    fn valid_name_strategy() -> impl Strategy<Value = StdString> {
+        prop::collection::vec(
+            any::<u8>().prop_filter("ascii lower/digit/hyphen", |b| {
+                let byte = *b;
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+            }),
+            3..=32,
+        )
+        .prop_filter("must not start or end with hyphen", |chars| {
+            !chars.is_empty() && chars[0] != b'-' && chars[chars.len() - 1] != b'-'
+        })
+        .prop_filter("must not contain consecutive hyphens", |chars| {
+            chars.iter().zip(chars.iter().skip(1)).all(|(a, b)| !(a == &b'-' && b == &b'-'))
+        })
+        .prop_map(|chars| StdString::from_utf8(chars).unwrap())
+    }
+
+    fn create_talos_with_auth(
+        env: &Env,
+        client: &talos_registry::TalosRegistryClient,
+        contract_id: &Address,
+        creator: &Address,
+        protocol_wallet: &Address,
+    ) -> u32 {
+        let name = soroban_string(env, "Genesis");
+        let category = soroban_string(env, "Marketing");
+        let description = soroban_string(env, "Autonomous marketing agent");
+        let patron = talos_registry::Patron {
+            creator_share: 60,
+            investor_share: 25,
+            treasury_share: 15,
+            creator_addr: creator.clone(),
+            investor_addr: Address::generate(env),
+            treasury_addr: Address::generate(env),
+        };
+        let kernel = talos_registry::Kernel {
+            approval_threshold: 10,
+            gtm_budget: 1_000,
+            min_patron_pulse: 100,
+        };
+        let pulse = talos_registry::Pulse {
+            total_supply: 1_000_000,
+            price_usd_cents: 100,
+            token_symbol: soroban_string(env, "TLOS"),
+        };
+
+        client
+            .mock_auths(&[MockAuth {
+                address: creator,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "create_talos",
+                    args: (
+                        name.clone(),
+                        category.clone(),
+                        description.clone(),
+                        patron.clone(),
+                        kernel.clone(),
+                        pulse.clone(),
+                        protocol_wallet.clone(),
+                    )
+                        .into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .create_talos(
+                &name,
+                &category,
+                &description,
+                &patron,
+                &kernel,
+                &pulse,
+                protocol_wallet,
+            )
+    }
+
+    #[test]
+    fn state_machine_register_name_preserves_invariants() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let owner = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let talos_id = create_talos_with_auth(&env, &registry_client, &registry_contract, &owner, &protocol_wallet);
+
+        let mut runner = TestRunner::new(ProptestConfig::with_cases(8));
+        let strategy = prop::collection::vec(valid_name_strategy(), 1..=3);
+        runner.run(&strategy, |names| {
+            let mut model = std::collections::BTreeMap::<StdString, u32>::new();
+            let mut talos_to_name = std::collections::BTreeMap::<u32, StdString>::new();
+
+            for name in names.iter() {
+                let soroban_name = soroban_string(&env, name.as_str());
+
+                let result = client
+                    .mock_auths(&[MockAuth {
+                        address: &owner,
+                        invoke: &MockAuthInvoke {
+                            contract: &contract_id,
+                            fn_name: "register_name",
+                            args: (owner.clone(), talos_id, soroban_name.clone()).into_val(&env),
+                            sub_invokes: &[MockAuthInvoke {
+                                contract: &registry_contract,
+                                fn_name: "creator_of",
+                                args: (talos_id,).into_val(&env),
+                                sub_invokes: &[],
+                            }],
+                        },
+                    }])
+                    .try_register_name(&owner, &talos_id, &soroban_name);
+
+                let expected_success = !model.contains_key(name) && !name.contains("--") && !name.starts_with('-') && !name.ends_with('-');
+                assert_eq!(result.is_ok(), expected_success, "name={name:?}, talos_id={talos_id}");
+
+                if result.is_ok() {
+                    if let Some(old_name) = talos_to_name.remove(&talos_id) {
+                        model.remove(&old_name);
+                    }
+                    model.insert(name.clone(), talos_id);
+                    talos_to_name.insert(talos_id, name.clone());
+                }
+
+                let resolved = client.resolve_name(&soroban_name);
+                let expected_resolved = model.get(name).copied();
+                assert_eq!(resolved, expected_resolved, "name={name:?}, talos_id={talos_id}");
+                assert_eq!(client.is_name_available(&soroban_name), expected_resolved.is_none());
+
+                let expected_name_for_talos = talos_to_name.get(&talos_id).cloned();
+                let actual_name_for_talos = client.name_of(&talos_id);
+                assert_eq!(
+                    actual_name_for_talos,
+                    expected_name_for_talos.as_ref().map(|value| soroban_string(&env, value.as_str()))
+                );
+            }
+
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
     use soroban_sdk::{
@@ -1268,5 +1444,308 @@ mod tests {
         let prop = client.get_timelock_proposal(&proposal_id).unwrap();
         assert_eq!(prop.status, ProposalStatus::Cancelled);
         assert!(client.try_execute_action(&proposal_id).is_err());
+    }
+    // ── Lifecycle invariant tests (Issue #194) ────────────────────────
+    //
+    // Assert: name→agent / agent→name mappings stay mutually consistent;
+    // freed names may be re-registered by a different owner/talos; rejected
+    // operations (duplicate name, unauthorized caller, invalid name,
+    // cross-contract lookup failure, uninitialized registry) leave storage
+    // and events byte-for-byte unchanged.
+
+    struct NameState {
+        resolved: Option<u32>,
+        name_of_talos: Option<String>,
+        available: bool,
+        has_name: bool,
+    }
+
+    fn snapshot(client: &TalosNameServiceClient, name: &String, talos_id: u32) -> NameState {
+        NameState {
+            resolved: client.resolve_name(name),
+            name_of_talos: client.name_of(&talos_id),
+            available: client.is_name_available(name),
+            has_name: client.has_name(&talos_id),
+        }
+    }
+
+    fn assert_state_eq(a: &NameState, b: &NameState, ctx: &str) {
+        assert_eq!(a.resolved, b.resolved, "resolve_name changed: {ctx}");
+        assert_eq!(a.name_of_talos, b.name_of_talos, "name_of changed: {ctx}");
+        assert_eq!(a.available, b.available, "is_name_available changed: {ctx}");
+        assert_eq!(a.has_name, b.has_name, "has_name changed: {ctx}");
+    }
+
+    fn event_count(env: &Env, contract_id: &Address) -> usize {
+        env.events()
+            .all()
+            .iter()
+            .filter(|e| e.0 == *contract_id)
+            .count()
+    }
+
+    #[test]
+    fn rejected_duplicate_registration_leaves_storage_and_events_unchanged() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let owner = Address::generate(&env);
+        let second_owner = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let name = s(&env, "marketbot");
+
+        let talos_id = create_talos_with_auth(
+            &env, &registry_client, &registry_contract, &owner, &protocol_wallet,
+        );
+        let second_talos_id = create_talos_with_auth(
+            &env, &registry_client, &registry_contract, &second_owner, &protocol_wallet,
+        );
+
+        register_name_with_auth(
+            &env, &client, &contract_id, &registry_contract, &owner, talos_id, &name,
+        );
+
+        let before = snapshot(&client, &name, talos_id);
+        let before_second = snapshot(&client, &name, second_talos_id);
+        let events_before = event_count(&env, &contract_id);
+
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &second_owner,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "register_name",
+                    args: (second_owner.clone(), second_talos_id, name.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_register_name(&second_owner, &second_talos_id, &name);
+        assert!(result.is_err());
+
+        let after = snapshot(&client, &name, talos_id);
+        let after_second = snapshot(&client, &name, second_talos_id);
+        assert_state_eq(&before, &after, "owner of existing name");
+        assert_state_eq(&before_second, &after_second, "rejected second talos_id");
+        assert_eq!(
+            events_before,
+            event_count(&env, &contract_id),
+            "rejected duplicate registration must not emit events"
+        );
+    }
+
+    #[test]
+    fn rejected_unauthorized_registration_leaves_storage_and_events_unchanged() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let creator = Address::generate(&env);
+        let unauthorized = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let name = s(&env, "marketbot");
+
+        let talos_id = create_talos_with_auth(
+            &env, &registry_client, &registry_contract, &creator, &protocol_wallet,
+        );
+
+        let before = snapshot(&client, &name, talos_id);
+        let events_before = event_count(&env, &contract_id);
+
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &unauthorized,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "register_name",
+                    args: (unauthorized.clone(), talos_id, name.clone()).into_val(&env),
+                    sub_invokes: &[MockAuthInvoke {
+                        contract: &registry_contract,
+                        fn_name: "creator_of",
+                        args: (talos_id,).into_val(&env),
+                        sub_invokes: &[],
+                    }],
+                },
+            }])
+            .try_register_name(&unauthorized, &talos_id, &name);
+        assert!(result.is_err());
+
+        let after = snapshot(&client, &name, talos_id);
+        assert_state_eq(&before, &after, "unauthorized caller rejection");
+        assert_eq!(
+            events_before,
+            event_count(&env, &contract_id),
+            "rejected unauthorized registration must not emit events"
+        );
+    }
+
+    #[test]
+    fn rejected_invalid_name_leaves_storage_and_events_unchanged() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let owner = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let invalid_name = s(&env, "Bad--Name-");
+
+        let talos_id = create_talos_with_auth(
+            &env, &registry_client, &registry_contract, &owner, &protocol_wallet,
+        );
+
+        let before = snapshot(&client, &invalid_name, talos_id);
+        let events_before = event_count(&env, &contract_id);
+
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &owner,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "register_name",
+                    args: (owner.clone(), talos_id, invalid_name.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_register_name(&owner, &talos_id, &invalid_name);
+        assert!(result.is_err());
+
+        let after = snapshot(&client, &invalid_name, talos_id);
+        assert_state_eq(&before, &after, "invalid name rejection");
+        assert_eq!(
+            events_before,
+            event_count(&env, &contract_id),
+            "rejected invalid name must not emit events"
+        );
+    }
+
+    #[test]
+    fn cross_contract_unknown_talos_id_rejected_leaves_storage_and_events_unchanged() {
+        let (env, registry_contract, contract_id, _registry_client, client) = setup();
+        let owner = Address::generate(&env);
+        let name = s(&env, "ghost-agent");
+        let unknown_talos_id = 999u32;
+
+        let before = snapshot(&client, &name, unknown_talos_id);
+        let events_before = event_count(&env, &contract_id);
+
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &owner,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "register_name",
+                    args: (owner.clone(), unknown_talos_id, name.clone()).into_val(&env),
+                    sub_invokes: &[MockAuthInvoke {
+                        contract: &registry_contract,
+                        fn_name: "creator_of",
+                        args: (unknown_talos_id,).into_val(&env),
+                        sub_invokes: &[],
+                    }],
+                },
+            }])
+            .try_register_name(&owner, &unknown_talos_id, &name);
+        assert!(result.is_err());
+
+        let after = snapshot(&client, &name, unknown_talos_id);
+        assert_state_eq(&before, &after, "unknown talos_id cross-contract rejection");
+        assert_eq!(
+            events_before,
+            event_count(&env, &contract_id),
+            "rejected cross-contract lookup must not emit events"
+        );
+    }
+
+    #[test]
+    fn cross_contract_uninitialized_registry_rejected_leaves_storage_unchanged() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, TalosNameService);
+        let client = TalosNameServiceClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let name = s(&env, "no-registry");
+        let talos_id = 1u32;
+
+        let before = snapshot(&client, &name, talos_id);
+        let events_before = event_count(&env, &contract_id);
+
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &owner,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "register_name",
+                    args: (owner.clone(), talos_id, name.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_register_name(&owner, &talos_id, &name);
+        assert!(result.is_err());
+
+        let after = snapshot(&client, &name, talos_id);
+        assert_state_eq(&before, &after, "uninitialized registry rejection");
+        assert_eq!(
+            events_before,
+            event_count(&env, &contract_id),
+            "rejected registration on uninitialized contract must not emit events"
+        );
+    }
+
+    #[test]
+    fn freed_name_can_be_reregistered_by_a_different_talos_and_owner() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let name1 = s(&env, "first-name");
+        let name2 = s(&env, "second-name");
+
+        let talos_a = create_talos_with_auth(
+            &env, &registry_client, &registry_contract, &owner_a, &protocol_wallet,
+        );
+        let talos_b = create_talos_with_auth(
+            &env, &registry_client, &registry_contract, &owner_b, &protocol_wallet,
+        );
+
+        register_name_with_auth(
+            &env, &client, &contract_id, &registry_contract, &owner_a, talos_a, &name1,
+        );
+        assert_eq!(client.resolve_name(&name1), Some(talos_a));
+
+        register_name_with_auth(
+            &env, &client, &contract_id, &registry_contract, &owner_a, talos_a, &name2,
+        );
+        assert_eq!(client.resolve_name(&name1), None);
+        assert!(client.is_name_available(&name1));
+        assert_eq!(client.resolve_name(&name2), Some(talos_a));
+        assert_eq!(client.name_of(&talos_a), Some(name2.clone()));
+
+        register_name_with_auth(
+            &env, &client, &contract_id, &registry_contract, &owner_b, talos_b, &name1,
+        );
+
+        assert_eq!(client.resolve_name(&name1), Some(talos_b));
+        assert_eq!(client.name_of(&talos_b), Some(name1.clone()));
+        assert_eq!(client.resolve_name(&name2), Some(talos_a));
+        assert_eq!(client.name_of(&talos_a), Some(name2));
+        assert!(!client.is_name_available(&name1));
+    }
+
+    #[test]
+    fn uniqueness_invariant_holds_across_repeated_renames() {
+        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let owner = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let talos_id = create_talos_with_auth(
+            &env, &registry_client, &registry_contract, &owner, &protocol_wallet,
+        );
+
+        let names: [&str; 4] = ["alpha-one", "beta-two", "gamma-three", "delta-four"];
+        let mut previous: Option<String> = None;
+
+        for raw in names {
+            let name = s(&env, raw);
+            register_name_with_auth(
+                &env, &client, &contract_id, &registry_contract, &owner, talos_id, &name,
+            );
+
+            assert_eq!(client.resolve_name(&name), Some(talos_id));
+            assert_eq!(client.name_of(&talos_id), Some(name.clone()));
+
+            if let Some(old) = previous {
+                assert_eq!(client.resolve_name(&old), None, "old name must be freed: {raw}");
+                assert!(client.is_name_available(&old), "old name must be available: {raw}");
+            }
+            previous = Some(name);
+        }
     }
 }
