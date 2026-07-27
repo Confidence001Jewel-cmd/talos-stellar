@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { tlsTalos, tlsApprovals, tlsPatrons } from "@/db/schema";
 import { and, eq, sql } from "drizzle-orm";
 import { recordApprovalOnChain, verifyStellarSignature } from "@/lib/stellar";
+import { emitWebhookEvent } from "@/lib/webhooks/delivery";
 
 // PATCH /api/talos/:id/approvals/:approvalId — Approve/reject
 export async function PATCH(
@@ -105,6 +106,21 @@ export async function PATCH(
       })
       .where(eq(tlsApprovals.id, approvalId))
       .returning();
+
+    // Fire webhook event (non-blocking)
+    emitWebhookEvent({
+      type: `approval.${status}`,
+      talosId: id,
+      payload: {
+        approvalId,
+        type: existing.type,
+        title: existing.title,
+        amount: existing.amount,
+        status,
+        decidedBy,
+        txHash: approval.txHash,
+      },
+    }).catch(() => {});
 
     return Response.json(approval);
   } catch {

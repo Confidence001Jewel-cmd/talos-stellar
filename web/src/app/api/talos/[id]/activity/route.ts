@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { tlsTalos, tlsActivities } from "@/db/schema";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { verifyAgentApiKey } from "@/lib/auth";
+import { emitWebhookEvent } from "@/lib/webhooks/delivery";
 
 // GET /api/talos/:id/activity — Get activities
 export async function GET(
@@ -94,6 +95,18 @@ export async function POST(
         status: status ?? "completed",
       })
       .returning();
+
+    // Fire webhook event (non-blocking)
+    emitWebhookEvent({
+      type: `activity.${type}`,
+      talosId: id,
+      payload: {
+        activityId: activity.id,
+        type,
+        channel,
+        status: activity.status,
+      },
+    }).catch(() => {});
 
     return Response.json(activity, { status: 201 });
   } catch {
