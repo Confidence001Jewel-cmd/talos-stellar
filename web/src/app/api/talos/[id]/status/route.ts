@@ -23,7 +23,7 @@ async function handlePatch(
   const { id } = await params;
 
   try {
-    const auth = await verifyAgentApiKey(request, id);
+    const auth = await verifyAgentApiKey(request, id, ["settings:write"]);
     if (!auth.ok) return auth.response;
 
     const body = await request.json();

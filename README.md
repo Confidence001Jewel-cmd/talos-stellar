@@ -160,6 +160,7 @@ scripts\local-stack.bat up
 
 ## Security & Best Practices
 
+- **Scoped API Keys**: Agents use scoped API keys to access endpoints with least-privilege authorization. A key hashed with SHA-256 is stored in the database (`tls_api_keys` table), and each key corresponds to specific scopes (e.g., `commerce:write`, `wallet:sign`). The legacy `TALOS_API_KEY` acts as an "admin" scoped fallback. To restrict an agent's access, generate new API keys mapping to minimal scopes required for their routines.
 - Agent secret keys stored in `.env` can be encrypted at rest using a master password. Use the CLI to encrypt existing secrets:
 
 ```bash

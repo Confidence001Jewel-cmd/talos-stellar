@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { timingSafeEqual } from "crypto";
+import { createHash, timingSafeEqual } from "crypto";
 import { db } from "@/db";
 import { tlsTalos, tlsApiAuditLogs } from "@/db/schema";
 import { eq, desc } from "drizzle-orm";
@@ -27,8 +27,9 @@ import { logger } from "@/lib/logger";
 export async function verifyAgentApiKey(
   request: NextRequest,
   talosId: string,
+  requiredScopes: Scope[] = [],
 ): Promise<
-  | { ok: true; talos: { id: string; apiKey: string | null } }
+  | { ok: true; talos: { id: string } }
   | { ok: false; response: Response }
 > {
   const authHeader = request.headers.get("authorization");
@@ -44,9 +45,10 @@ export async function verifyAgentApiKey(
   }
 
   const token = authHeader.slice(7);
+  const tokenHash = hashApiKey(token);
 
   const talos = await db
-    .select({ id: tlsTalos.id, apiKey: tlsTalos.apiKey })
+    .select({ id: tlsTalos.id, legacyApiKey: tlsTalos.apiKey })
     .from(tlsTalos)
     .where(eq(tlsTalos.id, talosId))
     .limit(1)
@@ -59,23 +61,67 @@ export async function verifyAgentApiKey(
     };
   }
 
-  if (
-    !talos.apiKey ||
-    talos.apiKey.length !== token.length ||
-    !timingSafeEqual(Buffer.from(talos.apiKey), Buffer.from(token))
-  ) {
-    // Log failed auth attempt (fire-and-forget — never block the response)
-    writeAuditLog(talos.id, request, 403).catch(() => {});
+  // 1. Try to match a scoped key
+  const scopedKey = await db
+    .select({ id: tlsApiKeys.id, scopes: tlsApiKeys.scopes })
+    .from(tlsApiKeys)
+    .where(
+      and(
+        eq(tlsApiKeys.talosId, talosId),
+        eq(tlsApiKeys.keyHash, tokenHash),
+        eq(tlsApiKeys.status, "active")
+      )
+    )
+    .limit(1)
+    .then((r) => r[0] ?? null);
+
+  let authorized = false;
+  let hasRequiredScopes = false;
+
+  if (scopedKey) {
+    authorized = true;
+    // Update lastUsedAt in the background
+    db.update(tlsApiKeys)
+      .set({ lastUsedAt: new Date() })
+      .where(eq(tlsApiKeys.id, scopedKey.id))
+      .execute()
+      .catch(() => {});
+
+    hasRequiredScopes = requiredScopes.every(
+      (scope) =>
+        scopedKey.scopes.includes(scope) || scopedKey.scopes.includes("admin")
+    );
+  } else if (talos.legacyApiKey) {
+    // 2. Fallback to legacy API key
+    if (
+      talos.legacyApiKey.length === token.length &&
+      timingSafeEqual(Buffer.from(talos.legacyApiKey), Buffer.from(token))
+    ) {
+      authorized = true;
+      // Legacy keys are granted all scopes (admin equivalent) for backward compatibility
+      hasRequiredScopes = true;
+    }
+  }
+
+  if (!authorized) {
+    writeAuditLog(talos.id, request, 403, "invalid_key", requiredScopes).catch(() => {});
     return {
       ok: false,
       response: Response.json({ error: "Invalid API key" }, { status: 403 }),
     };
   }
 
-  // Log successful auth (fire-and-forget)
+  if (!hasRequiredScopes) {
+    writeAuditLog(talos.id, request, 403, "insufficient_scopes", requiredScopes).catch(() => {});
+    return {
+      ok: false,
+      response: Response.json({ error: "Insufficient scopes", required: requiredScopes }, { status: 403 }),
+    };
+  }
+
   writeAuditLog(talos.id, request, 200).catch(() => {});
 
-  return { ok: true, talos };
+  return { ok: true, talos: { id: talos.id } };
 }
 
 /**
@@ -92,6 +138,8 @@ async function writeAuditLog(
   talosId: string,
   request: NextRequest,
   statusCode: number,
+  denialReason?: string,
+  scopesRequired?: Scope[]
 ): Promise<void> {
   const ip =
     request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??

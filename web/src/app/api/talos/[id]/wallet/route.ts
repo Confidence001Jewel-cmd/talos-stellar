@@ -13,7 +13,7 @@ async function handleGet(
   const { id } = await params;
 
   try {
-    const auth = await verifyAgentApiKey(request, id);
+    const auth = await verifyAgentApiKey(request, id, ["wallet:read"]);
     if (!auth.ok) return auth.response;
 
     const talos = await db
