@@ -78,7 +78,16 @@ export async function verifyAgentApiKey(
   return { ok: true, talos };
 }
 
-/** Persist one audit log entry. Called fire-and-forget — must not throw. */
+/**
+ * Persist one audit log entry. Called fire-and-forget — must not throw.
+ *
+ * When JOBS_ENABLED=true, this durably enqueues the write instead of
+ * inserting directly: a transient DB error is retried with backoff by the
+ * job worker rather than silently dropping the audit entry, which is what
+ * the plain insert below does today (the caller's `.catch(() => {})`
+ * swallows the failure). Default is unchanged — direct insert — so this is
+ * purely additive until an operator opts in.
+ */
 async function writeAuditLog(
   talosId: string,
   request: NextRequest,
