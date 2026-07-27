@@ -311,6 +311,9 @@ stellar contract invoke --id "$GOVERNANCE_CONTRACT" --network testnet -- version
 | "Timelock enabled: action must be scheduled" | min_delay > 0 | Use `schedule_action` then `execute_action` |
 | "Timelock delay not met" | Executed before ETA | Wait for `eta` ledger timestamp |
 | "Proposal expired" | Executed after grace window | Re-schedule; old proposal is permanently expired |
+| "Domain is paused" / `ContractError::DomainPaused` | A guardian or the admin paused that write path | Wait for the pause to expire, or have the admin call `unpause` |
+| "Caller is not admin or guardian" | Non-authorized address called `pause` | Have the admin add the caller via `add_guardian`, or use the admin key |
+| "Domain locked by admin; guardians cannot modify" | A guardian tried to override an admin-set pause | Only the admin can change or lift it — call `unpause` with the admin key |
 
 ## Invoke Examples
 
@@ -856,8 +859,8 @@ Rolling back the pause control feature is straightforward — no storage migrati
 
 Both `TalosRegistry` and `TalosNameService` expose a `version()` entry-point that returns the contract's interface version as `(major: u32, minor: u32, patch: u32)`.
 
-Current version: **`(1, 1, 0)`**  
-_(minor bumped from `1.0.0` when timelock entry-points were added in this release)_
+Current version: **`(1, 2, 0)`**  
+_(minor bumped from `1.1.0` when the scoped emergency pause entry-points were added in this release)_
 
 ```bash
 # Query TalosRegistry version

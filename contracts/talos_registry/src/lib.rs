@@ -93,6 +93,46 @@ pub struct TimelockConfig {
     pub grace_period: u64,
 }
 
+/// A narrowly-scoped write path that can be independently paused.
+///
+/// Reads are never gated by any pause domain — `get_talos`, `is_active`,
+/// `next_talos_id`, etc. always reflect current state regardless of pause
+/// status. Administrative entry-points (`set_protocol_fee`, admin transfer,
+/// timelock management) are intentionally **not** pausable: they already
+/// carry their own admin-auth (and optional timelock) protection, and
+/// making them pausable would risk an admin permanently locking itself out.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PauseDomain {
+    TalosCreation,
+    PatronUpdates,
+    KernelUpdates,
+    PulseUpdates,
+    Deactivation,
+}
+
+/// Persisted record of an active pause on a single [`PauseDomain`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseState {
+    pub paused_by: Address,
+    pub paused_at: u64,
+    /// Unix timestamp after which the pause automatically lifts.
+    /// `0` means indefinite — only settable by the admin, never by a guardian.
+    pub expires_at: u64,
+}
+
+/// Computed, read-friendly view of a domain's pause status.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseInfo {
+    pub active: bool,
+    pub paused_by: Option<Address>,
+    pub paused_at: Option<u64>,
+    /// `None` when not paused, or when paused indefinitely by the admin.
+    pub expires_at: Option<u64>,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -212,6 +252,28 @@ fn emit_timelock_config_changed(
         .publish(topics, (old_min_delay, new_min_delay, grace_period));
 }
 
+/// Emitted when a domain is paused (or an existing pause is refreshed/extended).
+fn emit_pause_set(env: &Env, domain: &PauseDomain, actor: &Address, expires_at: u64) {
+    let topics = (symbol_short!("pause_on"), domain.clone());
+    env.events().publish(topics, (actor.clone(), expires_at));
+}
+
+/// Emitted when an admin lifts an active pause on a domain.
+fn emit_pause_cleared(env: &Env, domain: &PauseDomain, actor: &Address) {
+    let topics = (symbol_short!("pause_off"), domain.clone());
+    env.events().publish(topics, (actor.clone(),));
+}
+
+fn emit_guardian_added(env: &Env, guardian: Address) {
+    let topics = (symbol_short!("guard_add"),);
+    env.events().publish(topics, (guardian,));
+}
+
+fn emit_guardian_removed(env: &Env, guardian: Address) {
+    let topics = (symbol_short!("guard_rem"),);
+    env.events().publish(topics, (guardian,));
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 fn validate_patron_shares(patron: &Patron) {
@@ -221,12 +283,47 @@ fn validate_patron_shares(patron: &Patron) {
     }
 }
 
+// ── Emergency Pause Helpers ────────────────────────────────────────
+
+fn get_guardians(e: &Env) -> Vec<Address> {
+    e.storage()
+        .persistent()
+        .get(&DataKey::Guardians)
+        .unwrap_or(Vec::new(e))
+}
+
+fn is_guardian_internal(e: &Env, addr: &Address) -> bool {
+    get_guardians(e).iter().any(|g| g == *addr)
+}
+
+/// Evaluate whether `domain` is currently paused, lazily treating an expired
+/// (non-indefinite) pause record as inactive without mutating storage.
+fn is_domain_paused(e: &Env, domain: &PauseDomain) -> bool {
+    match e
+        .storage()
+        .persistent()
+        .get::<_, PauseState>(&DataKey::PauseState(domain.clone()))
+    {
+        None => false,
+        Some(state) => state.expires_at == 0 || e.ledger().timestamp() < state.expires_at,
+    }
+}
+
+fn require_not_paused(e: &Env, domain: PauseDomain) {
+    if is_domain_paused(e, &domain) {
+        panic!("Write path paused");
+    }
+}
+
 // ── Constants ───────────────────────────────────────────────────────
 
 const PROTOCOL_FEE_BPS: u32 = 300; // 3%
 const MAX_PROTOCOL_FEE_BPS: u32 = 10_000; // 100%
 const DEFAULT_GRACE_PERIOD: u64 = 604_800; // 7 days in seconds
 const MAX_MIN_DELAY: u64 = 2_592_000; // 30 days in seconds
+const MAX_GUARDIAN_PAUSE_SECS: u64 = 604_800; // 7 days — bounds guardian blast radius
+const MAX_ADMIN_PAUSE_SECS: u64 = 2_592_000; // 30 days; 0 (indefinite) is also allowed for admin
+const MAX_GUARDIANS: u32 = 10; // bounds unbounded storage growth
 
 // ── Storage schema migrations (see `storage_migration` crate) ────────
 
@@ -866,6 +963,227 @@ impl TalosRegistry {
         e.storage().persistent().get(&DataKey::PendingAdmin)
     }
 
+    // ── Emergency Pause Controls ──────────────────────────────────────
+
+    /// Pause a single write-path domain, blocking it while leaving all
+    /// reads and every other domain fully functional.
+    ///
+    /// # Authorization
+    /// `caller` must be either the current admin (`ProtocolWallet`) or a
+    /// registered guardian, and must sign the transaction.
+    ///
+    /// # Duration semantics
+    /// - Admin: `duration = 0` pauses indefinitely (only the admin can lift
+    ///   it later via `unpause`). A non-zero `duration` must not exceed
+    ///   [`MAX_ADMIN_PAUSE_SECS`].
+    /// - Guardian: `duration` must be non-zero and at most
+    ///   [`MAX_GUARDIAN_PAUSE_SECS`] — guardians can never impose an
+    ///   indefinite pause, bounding the damage a compromised guardian key
+    ///   can do.
+    ///
+    /// Calling `pause` again on an already-paused domain refreshes
+    /// (overwrites) the existing record — this is intentionally idempotent
+    /// so a retried or duplicated transaction is safe. The one exception:
+    /// a guardian may never overwrite a pause that the admin established
+    /// (see `Panics`), preventing a guardian from weakening an admin lock.
+    ///
+    /// # Panics
+    /// - `"Contract not initialized"` — if `initialize` has not been called.
+    /// - `"Caller is not admin or guardian"` — unauthorized caller.
+    /// - `"Domain locked by admin; guardians cannot modify"` — a guardian
+    ///   attempted to overwrite an admin-established pause.
+    /// - `"Duration exceeds admin maximum"` / `"Guardian pause duration out of bounds"`.
+    pub fn pause(e: Env, caller: Address, domain: PauseDomain, duration: u64) {
+        caller.require_auth();
+
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::ProtocolWallet)
+            .expect("Contract not initialized");
+
+        let is_admin_caller = caller == admin;
+        if !is_admin_caller && !is_guardian_internal(&e, &caller) {
+            panic!("Caller is not admin or guardian");
+        }
+
+        let key = DataKey::PauseState(domain.clone());
+
+        if !is_admin_caller {
+            if let Some(existing) = e.storage().persistent().get::<_, PauseState>(&key) {
+                if existing.paused_by == admin {
+                    panic!("Domain locked by admin; guardians cannot modify");
+                }
+            }
+        }
+
+        let now = e.ledger().timestamp();
+        let expires_at = if is_admin_caller {
+            if duration == 0 {
+                0
+            } else {
+                if duration > MAX_ADMIN_PAUSE_SECS {
+                    panic!("Duration exceeds admin maximum");
+                }
+                now.saturating_add(duration)
+            }
+        } else {
+            if duration == 0 || duration > MAX_GUARDIAN_PAUSE_SECS {
+                panic!("Guardian pause duration out of bounds");
+            }
+            now.saturating_add(duration)
+        };
+
+        e.storage().persistent().set(
+            &key,
+            &PauseState {
+                paused_by: caller.clone(),
+                paused_at: now,
+                expires_at,
+            },
+        );
+
+        emit_pause_set(&e, &domain, &caller, expires_at);
+    }
+
+    /// Lift an active pause on `domain`.
+    ///
+    /// Idempotent: if the domain has no active pause record (never paused,
+    /// already lifted, or already expired), this is a deterministic no-op —
+    /// it does not panic, so duplicate or retried `unpause` calls are safe.
+    ///
+    /// # Authorization
+    /// Only the current admin (`ProtocolWallet`) may unpause, regardless of
+    /// whether the pause was originally set by the admin or a guardian.
+    ///
+    /// # Panics
+    /// - `"Contract not initialized"` — if `initialize` has not been called.
+    pub fn unpause(e: Env, domain: PauseDomain) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::ProtocolWallet)
+            .expect("Contract not initialized");
+        admin.require_auth();
+
+        let key = DataKey::PauseState(domain.clone());
+        if e.storage().persistent().get::<_, PauseState>(&key).is_none() {
+            return;
+        }
+
+        e.storage().persistent().remove(&key);
+        emit_pause_cleared(&e, &domain, &admin);
+    }
+
+    /// Returns `true` if `domain` is currently paused (and its pause has not
+    /// yet expired). Never requires authorization — this is a read.
+    pub fn is_paused(e: Env, domain: PauseDomain) -> bool {
+        is_domain_paused(&e, &domain)
+    }
+
+    /// Full observability view of a domain's pause status: who paused it,
+    /// when, and when it expires (or `None` for indefinite/unpaused).
+    pub fn pause_info(e: Env, domain: PauseDomain) -> PauseInfo {
+        match e
+            .storage()
+            .persistent()
+            .get::<_, PauseState>(&DataKey::PauseState(domain.clone()))
+        {
+            None => PauseInfo {
+                active: false,
+                paused_by: None,
+                paused_at: None,
+                expires_at: None,
+            },
+            Some(state) => {
+                let active = state.expires_at == 0 || e.ledger().timestamp() < state.expires_at;
+                PauseInfo {
+                    active,
+                    paused_by: Some(state.paused_by),
+                    paused_at: Some(state.paused_at),
+                    expires_at: if state.expires_at == 0 {
+                        None
+                    } else {
+                        Some(state.expires_at)
+                    },
+                }
+            }
+        }
+    }
+
+    /// Register a guardian address authorized to trigger (but never lift)
+    /// bounded-duration pauses. Bounded to [`MAX_GUARDIANS`] entries.
+    ///
+    /// Idempotent: adding an already-registered guardian is a no-op.
+    ///
+    /// # Authorization
+    /// Requires current admin (`ProtocolWallet`) authorization.
+    pub fn add_guardian(e: Env, guardian: Address) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::ProtocolWallet)
+            .expect("Contract not initialized");
+        admin.require_auth();
+
+        let mut guardians = get_guardians(&e);
+        if guardians.iter().any(|g| g == guardian) {
+            return;
+        }
+        if guardians.len() >= MAX_GUARDIANS {
+            panic!("Guardian limit reached");
+        }
+
+        guardians.push_back(guardian.clone());
+        e.storage().persistent().set(&DataKey::Guardians, &guardians);
+        emit_guardian_added(&e, guardian);
+    }
+
+    /// Revoke a guardian's pause authority.
+    ///
+    /// Idempotent: removing an address that is not a guardian is a no-op.
+    /// Does not affect any pause the guardian already set — use `unpause`
+    /// (admin-only) to lift it explicitly.
+    ///
+    /// # Authorization
+    /// Requires current admin (`ProtocolWallet`) authorization.
+    pub fn remove_guardian(e: Env, guardian: Address) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::ProtocolWallet)
+            .expect("Contract not initialized");
+        admin.require_auth();
+
+        let guardians = get_guardians(&e);
+        let mut remaining = Vec::new(&e);
+        let mut found = false;
+        for g in guardians.iter() {
+            if g == guardian {
+                found = true;
+                continue;
+            }
+            remaining.push_back(g);
+        }
+
+        if !found {
+            return;
+        }
+
+        e.storage().persistent().set(&DataKey::Guardians, &remaining);
+        emit_guardian_removed(&e, guardian);
+    }
+
+    /// Check whether `addr` currently holds guardian pause authority.
+    pub fn is_guardian(e: Env, addr: Address) -> bool {
+        is_guardian_internal(&e, &addr)
+    }
+
+    /// List all currently registered guardians (bounded to `MAX_GUARDIANS`).
+    pub fn list_guardians(e: Env) -> Vec<Address> {
+        get_guardians(&e)
+    }
+
     /// Return the contract's interface version as `(major, minor, patch)`.
     ///
     /// The value is a compile-time constant baked into the WASM binary.
@@ -1248,7 +1566,7 @@ mod tests {
     fn version_returns_compile_time_constant() {
         let (env, contract_id) = setup();
         let client = TalosRegistryClient::new(&env, &contract_id);
-        assert_eq!(client.version(), (1u32, 1u32, 0u32));
+        assert_eq!(client.version(), (1u32, 2u32, 0u32));
     }
 
     #[test]

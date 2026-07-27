@@ -53,6 +53,40 @@ pub struct TimelockConfig {
     pub grace_period: u64,
 }
 
+/// A narrowly-scoped write path that can be independently paused.
+///
+/// Reads (`resolve_name`, `name_of`, `is_name_available`, `has_name`) are
+/// never gated by any pause domain. Admin entry-points (`set_registry_contract`,
+/// timelock management) are intentionally not pausable — they already carry
+/// their own admin-auth (and optional timelock) protection.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PauseDomain {
+    NameRegistration,
+}
+
+/// Persisted record of an active pause on a single [`PauseDomain`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseState {
+    pub paused_by: Address,
+    pub paused_at: u64,
+    /// Unix timestamp after which the pause automatically lifts.
+    /// `0` means indefinite — only settable by the admin, never by a guardian.
+    pub expires_at: u64,
+}
+
+/// Computed, read-friendly view of a domain's pause status.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseInfo {
+    pub active: bool,
+    pub paused_by: Option<Address>,
+    pub paused_at: Option<u64>,
+    /// `None` when not paused, or when paused indefinitely by the admin.
+    pub expires_at: Option<u64>,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -72,6 +106,11 @@ pub enum ContractError {
     AlreadyInitialized = 1,
     UnauthorizedCaller = 2,
     TimelockEnabled = 3,
+    DomainPaused = 4,
+    NotAdminOrGuardian = 5,
+    DomainLockedByAdmin = 6,
+    InvalidPauseDuration = 7,
+    GuardianLimitReached = 8,
 }
 
 // ── Events ──────────────────────────────────────────────────────────
@@ -147,8 +186,63 @@ fn emit_timelock_config_changed(
         .publish(topics, (old_min_delay, new_min_delay, grace_period));
 }
 
+fn emit_pause_set(env: &Env, domain: &PauseDomain, actor: &Address, expires_at: u64) {
+    let topics = (symbol_short!("pause_on"), domain.clone());
+    env.events().publish(topics, (actor.clone(), expires_at));
+}
+
+fn emit_pause_cleared(env: &Env, domain: &PauseDomain, actor: &Address) {
+    let topics = (symbol_short!("pause_off"), domain.clone());
+    env.events().publish(topics, (actor.clone(),));
+}
+
+fn emit_guardian_added(env: &Env, guardian: Address) {
+    let topics = (symbol_short!("guard_add"),);
+    env.events().publish(topics, (guardian,));
+}
+
+fn emit_guardian_removed(env: &Env, guardian: Address) {
+    let topics = (symbol_short!("guard_rem"),);
+    env.events().publish(topics, (guardian,));
+}
+
+// ── Emergency Pause Helpers ────────────────────────────────────────
+
+fn get_guardians(e: &Env) -> Vec<Address> {
+    e.storage()
+        .persistent()
+        .get(&DataKey::Guardians)
+        .unwrap_or(Vec::new(e))
+}
+
+fn is_guardian_internal(e: &Env, addr: &Address) -> bool {
+    get_guardians(e).iter().any(|g| g == *addr)
+}
+
+/// Evaluate whether `domain` is currently paused, lazily treating an expired
+/// (non-indefinite) pause record as inactive without mutating storage.
+fn is_domain_paused(e: &Env, domain: &PauseDomain) -> bool {
+    match e
+        .storage()
+        .persistent()
+        .get::<_, PauseState>(&DataKey::PauseState(domain.clone()))
+    {
+        None => false,
+        Some(state) => state.expires_at == 0 || e.ledger().timestamp() < state.expires_at,
+    }
+}
+
+fn require_not_paused(e: &Env, domain: PauseDomain) {
+    if is_domain_paused(e, &domain) {
+        panic_with_error!(e, ContractError::DomainPaused);
+    }
+}
+
 const DEFAULT_GRACE_PERIOD: u64 = 604_800; // 7 days in seconds
 const MAX_MIN_DELAY: u64 = 2_592_000; // 30 days in seconds
+const MAX_GUARDIAN_PAUSE_SECS: u64 = 604_800; // 7 days — bounds guardian blast radius
+const MAX_ADMIN_PAUSE_SECS: u64 = 2_592_000; // 30 days; 0 (indefinite) is also allowed for admin
+const MAX_GUARDIANS: u32 = 10; // bounds unbounded storage growth
 
 // ── Stable interface (v1.x.x) ──────────────────────────────────────
 //
@@ -733,6 +827,193 @@ impl TalosNameService {
             .get(&DataKey::TimelockProposal(proposal_id))
     }
 
+    // ── Emergency Pause Controls ──────────────────────────────────────
+
+    /// Pause a single write-path domain, blocking it while leaving all
+    /// reads fully functional. See `TalosRegistry::pause` for full semantics
+    /// (duration rules, idempotency, admin-lock protection) — identical here.
+    ///
+    /// # Panics
+    /// - `Admin not configured` — if `set_admin` has not been called.
+    /// - `ContractError::NotAdminOrGuardian` — unauthorized caller.
+    /// - `ContractError::DomainLockedByAdmin` — a guardian attempted to
+    ///   overwrite an admin-established pause.
+    /// - `ContractError::InvalidPauseDuration` — duration out of bounds.
+    pub fn pause(e: Env, caller: Address, domain: PauseDomain, duration: u64) {
+        caller.require_auth();
+
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Admin not configured");
+
+        let is_admin_caller = caller == admin;
+        if !is_admin_caller && !is_guardian_internal(&e, &caller) {
+            panic_with_error!(&e, ContractError::NotAdminOrGuardian);
+        }
+
+        let key = DataKey::PauseState(domain.clone());
+
+        if !is_admin_caller {
+            if let Some(existing) = e.storage().persistent().get::<_, PauseState>(&key) {
+                if existing.paused_by == admin {
+                    panic_with_error!(&e, ContractError::DomainLockedByAdmin);
+                }
+            }
+        }
+
+        let now = e.ledger().timestamp();
+        let expires_at = if is_admin_caller {
+            if duration == 0 {
+                0
+            } else {
+                if duration > MAX_ADMIN_PAUSE_SECS {
+                    panic_with_error!(&e, ContractError::InvalidPauseDuration);
+                }
+                now.saturating_add(duration)
+            }
+        } else {
+            if duration == 0 || duration > MAX_GUARDIAN_PAUSE_SECS {
+                panic_with_error!(&e, ContractError::InvalidPauseDuration);
+            }
+            now.saturating_add(duration)
+        };
+
+        e.storage().persistent().set(
+            &key,
+            &PauseState {
+                paused_by: caller.clone(),
+                paused_at: now,
+                expires_at,
+            },
+        );
+
+        emit_pause_set(&e, &domain, &caller, expires_at);
+    }
+
+    /// Lift an active pause on `domain`. Idempotent no-op if not paused.
+    ///
+    /// # Authorization
+    /// Only the current admin may unpause, regardless of who set the pause.
+    pub fn unpause(e: Env, domain: PauseDomain) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Admin not configured");
+        admin.require_auth();
+
+        let key = DataKey::PauseState(domain.clone());
+        if e.storage().persistent().get::<_, PauseState>(&key).is_none() {
+            return;
+        }
+
+        e.storage().persistent().remove(&key);
+        emit_pause_cleared(&e, &domain, &admin);
+    }
+
+    /// Returns `true` if `domain` is currently paused (and not yet expired).
+    pub fn is_paused(e: Env, domain: PauseDomain) -> bool {
+        is_domain_paused(&e, &domain)
+    }
+
+    /// Full observability view of a domain's pause status.
+    pub fn pause_info(e: Env, domain: PauseDomain) -> PauseInfo {
+        match e
+            .storage()
+            .persistent()
+            .get::<_, PauseState>(&DataKey::PauseState(domain.clone()))
+        {
+            None => PauseInfo {
+                active: false,
+                paused_by: None,
+                paused_at: None,
+                expires_at: None,
+            },
+            Some(state) => {
+                let active = state.expires_at == 0 || e.ledger().timestamp() < state.expires_at;
+                PauseInfo {
+                    active,
+                    paused_by: Some(state.paused_by),
+                    paused_at: Some(state.paused_at),
+                    expires_at: if state.expires_at == 0 {
+                        None
+                    } else {
+                        Some(state.expires_at)
+                    },
+                }
+            }
+        }
+    }
+
+    /// Register a guardian address authorized to trigger (but never lift)
+    /// bounded-duration pauses. Idempotent; bounded to `MAX_GUARDIANS`.
+    ///
+    /// # Authorization
+    /// Requires current admin authorization.
+    pub fn add_guardian(e: Env, guardian: Address) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Admin not configured");
+        admin.require_auth();
+
+        let mut guardians = get_guardians(&e);
+        if guardians.iter().any(|g| g == guardian) {
+            return;
+        }
+        if guardians.len() >= MAX_GUARDIANS {
+            panic_with_error!(&e, ContractError::GuardianLimitReached);
+        }
+
+        guardians.push_back(guardian.clone());
+        e.storage().persistent().set(&DataKey::Guardians, &guardians);
+        emit_guardian_added(&e, guardian);
+    }
+
+    /// Revoke a guardian's pause authority. Idempotent.
+    ///
+    /// # Authorization
+    /// Requires current admin authorization.
+    pub fn remove_guardian(e: Env, guardian: Address) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Admin not configured");
+        admin.require_auth();
+
+        let guardians = get_guardians(&e);
+        let mut remaining = Vec::new(&e);
+        let mut found = false;
+        for g in guardians.iter() {
+            if g == guardian {
+                found = true;
+                continue;
+            }
+            remaining.push_back(g);
+        }
+
+        if !found {
+            return;
+        }
+
+        e.storage().persistent().set(&DataKey::Guardians, &remaining);
+        emit_guardian_removed(&e, guardian);
+    }
+
+    /// Check whether `addr` currently holds guardian pause authority.
+    pub fn is_guardian(e: Env, addr: Address) -> bool {
+        is_guardian_internal(&e, &addr)
+    }
+
+    /// List all currently registered guardians (bounded to `MAX_GUARDIANS`).
+    pub fn list_guardians(e: Env) -> Vec<Address> {
+        get_guardians(&e)
+    }
+
     /// Resolve a name to a Talos ID.
     /// Returns None if the name doesn't exist.
     pub fn resolve_name(e: Env, name: String) -> Option<u32> {
@@ -1223,7 +1504,7 @@ mod tests {
     #[test]
     fn version_returns_compile_time_constant() {
         let (_env, _registry_contract, _contract_id, _registry_client, client) = setup();
-        assert_eq!(client.version(), (1u32, 1u32, 0u32));
+        assert_eq!(client.version(), (1u32, 2u32, 0u32));
     }
 
     #[test]
