@@ -2,7 +2,8 @@ import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { tlsTalos, tlsPatrons, tlsRevenues, tlsDividends } from "@/db/schema";
 import { eq, and, sum } from "drizzle-orm";
-import { OPERATOR_PUBLIC_KEY, USDC_ISSUER } from "@/lib/stellar-config";
+import { USDC_ISSUER } from "@/lib/stellar-config";
+import { verifyAgentApiKey } from "@/lib/auth";
 
 
 /**
@@ -11,9 +12,7 @@ import { OPERATOR_PUBLIC_KEY, USDC_ISSUER } from "@/lib/stellar-config";
  * Distribute accumulated treasury USDC to Mitos holders proportionally.
  * Requires STELLAR_OPERATOR_SECRET_KEY (operator holds agent treasury for now).
  *
- * Body: { requesterPublicKey } — must be creator or operator
- *
- * Returns: list of transfers executed
+ * Auth: Bearer token with revenue:write scope (scoped key or legacy).
  */
 export async function POST(
   request: NextRequest,
@@ -22,21 +21,11 @@ export async function POST(
   const { id } = await params;
 
   try {
-    const body = await request.json();
-    const { requesterPublicKey } = body as { requesterPublicKey?: string };
-
-    if (!requesterPublicKey) {
-      return Response.json({ error: "requesterPublicKey is required" }, { status: 400 });
-    }
+    const auth = await verifyAgentApiKey(request, id, ["revenue:write"]);
+    if (!auth.ok) return auth.response;
 
     const talos = await db.query.tlsTalos.findFirst({ where: eq(tlsTalos.id, id) });
     if (!talos) return Response.json({ error: "TALOS not found" }, { status: 404 });
-
-    // Only creator or operator can distribute
-    const OPERATOR = OPERATOR_PUBLIC_KEY;
-    if (requesterPublicKey !== talos.creatorPublicKey && requesterPublicKey !== OPERATOR) {
-      return Response.json({ error: "Only the creator or operator can trigger distribution" }, { status: 403 });
-    }
 
     // Calculate total revenue
     const revenueResult = await db

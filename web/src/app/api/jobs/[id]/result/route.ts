@@ -1,26 +1,11 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
-import { tlsTalos, tlsCommerceJobs, tlsRevenues, tlsCommerceServices } from "@/db/schema";
+import { tlsCommerceJobs, tlsRevenues, tlsCommerceServices } from "@/db/schema";
 import { eq } from "drizzle-orm";
-
-/**
- * Resolve the caller's TALOS ID from their Bearer API key.
- * Returns null if auth is missing or invalid.
- */
-async function resolveCallerTalos(request: NextRequest): Promise<string | null> {
-  const authHeader = request.headers.get("authorization");
-  if (!authHeader?.startsWith("Bearer ")) return null;
-  const token = authHeader.slice(7);
-  const talos = await db
-    .select({ id: tlsTalos.id })
-    .from(tlsTalos)
-    .where(eq(tlsTalos.apiKey, token))
-    .limit(1)
-    .then((r) => r[0] ?? null);
-  return talos?.id ?? null;
-}
+import { resolveTalosFromRequest } from "@/lib/auth";
 
 // POST /api/jobs/:id/result — Submit job result (from service provider agent)
+// Requires commerce:write scope.
 export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -28,10 +13,8 @@ export async function POST(
   const { id } = await params;
 
   try {
-    const callerTalosId = await resolveCallerTalos(request);
-    if (!callerTalosId) {
-      return Response.json({ error: "Missing or invalid Authorization" }, { status: 401 });
-    }
+    const auth = await resolveTalosFromRequest(request, ["commerce:write"]);
+    if (!auth.ok) return auth.response;
 
     const body = await request.json();
     const { result } = body;
@@ -52,7 +35,7 @@ export async function POST(
     }
 
     // Only the service provider TALOS can submit results
-    if (job.talosId !== callerTalosId) {
+    if (job.talosId !== auth.talos.id) {
       return Response.json({ error: "Not authorized to fulfill this job" }, { status: 403 });
     }
 
@@ -62,8 +45,6 @@ export async function POST(
     }
 
     const updated = await db.transaction(async (tx) => {
-      // Use a WHERE status='pending' predicate so that a concurrent request
-      // racing through at the same instant will update 0 rows and skip revenue.
       const [updatedJob] = await tx
         .update(tlsCommerceJobs)
         .set({
@@ -73,7 +54,6 @@ export async function POST(
         .where(eq(tlsCommerceJobs.id, id))
         .returning();
 
-      // updatedJob is undefined when a concurrent call already completed the job
       if (!updatedJob) {
         return null;
       }
@@ -107,6 +87,7 @@ export async function POST(
 }
 
 // GET /api/jobs/:id/result — Poll for job result (from requester agent)
+// Requires commerce:read scope.
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -114,10 +95,8 @@ export async function GET(
   const { id } = await params;
 
   try {
-    const callerTalosId = await resolveCallerTalos(request);
-    if (!callerTalosId) {
-      return Response.json({ error: "Missing or invalid Authorization" }, { status: 401 });
-    }
+    const auth = await resolveTalosFromRequest(request, ["commerce:read"]);
+    if (!auth.ok) return auth.response;
 
     const job = await db
       .select()
@@ -131,7 +110,7 @@ export async function GET(
     }
 
     // Only the provider or requester can view results
-    if (job.talosId !== callerTalosId && job.requesterTalosId !== callerTalosId) {
+    if (job.talosId !== auth.talos.id && job.requesterTalosId !== auth.talos.id) {
       return Response.json({ error: "Not authorized to view this job" }, { status: 403 });
     }
 
