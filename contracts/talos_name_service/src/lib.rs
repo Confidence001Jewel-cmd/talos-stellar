@@ -63,6 +63,7 @@ pub enum DataKey {
     TimelockProposal(u64),
     NextTimelockId,
     LastTouched(u32),
+    NameFeeAmount,
 }
 
 #[contracterror]
@@ -133,6 +134,17 @@ fn emit_timelock_config_changed(
     let topics = (symbol_short!("tl_cfg"),);
     env.events()
         .publish(topics, (old_min_delay, new_min_delay, grace_period));
+}
+
+fn emit_name_fee_paid(
+    env: &Env,
+    talos_id: u32,
+    payer: &Address,
+    asset: &Address,
+    amount: i128,
+) {
+    let topics = (symbol_short!("nm_fee"), talos_id);
+    env.events().publish(topics, (payer.clone(), asset.clone(), amount));
 }
 
 const DEFAULT_GRACE_PERIOD: u64 = 604_800; // 7 days in seconds
@@ -718,6 +730,7 @@ mod property_tests {
         Env,
         Address,
         Address,
+        Address,
         talos_registry::TalosRegistryClient<'static>,
         TalosNameServiceClient<'static>,
     ) {
@@ -725,12 +738,14 @@ mod property_tests {
         let registry_contract = env.register_contract(None, talos_registry::TalosRegistry);
         let name_service_contract = env.register_contract(None, TalosNameService);
         let name_service_client = TalosNameServiceClient::new(&env, &name_service_contract);
-        name_service_client.initialize(&registry_contract);
+        let admin = Address::generate(&env);
+        name_service_client.initialize(&registry_contract, &admin, &0i128);
         let registry_client = talos_registry::TalosRegistryClient::new(&env, &registry_contract);
         (
             env,
             registry_contract,
             name_service_contract,
+            admin,
             registry_client,
             name_service_client,
         )
@@ -818,7 +833,7 @@ mod property_tests {
 
     #[test]
     fn state_machine_register_name_preserves_invariants() {
-        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let (env, registry_contract, contract_id, _admin, registry_client, client) = setup();
         let owner = Address::generate(&env);
         let protocol_wallet = Address::generate(&env);
         let talos_id = create_talos_with_auth(&env, &registry_client, &registry_contract, &owner, &protocol_wallet);
@@ -1049,7 +1064,7 @@ mod tests {
 
     #[test]
     fn version_returns_compile_time_constant() {
-        let (_env, _registry_contract, _contract_id, _registry_client, client) = setup();
+        let (_env, _registry_contract, _contract_id, _admin, _registry_client, client) = setup();
         assert_eq!(client.version(), (1u32, 2u32, 0u32));
     }
 
@@ -1416,7 +1431,7 @@ mod tests {
     }
     #[test]
     fn has_name_returns_false_for_unknown_talos_id() {
-        let (_env, _registry_contract, _contract_id, _registry_client, client) = setup();
+        let (_env, _registry_contract, _contract_id, _admin, _registry_client, client) = setup();
 
         // talos_id = 999 does not exist
         assert!(!client.has_name(&999));
@@ -1424,7 +1439,7 @@ mod tests {
 
     #[test]
     fn name_of_returns_none_for_unknown_talos_id() {
-        let (_env, _registry_contract, _contract_id, _registry_client, client) = setup();
+        let (_env, _registry_contract, _contract_id, _admin, _registry_client, client) = setup();
 
         assert!(client.name_of(&999).is_none());
     }
@@ -1435,7 +1450,7 @@ mod tests {
 
     #[test]
     fn name_service_timelock_schedule_execute_registry_update() {
-        let (env, _registry_contract, contract_id, _registry_client, client) = setup();
+        let (env, _registry_contract, contract_id, _admin, _registry_client, client) = setup();
         let admin = Address::generate(&env);
         client.set_admin(&admin);
 
@@ -1484,7 +1499,7 @@ mod tests {
 
     #[test]
     fn name_service_timelock_direct_call_guarded() {
-        let (env, _registry_contract, contract_id, _registry_client, client) = setup();
+        let (env, _registry_contract, contract_id, _admin, _registry_client, client) = setup();
         let admin = Address::generate(&env);
         client.set_admin(&admin);
 
@@ -1518,7 +1533,7 @@ mod tests {
 
     #[test]
     fn name_service_timelock_cancellation() {
-        let (env, _registry_contract, contract_id, _registry_client, client) = setup();
+        let (env, _registry_contract, contract_id, _admin, _registry_client, client) = setup();
         let admin = Address::generate(&env);
         client.set_admin(&admin);
 
@@ -1594,7 +1609,7 @@ mod tests {
 
     #[test]
     fn rejected_duplicate_registration_leaves_storage_and_events_unchanged() {
-        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let (env, registry_contract, contract_id, _admin, registry_client, client) = setup();
         let owner = Address::generate(&env);
         let second_owner = Address::generate(&env);
         let protocol_wallet = Address::generate(&env);
@@ -1641,7 +1656,7 @@ mod tests {
 
     #[test]
     fn rejected_unauthorized_registration_leaves_storage_and_events_unchanged() {
-        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let (env, registry_contract, contract_id, _admin, registry_client, client) = setup();
         let creator = Address::generate(&env);
         let unauthorized = Address::generate(&env);
         let protocol_wallet = Address::generate(&env);
@@ -1683,7 +1698,7 @@ mod tests {
 
     #[test]
     fn rejected_invalid_name_leaves_storage_and_events_unchanged() {
-        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let (env, registry_contract, contract_id, _admin, registry_client, client) = setup();
         let owner = Address::generate(&env);
         let protocol_wallet = Address::generate(&env);
         let invalid_name = s(&env, "Bad--Name-");
@@ -1719,7 +1734,7 @@ mod tests {
 
     #[test]
     fn cross_contract_unknown_talos_id_rejected_leaves_storage_and_events_unchanged() {
-        let (env, registry_contract, contract_id, _registry_client, client) = setup();
+        let (env, registry_contract, contract_id, _admin, _registry_client, client) = setup();
         let owner = Address::generate(&env);
         let name = s(&env, "ghost-agent");
         let unknown_talos_id = 999u32;
@@ -1790,7 +1805,7 @@ mod tests {
 
     #[test]
     fn freed_name_can_be_reregistered_by_a_different_talos_and_owner() {
-        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let (env, registry_contract, contract_id, _admin, registry_client, client) = setup();
         let owner_a = Address::generate(&env);
         let owner_b = Address::generate(&env);
         let protocol_wallet = Address::generate(&env);
@@ -1830,7 +1845,7 @@ mod tests {
 
     #[test]
     fn uniqueness_invariant_holds_across_repeated_renames() {
-        let (env, registry_contract, contract_id, registry_client, client) = setup();
+        let (env, registry_contract, contract_id, _admin, registry_client, client) = setup();
         let owner = Address::generate(&env);
         let protocol_wallet = Address::generate(&env);
         let talos_id = create_talos_with_auth(

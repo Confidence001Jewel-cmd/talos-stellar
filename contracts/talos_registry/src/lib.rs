@@ -209,6 +209,16 @@ fn emit_timelock_config_changed(
         .publish(topics, (old_min_delay, new_min_delay, grace_period));
 }
 
+fn emit_allowlist_added(env: &Env, asset: Address, admin: Address) {
+    let topics = (symbol_short!("al_add"), asset.clone());
+    env.events().publish(topics, admin);
+}
+
+fn emit_allowlist_removed(env: &Env, asset: Address, admin: Address) {
+    let topics = (symbol_short!("al_rem"), asset.clone());
+    env.events().publish(topics, admin);
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 fn validate_patron_shares(patron: &Patron) {
@@ -821,6 +831,52 @@ impl TalosRegistry {
             .unwrap_or(PROTOCOL_FEE_BPS);
 
         amount * fee_bps as i128 / MAX_PROTOCOL_FEE_BPS as i128
+    }
+
+    // ── Allowlist Management ──────────────────────────────────────
+
+    /// Check whether an asset is allowlisted for value-transfer operations.
+    ///
+    /// This is a read-only entry-point and does not require authorization.
+    /// Returns `true` if the asset is currently allowlisted, `false` otherwise.
+    pub fn is_asset_allowed(e: Env, asset: Address) -> bool {
+        crate::allowlist::AssetAllowlist::is_allowed(&e, &asset)
+    }
+
+    /// Add an asset to the allowlist.
+    ///
+    /// # Authorization
+    /// Requires the current protocol wallet (admin) to sign the transaction.
+    ///
+    /// # Panics
+    /// - `"Contract not initialized"` — if `initialize` has not been called.
+    pub fn add_asset_to_allowlist(e: Env, asset: Address) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::ProtocolWallet)
+            .expect("Contract not initialized");
+        admin.require_auth();
+        crate::allowlist::AssetAllowlist::add(&e, &admin, &asset);
+        emit_allowlist_added(&e, asset, admin);
+    }
+
+    /// Remove an asset from the allowlist.
+    ///
+    /// # Authorization
+    /// Requires the current protocol wallet (admin) to sign the transaction.
+    ///
+    /// # Panics
+    /// - `"Contract not initialized"` — if `initialize` has not been called.
+    pub fn remove_asset_from_allowlist(e: Env, asset: Address) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::ProtocolWallet)
+            .expect("Contract not initialized");
+        admin.require_auth();
+        crate::allowlist::AssetAllowlist::remove(&e, &admin, &asset);
+        emit_allowlist_removed(&e, asset, admin);
     }
 
     // ── Storage TTL Management ───────────────────────────────────
@@ -2209,5 +2265,241 @@ mod tests {
             }])
             .try_propose_admin(&new_admin);
         assert!(res_prop.is_err());
+    }
+
+    // ── Allowlist tests ──────────────────────────────────────────
+
+    #[test]
+    fn allowlist_new_asset_defaults_to_denied() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let asset = Address::generate(&env);
+        client.initialize(&admin);
+
+        // Before being added, asset must report as NOT allowed.
+        assert_eq!(client.is_asset_allowed(&asset), false);
+    }
+
+    #[test]
+    fn allowlist_admin_add_marks_asset_allowed() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let asset_a = Address::generate(&env);
+        let asset_b = Address::generate(&env);
+        client.initialize(&admin);
+
+        // Sanity: neither is allowed yet.
+        assert_eq!(client.is_asset_allowed(&asset_a), false);
+        assert_eq!(client.is_asset_allowed(&asset_b), false);
+
+        // Admin allowlists asset_a.
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "add_asset_to_allowlist",
+                    args: (asset_a.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .add_asset_to_allowlist(&asset_a);
+
+        // After add: asset_a is allowed, asset_b is still denied.
+        assert_eq!(client.is_asset_allowed(&asset_a), true);
+        assert_eq!(client.is_asset_allowed(&asset_b), false);
+    }
+
+    #[test]
+    fn allowlist_admin_remove_revokes_asset() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let asset = Address::generate(&env);
+        client.initialize(&admin);
+
+        // 1. Add → allowed.
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "add_asset_to_allowlist",
+                    args: (asset.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .add_asset_to_allowlist(&asset);
+        assert_eq!(client.is_asset_allowed(&asset), true);
+
+        // 2. Remove → denied again.
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "remove_asset_from_allowlist",
+                    args: (asset.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .remove_asset_from_allowlist(&asset);
+        assert_eq!(client.is_asset_allowed(&asset), false);
+    }
+
+    #[test]
+    fn allowlist_add_rejects_unauthorized_caller() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let asset = Address::generate(&env);
+        client.initialize(&admin);
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &attacker,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "add_asset_to_allowlist",
+                    args: (asset.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_add_asset_to_allowlist(&asset);
+
+        assert!(res.is_err());
+        // State must be unchanged: asset still not allowed.
+        assert_eq!(client.is_asset_allowed(&asset), false);
+    }
+
+    #[test]
+    fn allowlist_remove_rejects_unauthorized_caller() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let asset = Address::generate(&env);
+        client.initialize(&admin);
+
+        // Admin adds the asset first.
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "add_asset_to_allowlist",
+                    args: (asset.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .add_asset_to_allowlist(&asset);
+        assert_eq!(client.is_asset_allowed(&asset), true);
+
+        // Attacker cannot remove it.
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &attacker,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "remove_asset_from_allowlist",
+                    args: (asset.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_remove_asset_from_allowlist(&asset);
+        assert!(res.is_err());
+
+        // State unchanged: asset remains allowed.
+        assert_eq!(client.is_asset_allowed(&asset), true);
+    }
+
+    #[test]
+    fn allowlist_add_emits_al_add_event() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let asset = Address::generate(&env);
+        client.initialize(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "add_asset_to_allowlist",
+                    args: (asset.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .add_asset_to_allowlist(&asset);
+
+        let events = env.events().all();
+        // `initialize` does not emit, `add_asset_to_allowlist` emits one.
+        let al_events = events
+            .iter()
+            .filter(|(addr, _topics, _data)| *addr == contract_id)
+            .collect::<std::vec::Vec<_>>();
+        assert_eq!(al_events.len(), 1);
+        let (_addr, topics, data) = al_events.get(0).unwrap();
+        assert_eq!(topics.len(), 2);
+        let t0: Symbol = TryFromVal::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+        let t1: Address = TryFromVal::try_from_val(&env, &topics.get(1).unwrap()).unwrap();
+        assert_eq!(t0, symbol_short!("al_add"));
+        assert_eq!(t1, asset);
+        let got_admin: Address = TryFromVal::try_from_val(&env, data).unwrap();
+        assert_eq!(got_admin, admin);
+    }
+
+    #[test]
+    fn allowlist_remove_emits_al_rem_event() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let asset = Address::generate(&env);
+        client.initialize(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "add_asset_to_allowlist",
+                    args: (asset.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .add_asset_to_allowlist(&asset);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "remove_asset_from_allowlist",
+                    args: (asset.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .remove_asset_from_allowlist(&asset);
+
+        let events = env.events().all();
+        let al_events = events
+            .iter()
+            .filter(|(addr, _topics, _data)| *addr == contract_id)
+            .collect::<std::vec::Vec<_>>();
+        // One add event, one remove event.
+        assert_eq!(al_events.len(), 2);
+        // Last event is removal.
+        let (_addr, topics, data) = al_events.get(1).unwrap();
+        assert_eq!(topics.len(), 2);
+        let t0: Symbol = TryFromVal::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+        let t1: Address = TryFromVal::try_from_val(&env, &topics.get(1).unwrap()).unwrap();
+        assert_eq!(t0, symbol_short!("al_rem"));
+        assert_eq!(t1, asset);
+        let got_admin: Address = TryFromVal::try_from_val(&env, data).unwrap();
+        assert_eq!(got_admin, admin);
     }
 }
