@@ -221,6 +221,25 @@ export const regenerateKeySchema = z.object({
   message: z.string().min(1),
 });
 
+// --- Retire Agent ---
+
+export const retireAgentSchema = z.object({
+  reason: z.string().min(1).max(1000),
+  supersededBy: z.string().nullable().optional(),
+  stellarPublicKey: z.string().min(1),
+  signature: z.string().min(1),
+  message: z.string().min(1),
+});
+
+// --- Delete Agent (Privacy Deletion) ---
+
+export const deleteAgentSchema = z.object({
+  reason: z.string().min(1).max(1000),
+  stellarPublicKey: z.string().min(1),
+  signature: z.string().min(1),
+  message: z.string().min(1),
+});
+
 // --- Sign Payment (Stellar x402) ---
 
 export const signPaymentSchema = z.object({
