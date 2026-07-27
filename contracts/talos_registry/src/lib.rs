@@ -14,6 +14,7 @@ extern crate std;
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
 use storage_migration;
 use ttl_manager;
+use pause_control;
 
 // ── Data Types ──────────────────────────────────────────────────────
 
@@ -247,7 +248,18 @@ const MAX_ROLLBACK_DEPTH: u32 = 1;
 /// This constant is embedded in the WASM binary at compile time and is
 /// therefore immutable once deployed; it cannot be altered by any admin
 /// call, storage write, or cross-contract invocation.
-pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 2, 0);
+pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 3, 0);
+
+// ── Pause Domains ───────────────────────────────────────────────────
+
+/// Pause domain for Talos creation (create_talos).
+pub const PAUSE_TALOS_CREATION: u32 = 1;
+/// Pause domain for Talos metadata updates (update_patron, update_kernel, update_pulse).
+pub const PAUSE_TALOS_UPDATE: u32 = 2;
+/// Pause domain for Talos deactivation.
+pub const PAUSE_TALOS_DEACTIVATION: u32 = 3;
+/// Pause domain for protocol configuration (fees, admin, timelock).
+pub const PAUSE_PROTOCOL_CONFIG: u32 = 4;
 
 // ── Contract ────────────────────────────────────────────────────────
 
@@ -279,6 +291,8 @@ impl TalosRegistry {
         pulse: Pulse,
         protocol_wallet: Address,
     ) -> u32 {
+        pause_control::check_not_paused(&e, PAUSE_TALOS_CREATION);
+
         // Require creator authorization
         patron.creator_addr.require_auth();
 
@@ -374,6 +388,8 @@ impl TalosRegistry {
 
     /// Update patron shares for a Talos.
     pub fn update_patron(e: Env, talos_id: u32, patron: Patron) {
+        pause_control::check_not_paused(&e, PAUSE_TALOS_UPDATE);
+
         let mut talos: Talos = e
             .storage()
             .persistent()
@@ -396,6 +412,8 @@ impl TalosRegistry {
 
     /// Update kernel policy for a Talos.
     pub fn update_kernel(e: Env, talos_id: u32, kernel: Kernel) {
+        pause_control::check_not_paused(&e, PAUSE_TALOS_UPDATE);
+
         let mut talos: Talos = e
             .storage()
             .persistent()
@@ -413,6 +431,8 @@ impl TalosRegistry {
 
     /// Update pulse token config for a Talos.
     pub fn update_pulse(e: Env, talos_id: u32, pulse: Pulse) {
+        pause_control::check_not_paused(&e, PAUSE_TALOS_UPDATE);
+
         let mut talos: Talos = e
             .storage()
             .persistent()
@@ -430,6 +450,8 @@ impl TalosRegistry {
 
     /// Deactivate a Talos.
     pub fn deactivate_talos(e: Env, talos_id: u32) {
+        pause_control::check_not_paused(&e, PAUSE_TALOS_DEACTIVATION);
+
         let mut talos: Talos = e
             .storage()
             .persistent()
@@ -504,6 +526,8 @@ impl TalosRegistry {
     ///
     /// Only the configured protocol wallet may update the fee.
     pub fn set_protocol_fee(e: Env, fee_bps: u32) {
+        pause_control::check_not_paused(&e, PAUSE_PROTOCOL_CONFIG);
+
         if fee_bps > MAX_PROTOCOL_FEE_BPS {
             panic!("Protocol fee cannot exceed 100%");
         }
@@ -543,6 +567,8 @@ impl TalosRegistry {
     /// # Panics
     /// - `"Contract not initialized"` — if `initialize` has not been called.
     pub fn propose_admin(e: Env, new_admin: Address) {
+        pause_control::check_not_paused(&e, PAUSE_PROTOCOL_CONFIG);
+
         let current: Address = e
             .storage()
             .persistent()
@@ -566,6 +592,8 @@ impl TalosRegistry {
     /// # Authorization
     /// Requires current protocol wallet (admin) authorization.
     pub fn set_timelock_config(e: Env, min_delay: u64, grace_period: u64) {
+        pause_control::check_not_paused(&e, PAUSE_PROTOCOL_CONFIG);
+
         let admin: Address = e
             .storage()
             .persistent()
@@ -610,6 +638,8 @@ impl TalosRegistry {
     /// # Authorization
     /// Requires current protocol wallet (admin) authorization.
     pub fn schedule_action(e: Env, action: AdminAction, delay: u64) -> u64 {
+        pause_control::check_not_paused(&e, PAUSE_PROTOCOL_CONFIG);
+
         let admin: Address = e
             .storage()
             .persistent()
@@ -701,6 +731,8 @@ impl TalosRegistry {
     /// # Authorization
     /// Requires current protocol wallet (admin) authorization.
     pub fn cancel_action(e: Env, proposal_id: u64) {
+        pause_control::check_not_paused(&e, PAUSE_PROTOCOL_CONFIG);
+
         let admin: Address = e
             .storage()
             .persistent()
@@ -747,6 +779,8 @@ impl TalosRegistry {
     /// # Panics
     /// - `"No pending admin transfer"` — if `propose_admin` has not been called.
     pub fn accept_admin(e: Env) {
+        pause_control::check_not_paused(&e, PAUSE_PROTOCOL_CONFIG);
+
         let pending: Address = e
             .storage()
             .persistent()
@@ -778,6 +812,8 @@ impl TalosRegistry {
     /// - `"Contract not initialized"` — if `initialize` has not been called.
     /// - `"No pending admin transfer"` — if there is nothing to cancel.
     pub fn cancel_admin_transfer(e: Env) {
+        pause_control::check_not_paused(&e, PAUSE_PROTOCOL_CONFIG);
+
         let current: Address = e
             .storage()
             .persistent()
@@ -872,6 +908,8 @@ impl TalosRegistry {
     /// # Authorization
     /// Requires the protocol wallet (admin) to sign.
     pub fn touch_batch(e: Env, start_id: u32, limit: u32) -> (u32, u32) {
+        pause_control::check_not_paused(&e, PAUSE_PROTOCOL_CONFIG);
+
         let admin: Address = e
             .storage()
             .persistent()

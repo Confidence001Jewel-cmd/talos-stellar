@@ -7,6 +7,7 @@ extern crate std;
 
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
 use ttl_manager;
+use pause_control;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,6 +72,15 @@ pub enum DataKey {
     TokenBalanceSnapshot(u32, Address),
     LastTouched(u32),
 }
+
+// ── Pause Domains ───────────────────────────────────────────────────
+
+/// Pause domain for proposal creation.
+pub const PAUSE_PROPOSAL_CREATION: u32 = 7;
+/// Pause domain for governance voting.
+pub const PAUSE_GOVERNANCE_VOTING: u32 = 8;
+/// Pause domain for governance configuration.
+pub const PAUSE_GOVERNANCE_CONFIG: u32 = 9;
 
 fn emit_proposal_created(env: &Env, proposal_id: u32, talos_id: u32, proposer: Address) {
     env.events().publish(
@@ -140,6 +150,8 @@ impl TalosGovernance {
         title: String,
         description: String,
     ) -> u32 {
+        pause_control::check_not_paused(&env, PAUSE_PROPOSAL_CREATION);
+
         proposer.require_auth();
 
         if title.len() == 0 {
@@ -182,6 +194,8 @@ impl TalosGovernance {
     }
 
     pub fn vote(env: Env, voter: Address, proposal_id: u32, choice: VoteChoice) {
+        pause_control::check_not_paused(&env, PAUSE_GOVERNANCE_VOTING);
+
         voter.require_auth();
 
         let mut proposal: Proposal = env
@@ -277,6 +291,7 @@ impl TalosGovernance {
         address: Address,
         balance: i128,
     ) {
+        pause_control::check_not_paused(&env, PAUSE_GOVERNANCE_CONFIG);
         Self::require_admin(&env, &admin);
         if balance < 0 {
             panic!("Balance cannot be negative");
@@ -287,6 +302,7 @@ impl TalosGovernance {
     }
 
     pub fn update_config(env: Env, admin: Address, config: GovernanceConfig) {
+        pause_control::check_not_paused(&env, PAUSE_GOVERNANCE_CONFIG);
         Self::require_admin(&env, &admin);
         if config.quorum_threshold <= 0 {
             panic!("Quorum must be positive");
@@ -354,6 +370,8 @@ impl TalosGovernance {
 
     /// Batch-touch all governance proposals + admin keys (admin only).
     pub fn touch_all_ttl(e: Env) -> (u32, u32) {
+        pause_control::check_not_paused(&e, PAUSE_GOVERNANCE_CONFIG);
+
         let admin: Address = e
             .storage()
             .persistent()
@@ -483,6 +501,39 @@ impl TalosGovernance {
         } else {
             ProposalStatus::Rejected
         };
+    }
+
+    // ── Scoped Emergency Pause Controls ──────────────────────────────
+
+    /// Pause a domain. Only the admin can pause.
+    pub fn pause_domain(e: Env, domain_id: u32, duration: u64) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        pause_control::pause_domain(&e, domain_id, &admin, duration);
+    }
+
+    /// Unpause a domain. Only the admin can unpause.
+    pub fn unpause_domain(e: Env, domain_id: u32) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        pause_control::unpause_domain(&e, domain_id, &admin);
+    }
+
+    /// Check whether a domain is paused (expires elapsed pauses first).
+    pub fn is_domain_paused(e: Env, domain_id: u32) -> bool {
+        pause_control::check_not_paused(&e, domain_id);
+        pause_control::is_paused(&e, domain_id)
+    }
+
+    /// Get the pause status for a domain.
+    pub fn get_domain_pause_status(e: Env, domain_id: u32) -> Option<pause_control::PauseStatus> {
+        pause_control::get_pause_status(&e, domain_id)
     }
 }
 
@@ -700,5 +751,159 @@ mod tests {
                 },
             }])
             .update_config(&attacker, &config);
+    }
+
+    // ── Pause Control Integration Tests ─────────────────────────
+
+    #[test]
+    fn pause_proposal_creation_blocks_create_proposal() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "pause_domain",
+                    args: (PAUSE_PROPOSAL_CREATION, 0u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .pause_domain(&PAUSE_PROPOSAL_CREATION, &0);
+
+        let title = s(&env, "Test");
+        let description = s(&env, "Test");
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 1u32, title.clone(), description.clone())
+                        .into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_create_proposal(&proposer, &1, &title, &description);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn pause_voting_blocks_vote() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let proposal_id =
+            create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        cache_balance_with_auth(&env, &contract_id, &client, &admin, 90, &voter, 200);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "pause_domain",
+                    args: (PAUSE_GOVERNANCE_VOTING, 0u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .pause_domain(&PAUSE_GOVERNANCE_VOTING, &0);
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &voter,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "vote",
+                    args: (voter.clone(), proposal_id, VoteChoice::Approve).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_vote(&voter, &proposal_id, &VoteChoice::Approve);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn pause_governance_config_blocks_update_config() {
+        let (env, contract_id, admin, pulse, client) = setup();
+        let new_admin = Address::generate(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "pause_domain",
+                    args: (PAUSE_GOVERNANCE_CONFIG, 0u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .pause_domain(&PAUSE_GOVERNANCE_CONFIG, &0);
+
+        let config = GovernanceConfig {
+            quorum_threshold: 200,
+            consensus_threshold: 6_000,
+            voting_period_ledgers: 30,
+            pulse_token_address: pulse,
+        };
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &new_admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "update_config",
+                    args: (new_admin.clone(), config.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_update_config(&new_admin, &config);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn unpause_governance_restores_voting() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let proposal_id =
+            create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        cache_balance_with_auth(&env, &contract_id, &client, &admin, 90, &voter, 200);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "pause_domain",
+                    args: (PAUSE_GOVERNANCE_VOTING, 0u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .pause_domain(&PAUSE_GOVERNANCE_VOTING, &0);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "unpause_domain",
+                    args: (PAUSE_GOVERNANCE_VOTING,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .unpause_domain(&PAUSE_GOVERNANCE_VOTING);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &voter,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "vote",
+                    args: (voter.clone(), proposal_id, VoteChoice::Approve).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .vote(&voter, &proposal_id, &VoteChoice::Approve);
     }
 }

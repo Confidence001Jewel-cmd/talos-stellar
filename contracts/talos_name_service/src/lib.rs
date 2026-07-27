@@ -16,6 +16,7 @@ use soroban_sdk::{
     Env, IntoVal, String, Symbol,
 };
 use ttl_manager;
+use pause_control;
 
 // ── Data Types ──────────────────────────────────────────────────────
 
@@ -185,7 +186,14 @@ fn validate_name(name: &String) -> bool {
 /// This constant is embedded in the WASM binary at compile time and is
 /// therefore immutable once deployed; it cannot be altered by any admin
 /// call, storage write, or cross-contract invocation.
-pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 2, 0);
+pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 3, 0);
+
+// ── Pause Domains ───────────────────────────────────────────────────
+
+/// Pause domain for name registration.
+pub const PAUSE_NAME_REGISTRATION: u32 = 5;
+/// Pause domain for name service configuration (admin, registry, timelock).
+pub const PAUSE_NAME_CONFIG: u32 = 6;
 
 #[contract]
 pub struct TalosNameService;
@@ -217,6 +225,8 @@ impl TalosNameService {
     /// * `talos_id` - The Talos ID to associate with the name
     /// * `name` - Human-readable name (3-32 chars, lowercase alphanumeric + hyphens)
     pub fn register_name(e: Env, owner: Address, talos_id: u32, name: String) {
+        pause_control::check_not_paused(&e, PAUSE_NAME_REGISTRATION);
+
         owner.require_auth();
 
         if !validate_name(&name) {
@@ -300,6 +310,8 @@ impl TalosNameService {
 
     /// Set or transfer admin role for TalosNameService.
     pub fn set_admin(e: Env, new_admin: Address) {
+        pause_control::check_not_paused(&e, PAUSE_NAME_CONFIG);
+
         if let Some(admin) = e.storage().persistent().get::<_, Address>(&DataKey::Admin) {
             admin.require_auth();
         }
@@ -311,6 +323,8 @@ impl TalosNameService {
     /// Requires admin authorization. If timelock is enabled (`min_delay > 0`),
     /// this action must be scheduled and executed via `execute_action`.
     pub fn set_registry_contract(e: Env, new_registry_id: Address) {
+        pause_control::check_not_paused(&e, PAUSE_NAME_CONFIG);
+
         let admin: Address = e
             .storage()
             .persistent()
@@ -330,6 +344,8 @@ impl TalosNameService {
 
     /// Configure timelock parameter settings (`min_delay` and `grace_period`).
     pub fn set_timelock_config(e: Env, min_delay: u64, grace_period: u64) {
+        pause_control::check_not_paused(&e, PAUSE_NAME_CONFIG);
+
         let admin: Address = e
             .storage()
             .persistent()
@@ -371,6 +387,8 @@ impl TalosNameService {
 
     /// Schedule an administrative action for future execution.
     pub fn schedule_action(e: Env, action: AdminAction, delay: u64) -> u64 {
+        pause_control::check_not_paused(&e, PAUSE_NAME_CONFIG);
+
         let admin: Address = e
             .storage()
             .persistent()
@@ -456,6 +474,8 @@ impl TalosNameService {
 
     /// Cancel a scheduled action.
     pub fn cancel_action(e: Env, proposal_id: u64) {
+        pause_control::check_not_paused(&e, PAUSE_NAME_CONFIG);
+
         let admin: Address = e
             .storage()
             .persistent()
@@ -551,6 +571,8 @@ impl TalosNameService {
 
     /// Batch-touch admin keys plus name records for talos IDs (admin only).
     pub fn touch_all_ttl(e: Env, max_talos_id: u32) -> u32 {
+        pause_control::check_not_paused(&e, PAUSE_NAME_CONFIG);
+
         let admin: Address = e
             .storage()
             .persistent()
@@ -623,6 +645,39 @@ impl TalosNameService {
         } else {
             (health.min_age, health.max_age, health.keys_below_warn, health.keys_below_crit, health.total_keys)
         }
+    }
+
+    // ── Scoped Emergency Pause Controls ──────────────────────────────
+
+    /// Pause a domain. Only the admin can pause.
+    pub fn pause_domain(e: Env, domain_id: u32, duration: u64) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Admin not configured");
+        pause_control::pause_domain(&e, domain_id, &admin, duration);
+    }
+
+    /// Unpause a domain. Only the admin can unpause.
+    pub fn unpause_domain(e: Env, domain_id: u32) {
+        let admin: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Admin not configured");
+        pause_control::unpause_domain(&e, domain_id, &admin);
+    }
+
+    /// Check whether a domain is paused (expires elapsed pauses first).
+    pub fn is_domain_paused(e: Env, domain_id: u32) -> bool {
+        pause_control::check_not_paused(&e, domain_id);
+        pause_control::is_paused(&e, domain_id)
+    }
+
+    /// Get the pause status for a domain.
+    pub fn get_domain_pause_status(e: Env, domain_id: u32) -> Option<pause_control::PauseStatus> {
+        pause_control::get_pause_status(&e, domain_id)
     }
 }
 
