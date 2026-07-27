@@ -5,6 +5,7 @@ import { eq, and } from "drizzle-orm";
 import { NextResponse } from "next/server";
 import { getAccountInfo, getNetworkPassphrase, getUSDCIssuer } from "@/lib/stellar";
 import { OPERATOR_PUBLIC_KEY } from "@/lib/stellar-config";
+import { logger } from "@/lib/logger";
 
 /**
  * Buy Mitos tokens from a Talos.
@@ -80,16 +81,36 @@ export async function POST(
 
   if (existing) {
     if (existing.status === "completed" && existing.responseBody) {
-      // Idempotent replay — return original response
-      return NextResponse.json(existing.responseBody, { status: 200 });
+      // Idempotent replay — return original response with echo headers
+      logger.info({
+        event: "idempotency_hit",
+        idempotencyKey: txHash,
+        talosId: id,
+        replayed: true,
+      }, "buy-token idempotent replay — returning cached response");
+      const replayRes = NextResponse.json(existing.responseBody, { status: 200 });
+      replayRes.headers.set("Idempotency-Key", txHash);
+      replayRes.headers.set("X-Idempotent-Replayed", "true");
+      return replayRes;
     }
     if (existing.status === "pending") {
+      logger.info({
+        event: "idempotency_inflight",
+        idempotencyKey: txHash,
+        talosId: id,
+      }, "buy-token purchase in progress");
       return NextResponse.json(
         { error: "Purchase is already in progress for this transaction" },
         { status: 409 },
       );
     }
     // "failed" — fall through and retry (row will be updated below)
+    logger.info({
+      event: "idempotency_miss",
+      idempotencyKey: txHash,
+      talosId: id,
+      retryOfFailed: true,
+    }, "buy-token retrying failed purchase");
   }
 
   // Claim the idempotency slot. For a brand-new request we insert a pending
@@ -372,5 +393,15 @@ export async function POST(
     { category: "TOKEN" }
   );
 
-  return NextResponse.json(responseBody);
+  logger.info({
+    event: "idempotency_commit",
+    idempotencyKey: txHash,
+    talosId: id,
+    replayed: false,
+  }, "buy-token purchase committed");
+
+  const successRes = NextResponse.json(responseBody);
+  successRes.headers.set("Idempotency-Key", txHash);
+  successRes.headers.set("X-Idempotent-Replayed", "false");
+  return successRes;
 }

@@ -131,6 +131,64 @@ The web `_backup` and `/ops/restore` endpoints never log:
 See `sanitizeErrorMessage` in `web/src/lib/backup-types.ts` for the exact
 redaction regex set.
 
+## Idempotency Observability
+
+### Structured log events
+
+All idempotency state transitions are logged as structured events. Keys and route paths are
+logged; payload contents and response bodies are **never** logged.
+
+#### Web (pino)
+
+| `event` field | When emitted | Log level |
+|---|---|---|
+| `idempotency_miss` | New key seen for first time | `info` |
+| `idempotency_hit` | Cache hit — cached response returned | `info` |
+| `idempotency_inflight` | Key exists but response not yet cached | `info` |
+| `idempotency_conflict` | Key reused with different payload | `warn` |
+| `idempotency_commit` | buy-token purchase committed successfully | `info` |
+
+Example log line (JSON):
+```json
+{
+  "level": "info",
+  "time": "2026-07-24T18:00:00.000Z",
+  "event": "idempotency_hit",
+  "idempotencyKey": "550e8400-e29b-41d4-a716-446655440000",
+  "talosId": "abc123",
+  "jobId": "job-xyz",
+  "replayed": true,
+  "msg": "idempotent replay — returning cached response"
+}
+```
+
+#### Agent (Python / structlog)
+
+| Event | When emitted |
+|---|---|
+| `idempotency_key_injected` | Key appended to outbound POST/PATCH |
+| `idempotency_conflict` | `IdempotencyConflictError` raised |
+
+### Metrics
+
+Aggregate the structured log events with a log drain or query:
+
+| Suggested metric name | `event` filter |
+|---|---|
+| `idempotency_hit_total` | `event = "idempotency_hit"` |
+| `idempotency_miss_total` | `event = "idempotency_miss"` |
+| `idempotency_conflict_total` | `event = "idempotency_conflict"` |
+| `idempotency_inflight_total` | `event = "idempotency_inflight"` |
+
+### Response headers
+
+Use the response headers to detect replays at the HTTP layer (e.g. in a proxy or test harness):
+
+```
+Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
+X-Idempotent-Replayed: true
+```
+
 ## Pagination
 
 List endpoints now support cursor-based pagination:

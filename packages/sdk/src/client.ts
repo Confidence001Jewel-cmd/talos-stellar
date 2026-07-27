@@ -150,10 +150,11 @@ export class TalosClient {
     return this.fetchOverride ?? globalThis.fetch;
   }
 
-  private shouldRetry(method: string, status: number): boolean {
+  private shouldRetry(method: string, status: number, retryMethodsOverride?: string[]): boolean {
+    const methods = retryMethodsOverride ?? this.retryPolicy.retryMethods;
     return (
       this.retryPolicy.retryStatusCodes.includes(status) &&
-      this.retryPolicy.retryMethods.includes(method)
+      methods.includes(method)
     );
   }
 
@@ -220,10 +221,13 @@ export class TalosClient {
 
   private async request<T>(
     path: string,
-    init?: RequestInit & { params?: Record<string, string | number | boolean> },
+    init?: RequestInit & {
+      params?: Record<string, string | number | boolean>;
+      idempotencyKey?: string;
+    },
   ): Promise<T> {
     let url = `${this.baseUrl}${path}`;
-    const { params, signal, ...requestInit } = init ?? {};
+    const { params, signal, idempotencyKey, ...requestInit } = init ?? {};
     const normalizedSignal = signal ?? undefined;
     if (params) {
       const filteredParams = Object.entries(params)
@@ -315,6 +319,8 @@ export class TalosClient {
     return this.request(`/api/talos/${talosId}/activity`, {
       method: "POST",
       body: JSON.stringify(params),
+      idempotencyKey: options?.idempotencyKey,
+      signal: options?.signal,
     });
   }
 
@@ -331,6 +337,8 @@ export class TalosClient {
     return this.request(`/api/talos/${talosId}/revenue`, {
       method: "POST",
       body: JSON.stringify(params),
+      idempotencyKey: options?.idempotencyKey,
+      signal: options?.signal,
     });
   }
 
@@ -347,6 +355,8 @@ export class TalosClient {
     return this.request(`/api/talos/${talosId}/approvals`, {
       method: "POST",
       body: JSON.stringify(params),
+      idempotencyKey: options?.idempotencyKey,
+      signal: options?.signal,
     });
   }
 
@@ -391,11 +401,14 @@ export class TalosClient {
   async purchaseService(
     talosId: string,
     params: PurchaseServiceParams,
+    options?: WriteOptions,
   ): Promise<CommerceJob> {
     return this.request(`/api/talos/${talosId}/service`, {
       method: "POST",
       body: JSON.stringify({ payload: params.payload }),
       headers: { "X-PAYMENT": params.paymentHeader },
+      idempotencyKey: options?.idempotencyKey,
+      signal: options?.signal,
     });
   }
 
@@ -415,6 +428,7 @@ export class TalosClient {
     talosId: string,
     buyerTalosId: string,
     payload?: Record<string, unknown>,
+    options?: WriteOptions,
   ): Promise<CommerceJob> {
     const path = `/api/talos/${talosId}/service`;
     const url = `${this.baseUrl}${path}`;
@@ -478,7 +492,7 @@ export class TalosClient {
       return this.purchaseService(talosId, {
         paymentHeader: signRes.paymentHeader,
         payload,
-      });
+      }, options);
     }
 
     // Non-402 responses — wrap them through the typed dispatch.
@@ -557,6 +571,8 @@ export class TalosClient {
     return this.request(`/api/talos/${talosId}/transfer`, {
       method: "POST",
       body: JSON.stringify(params),
+      idempotencyKey: options?.idempotencyKey,
+      signal: options?.signal,
     });
   }
 
@@ -566,10 +582,23 @@ export class TalosClient {
     return this.request("/api/jobs/pending");
   }
 
-  async submitJobResult(jobId: string, result: unknown): Promise<CommerceJob> {
+  /**
+   * Submit the result of a fulfilled job.
+   *
+   * Pass `options.idempotencyKey` to enable safe retry: if the network drops
+   * after the server has already committed the result, the retry will receive
+   * a 201 from cache rather than creating a duplicate.
+   */
+  async submitJobResult(
+    jobId: string,
+    result: unknown,
+    options?: WriteOptions,
+  ): Promise<CommerceJob> {
     return this.request(`/api/jobs/${jobId}/result`, {
       method: "POST",
       body: JSON.stringify({ result }),
+      idempotencyKey: options?.idempotencyKey,
+      signal: options?.signal,
     });
   }
 
@@ -597,10 +626,15 @@ export class TalosClient {
     return this.requestPage("/api/playbooks", params);
   }
 
-  async createPlaybook(params: CreatePlaybookParams): Promise<Playbook> {
+  async createPlaybook(
+    params: CreatePlaybookParams,
+    options?: WriteOptions,
+  ): Promise<Playbook> {
     return this.request("/api/playbooks", {
       method: "POST",
       body: JSON.stringify(params),
+      idempotencyKey: options?.idempotencyKey,
+      signal: options?.signal,
     });
   }
 }

@@ -20,18 +20,24 @@ import { ingestJobToLedger } from "@/lib/reputation-ledger";
  * Idempotency contract
  * ────────────────────
  * The caller may include an `Idempotency-Key` request header with any opaque
- * string value (UUID recommended).  The key is scoped per talosId so the same
- * value may be reused safely across different agents.
+ * string value (UUID recommended, max 128 bytes).  The key is scoped per
+ * talosId so the same value may be reused safely across different agents.
  *
  * Behaviour:
  *   No header supplied   → request is processed normally with no idempotency.
  *
  *   New key              → job is created and the response body is cached in
  *                          idempotencyResponse.  Status 201 returned.
+ *                          Response includes:
+ *                            Idempotency-Key: <key>
+ *                            X-Idempotent-Replayed: false
  *
  *   Same key, equivalent payload (same serviceName + payload contents)
  *                        → original cached 201 response returned immediately.
  *                          No side effects are repeated.
+ *                          Response includes:
+ *                            Idempotency-Key: <key>
+ *                            X-Idempotent-Replayed: true
  *
  *   Same key, different payload (serviceName or payload mismatch)
  *                        → 409 Conflict.  Conflicting reuse of an idempotency
@@ -47,6 +53,20 @@ import { ingestJobToLedger } from "@/lib/reputation-ledger";
  * response in idempotencyResponse.  Both columns are nullable so existing jobs
  * without a key are completely unaffected.
  */
+
+/** Build a JSON response with standard idempotency echo headers. */
+function idempotentResponse(
+  body: unknown,
+  status: number,
+  idempotencyKey: string,
+  replayed: boolean,
+): Response {
+  const res = Response.json(body, { status });
+  res.headers.set("Idempotency-Key", idempotencyKey);
+  res.headers.set("X-Idempotent-Replayed", String(replayed));
+  return res;
+}
+
 async function submitAndVerifyPayment(
   signedXdr: string,
   expectedAmount: string,
@@ -106,7 +126,22 @@ export async function POST(
 
     // Read optional idempotency key from the request header.
     // Trim whitespace; treat an empty string as absent.
-    const idempotencyKey = request.headers.get("Idempotency-Key")?.trim() || null;
+    const rawKey = request.headers.get("Idempotency-Key")?.trim() || null;
+
+    // Validate key length (prevent header-size abuse)
+    if (rawKey !== null) {
+      const byteLength = Buffer.byteLength(rawKey, "utf8");
+      if (byteLength > IDEMPOTENCY_KEY_MAX_BYTES) {
+        return Response.json(
+          {
+            error: `Idempotency-Key must be at most ${IDEMPOTENCY_KEY_MAX_BYTES} bytes`,
+          },
+          { status: 400 },
+        );
+      }
+    }
+
+    const idempotencyKey = rawKey;
 
     const [service, talos] = await Promise.all([
       db.select().from(tlsCommerceServices).where(eq(tlsCommerceServices.talosId, id)).limit(1).then(r => r[0] ?? null),
@@ -148,6 +183,14 @@ export async function POST(
           existing.serviceName !== service.serviceName ||
           incomingPayloadJson !== storedPayloadJson
         ) {
+          logger.warn({
+            event: "idempotency_conflict",
+            idempotencyKey,
+            talosId: id,
+            existingServiceName: existing.serviceName,
+            incomingServiceName: service.serviceName,
+          }, "idempotency key reused with different payload");
+
           return Response.json(
             {
               error:
@@ -160,16 +203,38 @@ export async function POST(
 
         // Equivalent retry — return the original response from cache.
         if (existing.idempotencyResponse) {
-          return Response.json(existing.idempotencyResponse, { status: 201 });
+          logger.info({
+            event: "idempotency_hit",
+            idempotencyKey,
+            talosId: id,
+            jobId: existing.id,
+            replayed: true,
+          }, "idempotent replay — returning cached response");
+
+          return idempotentResponse(existing.idempotencyResponse, 201, idempotencyKey, true);
         }
 
         // Key exists but no cached response yet (edge case: concurrent first
         // request still in flight).  Treat as a duplicate in progress.
+        logger.info({
+          event: "idempotency_inflight",
+          idempotencyKey,
+          talosId: id,
+          jobId: existing.id,
+        }, "idempotent request in flight");
+
         return Response.json(
           { error: "Request with this Idempotency-Key is already being processed" },
           { status: 409 },
         );
       }
+
+      // First time seeing this key
+      logger.info({
+        event: "idempotency_miss",
+        idempotencyKey,
+        talosId: id,
+      }, "new idempotent request");
     }
 
     // Submit + verify payment if signedXdr provided; otherwise use legacy txHash
@@ -319,7 +384,7 @@ export async function POST(
       }
       return Response.json({ error: "Transaction already used for a job (replay)" }, { status: 409 });
     }
-    console.error("[jobs POST]", err);
+    logger.error({ err, event: "jobs_post_error" }, "[jobs POST] Unhandled error");
     return Response.json({ error: "Internal server error" }, { status: 500 });
   }
 }
