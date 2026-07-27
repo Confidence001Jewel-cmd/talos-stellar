@@ -14,6 +14,8 @@ from talos_agent.http import RetryableHTTPError, request_with_retry
 from talos_agent.tracing import inject_trace_headers, traced_span
 from opentelemetry.trace import SpanKind
 
+_NO_KEY = object()
+
 
 class TalosAPIClient:
     def __init__(self, settings: Settings):
@@ -88,6 +90,11 @@ class TalosAPIClient:
         return await request_with_retry(lambda: self._client.get(url, **kwargs), provider="talos_web_api")
 
     async def _post(self, url: str, **kwargs: Any) -> httpx.Response:
+        idempotency_key = kwargs.pop("idempotency_key", _NO_KEY)
+        if idempotency_key is not _NO_KEY and idempotency_key:
+            headers = dict(kwargs.pop("headers", {}) or {})
+            headers["Idempotency-Key"] = str(idempotency_key)
+            kwargs["headers"] = headers
         return await request_with_retry(lambda: self._client.post(url, **kwargs), provider="talos_web_api")
 
     async def _put(self, url: str, **kwargs: Any) -> httpx.Response:

@@ -2,7 +2,6 @@
 
 import logging
 from enum import Enum
-from typing import Optional, List, Dict, Any
 
 from talos_agent.config import Settings
 from talos_agent.db import LocalDB
@@ -93,7 +92,7 @@ class LifecycleManager:
             # Never expose private keys in logs
             logger.info("Credentials successfully revoked.")
             return True
-        except Exception as e:
+        except Exception:
             logger.error("Failed to revoke credentials.", exc_info=True)
             return False
 
@@ -123,7 +122,7 @@ class LifecycleManager:
                 result["refunds_issued"] = len(pending_approvals)
                 
             return result
-        except Exception as e:
+        except Exception:
             logger.error("Reconciliation failed.", exc_info=True)
             return result
 

@@ -7,16 +7,14 @@ import logging
 import os
 import random
 import signal
-import time
 import uuid
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from talos_agent.clock import ClockProtocol, SystemClock
+from talos_agent import metrics
 
 import structlog
-from opentelemetry.trace import SpanKind
 from rich.console import Console
 
 if TYPE_CHECKING:
@@ -24,12 +22,23 @@ if TYPE_CHECKING:
 
 from talos_agent.circuit_breaker import cb_registry
 from talos_agent.observability import log, setup as setup_observability
-from talos_agent.tracing import force_flush as force_flush_tracing, shutdown_tracing, traced_span
+from talos_agent.tracing import (
+    force_flush as force_flush_tracing,
+    shutdown_tracing,
+    traced_span,
+)
 
 console = Console()
 logger = logging.getLogger(__name__)
 
 SHUTDOWN_GRACE_PERIOD = 10  # seconds before force-exit on second signal
+
+
+def _traced_task_run(name: str, talos_config: dict):
+    return traced_span(
+        f"scheduler.{name}",
+        {"talos.id": str(talos_config.get("id", ""))},
+    )
 
 
 async def run_dividend_distribution(

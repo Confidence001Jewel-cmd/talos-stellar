@@ -7,7 +7,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, get_type_hints
 
-from talos_agent.config import Settings
+from talos_agent import metrics
+from talos_agent.config import Settings, resolve_setting_secret
+from talos_agent.tracing import traced_span
 from talos_agent.tools.permissions import (
     EnforcementMode,
     PermissionEnforcer,
@@ -257,6 +259,8 @@ def build_all_tools(
     browser: Any,
     settings: Settings,
     policy_middleware: Any = None,
+    job_effect_store: Any = None,
+    job_effect_dispatcher: Any = None,
 ) -> ToolRegistry:
     """Import all tool modules to trigger @tool registrations, then return registry."""
     # Import modules so decorators execute

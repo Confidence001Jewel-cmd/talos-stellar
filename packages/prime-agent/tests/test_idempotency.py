@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
