@@ -136,6 +136,46 @@ uv run talos-agent encrypt-keys --env-file .env
 
 - On startup the agent will prompt for the master password (or read it from the `TALOS_MASTER_KEY` env var) to decrypt secrets. Keep the master password secure and do not commit it to source control.
 
+## Backup / Restore / Disaster Recovery
+
+The repository ships first-class DR primitives on both stacks. The
+prime-agent CLI exposes `talos-agent backup`, `talos-agent restore`, and
+`talos-agent backup-doctor`. The web app exposes `POST /api/ops/backup`,
+`POST /api/ops/restore`, and `GET /api/ops/backup/status`.
+
+```bash
+# Prime agent encrypted backup of local SQLite state
+cd packages/prime-agent
+uv run talos-agent backup
+
+# Verify an artifact without applying it
+uv run talos-agent backup-doctor --artifact ~/.talos-agent/backups/talos-agent-...enc
+
+# Restore from an artifact (DBs are pre-renamed to .pre-restore siblings)
+uv run talos-agent restore ~/.talos-agent/backups/talos-agent-...enc --confirm
+```
+
+```bash
+# Trigger a Postgres snapshot from the web app
+curl -sS -X POST https://talos-stellar.vercel.app/api/ops/backup \
+  -H "X-Ops-Token: $OPS_ADMIN_SECRET" \
+  -H "X-Backup-Passphrase: $BACKUP_PASSPHRASE" \
+  -H "Content-Type: application/json" \
+  -d '{"scope":"system","triggeredBy":"cli"}'
+```
+
+Cypher envelope:
+
+```
+"ENC::" + base64(salt[16] | nonce[12] | AES-256-GCM(ct) | gcmTag[16])
+KDF: PBKDF2-HMAC-SHA256, 200 000 iterations, 32-byte derived key
+```
+
+Format is shared with `packages/prime-agent/src/talos_agent/crypto.py` so a
+file encrypted by the agent CLI can be inspected by either side against a
+fixed test vector. See [`docs/DR_RUNBOOK.md`](docs/DR_RUNBOOK.md) for RPO /
+RTO targets, runbooks, and rollback procedures.
+
 ## Health check
 
 `GET /api/health` — returns `200` when all dependencies are reachable, `503` when any check fails.

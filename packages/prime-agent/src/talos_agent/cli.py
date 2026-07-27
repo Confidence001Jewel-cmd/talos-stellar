@@ -317,6 +317,217 @@ def status():
     db.close()
 
 
+# ─── Backup / Restore / Verify ──────────────────────────────────────
+
+
+@main.command()
+@click.option("--output", default=None, help="Output artifact path (default: ~/.talos-agent/backups/talos-agent-YYYYMMDD-HHMMSS.enc)")
+@click.option("--agent-id", default=None, help="Talos ID for multi-agent mode")
+@click.option("--passphrase", default=None, help="Backup passphrase (≥ 8 chars). Prompted if not provided.")
+@click.option("--web-endpoint", is_flag=True, help="Also trigger POST /api/ops/backup on the Talos web API for Postgres coverage.")
+@click.option(
+    "--web-api-url",
+    default=None,
+    help="Talos web API URL for --web-endpoint (defaults to TALOS_API_URL env or https://talos-stellar.vercel.app)",
+)
+@click.option(
+    "--ops-token",
+    default=None,
+    help="OPS_ADMIN_SECRET for the web endpoint (env: TALOS_OPS_TOKEN). Required when --web-endpoint is set.",
+)
+def backup(output, agent_id, passphrase, web_endpoint, web_api_url, ops_token):
+    """Create an encrypted backup of this agent's local state.
+
+    The artifact is smaller and independent from the web-side Postgres
+    backup. With --web-endpoint, also kicks the web /api/ops/backup route
+    so a single `backup` covers both the SQLite state and the Postgres
+    rows.
+
+    Bounded: writes are streamed through a tempdir, the encrypted output
+    is bounded by MAX_PLAINTEXT_BYTES (10 MiB by default), and a
+    single-flight lock prevents concurrent overwrites of the same WAL.
+    """
+    from pathlib import Path as _Path
+    from talos_agent.backup_service import (
+        BACKUP_ENCRYPTION_LABEL,
+        BackupBusyError,
+        BackupError,
+        build_backup,
+    )
+
+    ensure_app_dir()
+    if not passphrase:
+        passphrase = click.prompt("Backup passphrase (≥8 chars)", hide_input=True, confirmation_prompt=True)
+    if len(passphrase) < 8:
+        console.print("[red]Error:[/red] passphrase must be ≥ 8 chars.")
+        sys.exit(2)
+
+    default_name = f"talos-agent-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.enc"
+    out = _Path(output) if output else (APP_DIR / "backups" / default_name)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    t0 = time.monotonic()
+    try:
+        run = build_backup(
+            password=passphrase,
+            out_path=out,
+            agent_id=agent_id,
+            scope="agent",
+        )
+    except BackupBusyError as exc:
+        console.print(f"[red]Busy:[/red] {exc}")
+        sys.exit(75)
+    except BackupError as exc:
+        console.print(f"[red]Backup failed:[/red] {exc}")
+        sys.exit(1)
+
+    elapsed = time.monotonic() - t0
+    console.print(f"[green]Backup written to[/green] {out}")
+    console.print(f"  encryption:    {BACKUP_ENCRYPTION_LABEL}")
+    console.print(f"  scope:         {run.scope}")
+    console.print(f"  files:         {len(run.files)}")
+    console.print(f"  row_count:     {run.manifest.get('rowCountTotal', 0)}")
+    console.print(f"  duration_s:    {elapsed:.2f}")
+
+    if web_endpoint:
+        import asyncio
+        import os
+
+        from talos_agent.backup_service import trigger_web_backup
+
+        url = (
+            web_api_url
+            or os.environ.get("TALOS_API_URL")
+            or "https://talos-stellar.vercel.app"
+        )
+        token = ops_token or os.environ.get("TALOS_OPS_TOKEN")
+        if not token:
+            console.print("[red]--web-endpoint requires --ops-token or TALOS_OPS_TOKEN[/red]")
+            sys.exit(2)
+        try:
+            result = asyncio.run(
+                trigger_web_backup(
+                    api_url=url,
+                    api_key=token,
+                    passphrase=passphrase,
+                    scope="system",
+                    timeout_s=60.0,
+                )
+            )
+            console.print("[green]Web /api/ops/backup completed[/green]")
+            console.print(f"  run_id:        {result.get('runId')}")
+            console.print(f"  row_count:     {result.get('rowCountTotal')}")
+        except Exception as exc:  # noqa: BLE001 — boundary, re-format below
+            console.print(f"[red]Web backup trigger failed:[/red] {exc}")
+            sys.exit(1)
+
+
+@main.command()
+@click.argument("artifact", type=click.Path(exists=True, dir_okay=False))
+@click.option("--passphrase", default=None, help="Backup passphrase (Prompted if not provided.)")
+@click.option("--confirm", is_flag=True, help="Overwrite existing agent DB. Required if state already exists.")
+@click.option("--agent-id", default=None, help="Talos ID for multi-agent mode")
+@click.option("--restore-root", default=None, help="Override restore root (default: ~/.talos-agent)")
+def restore(artifact, passphrase, confirm, agent_id, restore_root):
+    """Restore agent state from an encrypted backup artifact.
+
+    By default this is a dry run that prints the manifest. Pass --confirm
+    to actually replace the local SQLite state. Any existing files are
+    backed up to `.pre-restore` siblings first.
+    """
+    from pathlib import Path as _Path
+    from talos_agent.backup_service import (
+        BACKUP_ENCRYPTION_LABEL,
+        BackupError,
+        restore_backup,
+        verify_backup,
+    )
+
+    ensure_app_dir()
+    if not passphrase:
+        passphrase = click.prompt("Backup passphrase", hide_input=True)
+
+    path = _Path(artifact).resolve()
+    try:
+        verified = verify_backup(artifact_path=path, password=passphrase)
+    except BackupError as exc:
+        code = getattr(exc, "code", "BAD_INPUT")
+        if code == "AUTH_FAILED":
+            console.print("[red]Passphrase rejected[/red]")
+            sys.exit(3)
+        console.print(f"[red]Verify failed:[/red] {exc}")
+        sys.exit(1)
+
+    files = list(verified.files.keys())
+    console.print(f"[green]Verified[/green] {path}")
+    console.print(f"  encryption:     {BACKUP_ENCRYPTION_LABEL}")
+    console.print(f"  scope:          {verified.scope}")
+    console.print(f"  timestamp:      {verified.timestamp}")
+    console.print(f"  files:          {files}")
+    console.print(f"  row_count:      {verified.manifest.get('rowCountTotal', 0)}")
+    console.print(f"  plaintext_size: {verified.manifest.get('size_bytes', 0)} B")
+
+    if not confirm:
+        console.print("[yellow]Dry run only.[/yellow] Re-run with --confirm to apply the restore.")
+        return
+
+    try:
+        restore_backup(
+            artifact_path=path,
+            password=passphrase,
+            confirm=True,
+            agent_id=agent_id,
+            restore_root=_Path(restore_root) if restore_root else None,
+        )
+    except BackupError as exc:
+        console.print(f"[red]Restore failed:[/red] {exc}")
+        sys.exit(1)
+    console.print(f"[green]Restore applied to {_Path(restore_root) if restore_root else APP_DIR}[/green]")
+
+
+@main.command(name="backup-doctor")
+@click.argument("artifact", type=click.Path(exists=True, dir_okay=False))
+@click.option("--passphrase", default=None, help="Backup passphrase (Prompted if not provided.)")
+def backup_doctor(artifact, passphrase):
+    """Print integrity-check results for a backup artifact without applying it.
+
+    Useful for incident-response checklists: this command reveals scope,
+    timestamp, row counts, file sha256s, and the cipher label so an
+    operator can sanity-check a backup years later without source code
+    at hand.
+    """
+    from pathlib import Path as _Path
+    from talos_agent.backup_service import (
+        BACKUP_ENCRYPTION_LABEL,
+        BackupError,
+        verify_backup,
+    )
+
+    if not passphrase:
+        passphrase = click.prompt("Backup passphrase", hide_input=True)
+    path = _Path(artifact).resolve()
+    try:
+        verified = verify_backup(artifact_path=path, password=passphrase)
+    except BackupError as exc:
+        code = getattr(exc, "code", "BAD_INPUT")
+        if code == "AUTH_FAILED":
+            console.print("[red]Passphrase mismatched or artifact tampered[/red]")
+            sys.exit(3)
+        console.print(f"[red]Doctor failed:[/red] {exc}")
+        sys.exit(1)
+
+    console.print(f"[bold green]OK[/bold green] {path}")
+    console.print(f"  encryption:     {BACKUP_ENCRYPTION_LABEL}")
+    console.print(f"  formatVersion:  {verified.version}")
+    console.print(f"  scope:          {verified.scope}")
+    console.print(f"  timestamp:      {verified.timestamp}")
+    console.print(f"  rows_total:     {verified.manifest.get('rowCountTotal', 0)}")
+    console.print(f"  plaintext_size: {verified.manifest.get('size_bytes', 0)} B")
+    console.print("  files:")
+    for name, meta in verified.files.items():
+        console.print(f"    - {name}")
+        console.print(f"        sha256:    {meta.get('sha256')}")
+        console.print(f"        size_bytes:{meta.get('size_bytes')}")
 @main.command()
 @click.option("--json", "json_output", is_flag=True, help="Output raw JSON instead of a formatted summary.")
 def telemetry(json_output: bool):

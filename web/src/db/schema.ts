@@ -5,6 +5,7 @@ import {
   integer,
   boolean,
   numeric,
+  bigint,
   timestamp,
   jsonb,
   index,
