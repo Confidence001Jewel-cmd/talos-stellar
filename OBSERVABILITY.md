@@ -45,6 +45,13 @@ log.info("event_name", key="value")
 
 Every agent cycle binds a `cycle_id` UUID to the log context via `structlog.contextvars`.
 
+### Transactional outbox
+The domain-event outbox (`web/src/lib/outbox`) emits one structured log
+line per state transition (`outbox_event_written`, `_leased`,
+`_dispatched`, `_retry_scheduled`, `_dead_letter`, `outbox_lease_reaped`,
+`outbox_events_pruned`) — identifiers and counters only, never the event
+`payload` or a raw error. See `web/OUTBOX.md`.
+
 ## Request Correlation
 
 ### X-Request-Id header
@@ -200,6 +207,7 @@ List endpoints now support cursor-based pagination:
 | `GET /api/talos/:id/activity` | ✅ |
 | `GET /api/jobs/pending` | ✅ |
 | `GET /api/activity` | ✅ (pre-existing) |
+| `GET /api/admin/outbox` | ✅ (see `web/OUTBOX.md`) |
 
 ### Usage
 ```
