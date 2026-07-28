@@ -3,6 +3,7 @@ import { POST as createJobPOST } from "../src/app/api/talos/[id]/jobs/route";
 import { POST as completeJobPOST } from "../src/app/api/jobs/[id]/result/route";
 import { NextRequest } from "next/server";
 import { tlsCommerceJobs, tlsRevenues } from "../src/db/schema";
+import { resolveTalosFromRequest } from "@/lib/auth";
 
 // Use vi.hoisted to declare mock functions so they are hoisted before vi.mock calls,
 // preventing any ReferenceError during test execution.
@@ -21,6 +22,11 @@ const { mockDb } = mocks;
 
 vi.mock("@/db", () => ({
   db: mocks.mockDb,
+}));
+
+vi.mock("@/lib/auth", () => ({
+  resolveTalosFromRequest: vi.fn(),
+  verifyAgentApiKey: vi.fn(),
 }));
 
 // Mock external SDKs / methods to avoid external network calls
@@ -173,11 +179,16 @@ describe("Async Jobs Revenue Recording Unit Tests", () => {
       status: "completed",
     };
 
+    beforeEach(() => {
+      vi.mocked(resolveTalosFromRequest).mockResolvedValue({
+        ok: true,
+        talos: { id: "agent_1" },
+      });
+    });
+
     it("records revenue on completing a previously pending job", async () => {
-      // 1. authenticate (returns talos with callerTalosId)
-      // 2. fetch job (returns pending job)
+      // resolveTalosFromRequest is mocked, so only the job fetch is needed
       mockDb.select
-        .mockReturnValueOnce(mockSelectChain([{ id: "agent_1" }]))
         .mockReturnValueOnce(mockSelectChain([mockJob]));
 
       const mockTxUpdate = vi.fn().mockReturnValue({
@@ -244,7 +255,6 @@ describe("Async Jobs Revenue Recording Unit Tests", () => {
       };
 
       mockDb.select
-        .mockReturnValueOnce(mockSelectChain([{ id: "agent_1" }]))
         .mockReturnValueOnce(mockSelectChain([mockAlreadyCompletedJob]));
 
       const mockTxUpdate = vi.fn().mockReturnValue({

@@ -17,16 +17,10 @@ async function handleGet(request: NextRequest) {
   const apiKey = authHeader.slice(7);
 
   try {
-    const talos = await db.query.tlsTalos.findFirst({
-      where: eq(tlsTalos.apiKey, apiKey),
-    });
+    const auth = await resolveTalosFromRequest(request);
+    if (!auth.ok) return auth.response;
 
-    if (!talos) {
-      return Response.json({ error: "Invalid API key" }, { status: 401 });
-    }
-
-    const { apiKey: _key, ...safeTalos } = talos;
-    return Response.json(safeTalos);
+    return Response.json(auth.talos);
   } catch {
     return Response.json({ error: "Internal server error" }, { status: 500 });
   }

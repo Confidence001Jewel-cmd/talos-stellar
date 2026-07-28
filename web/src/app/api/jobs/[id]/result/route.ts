@@ -27,10 +27,8 @@ async function handlePost(
   const { id } = await params;
 
   try {
-    const callerTalosId = await resolveCallerTalos(request);
-    if (!callerTalosId) {
-      return Response.json({ error: "Missing or invalid Authorization" }, { status: 401 });
-    }
+    const auth = await resolveTalosFromRequest(request, ["commerce:write"]);
+    if (!auth.ok) return auth.response;
 
     const body = await request.json();
     const { result, fencingToken } = body;
@@ -158,10 +156,8 @@ async function handleGet(
   const { id } = await params;
 
   try {
-    const callerTalosId = await resolveCallerTalos(request);
-    if (!callerTalosId) {
-      return Response.json({ error: "Missing or invalid Authorization" }, { status: 401 });
-    }
+    const auth = await resolveTalosFromRequest(request, ["commerce:read"]);
+    if (!auth.ok) return auth.response;
 
     const job = await db
       .select()

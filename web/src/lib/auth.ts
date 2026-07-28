@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { createHash, timingSafeEqual } from "crypto";
+import { createHash, randomBytes, timingSafeEqual } from "crypto";
 import { db } from "@/db";
 import { tlsTalos, tlsApiAuditLogs } from "@/db/schema";
 import { eq, desc } from "drizzle-orm";
@@ -12,6 +12,25 @@ import {
   type AuditChainEntry,
 } from "@/lib/audit-chain";
 import { logger } from "@/lib/logger";
+
+/**
+ * Generate a new scoped API key.
+ * Returns the raw key (shown once) and its SHA-256 hash (stored in DB).
+ */
+export function generateApiKey(): { raw: string; hash: string } {
+  const raw = `tak_${randomBytes(32).toString("hex")}`;
+  return { raw, hash: hashApiKey(raw) };
+}
+
+/**
+ * Extract the Bearer token from the Authorization header.
+ * Returns null if missing or malformed.
+ */
+function extractBearerToken(request: NextRequest): string | null {
+  const authHeader = request.headers.get("authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
+  return authHeader.slice(7);
+}
 
 /**
  * Verify API key from Authorization header against the TALOS's stored key.
@@ -32,9 +51,9 @@ export async function verifyAgentApiKey(
   | { ok: true; talos: { id: string } }
   | { ok: false; response: Response }
 > {
-  const authHeader = request.headers.get("authorization");
+  const token = extractBearerToken(request);
 
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+  if (!token) {
     return {
       ok: false,
       response: Response.json(
@@ -44,7 +63,6 @@ export async function verifyAgentApiKey(
     };
   }
 
-  const token = authHeader.slice(7);
   const tokenHash = hashApiKey(token);
 
   const talos = await db
@@ -63,7 +81,7 @@ export async function verifyAgentApiKey(
 
   // 1. Try to match a scoped key
   const scopedKey = await db
-    .select({ id: tlsApiKeys.id, scopes: tlsApiKeys.scopes })
+    .select({ id: tlsApiKeys.id, scopes: tlsApiKeys.scopes, expiresAt: tlsApiKeys.expiresAt })
     .from(tlsApiKeys)
     .where(
       and(
@@ -79,6 +97,16 @@ export async function verifyAgentApiKey(
   let hasRequiredScopes = false;
 
   if (scopedKey) {
+    // Check expiry
+    if (scopedKey.expiresAt && scopedKey.expiresAt < new Date()) {
+      logger.warn({ talosId, keyId: scopedKey.id }, "auth.key.expired");
+      writeAuditLog(talos.id, request, 403, "expired_key", requiredScopes).catch(() => {});
+      return {
+        ok: false,
+        response: Response.json({ error: "API key has expired" }, { status: 403 }),
+      };
+    }
+
     authorized = true;
     // Update lastUsedAt in the background
     db.update(tlsApiKeys)
@@ -91,6 +119,8 @@ export async function verifyAgentApiKey(
       (scope) =>
         scopedKey.scopes.includes(scope) || scopedKey.scopes.includes("admin")
     );
+
+    logger.info({ talosId, keyId: scopedKey.id, path: new URL(request.url).pathname }, "auth.key.resolved");
   } else if (talos.legacyApiKey) {
     // 2. Fallback to legacy API key
     if (
@@ -100,10 +130,13 @@ export async function verifyAgentApiKey(
       authorized = true;
       // Legacy keys are granted all scopes (admin equivalent) for backward compatibility
       hasRequiredScopes = true;
+
+      logger.info({ talosId, path: new URL(request.url).pathname }, "auth.key.resolved (legacy)");
     }
   }
 
   if (!authorized) {
+    logger.warn({ talosId, path: new URL(request.url).pathname }, "auth.key.denied");
     writeAuditLog(talos.id, request, 403, "invalid_key", requiredScopes).catch(() => {});
     return {
       ok: false,
@@ -112,6 +145,7 @@ export async function verifyAgentApiKey(
   }
 
   if (!hasRequiredScopes) {
+    logger.warn({ talosId, requiredScopes, path: new URL(request.url).pathname }, "auth.scope.denied");
     writeAuditLog(talos.id, request, 403, "insufficient_scopes", requiredScopes).catch(() => {});
     return {
       ok: false,
@@ -139,7 +173,7 @@ async function writeAuditLog(
   request: NextRequest,
   statusCode: number,
   denialReason?: string,
-  scopesRequired?: Scope[]
+  scopesRequired?: Scope[],
 ): Promise<void> {
   const ip =
     request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??

@@ -400,6 +400,26 @@ export const createPlaybookSchema = z.object({
   periodDays: z.number().int().positive().optional().default(30),
 });
 
+// --- API Key Management ---
+
+const VALID_SCOPE_VALUES = [
+  "admin", "activity:write", "commerce:read", "commerce:write",
+  "wallet:read", "wallet:sign", "settings:read", "settings:write",
+  "revenue:read", "revenue:write",
+] as const;
+
+export const createApiKeySchema = z.object({
+  name: z.string().min(1).max(100),
+  scopes: z.array(z.enum(VALID_SCOPE_VALUES)).min(1),
+  expiresAt: z.string().datetime().optional(),
+});
+
+export const updateApiKeySchema = z.object({
+  name: z.string().min(1).max(100).optional(),
+  scopes: z.array(z.enum(VALID_SCOPE_VALUES)).min(1).optional(),
+  expiresAt: z.string().datetime().nullable().optional(),
+});
+
 /**
  * Parse and validate request body with a Zod schema.
  * Returns { data, error } — if error is set, return it as the Response.

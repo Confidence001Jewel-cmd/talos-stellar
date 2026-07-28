@@ -13,9 +13,7 @@ import { withTraceContext } from "@/lib/tracing";
  * Distribute accumulated treasury USDC to Mitos holders proportionally.
  * Requires STELLAR_OPERATOR_SECRET_KEY (operator holds agent treasury for now).
  *
- * Body: { requesterPublicKey } — must be creator or operator
- *
- * Returns: list of transfers executed
+ * Auth: Bearer token with revenue:write scope (scoped key or legacy).
  */
 async function handlePost(
   request: NextRequest,
