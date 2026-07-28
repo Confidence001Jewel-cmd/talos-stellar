@@ -10,6 +10,7 @@
     "test": "vitest run",
     "test:unit": "vitest run tests/health.test.ts tests/*.unit.test.ts tests/sse.test.ts",
     "test:e2e": "vitest run tests/api-e2e.test.ts tests/outbox-e2e.test.ts",
+    "test:load": "vitest run tests/load/",
     "test:openapi": "vitest run tests/openapi-snapshot.test.ts",
     "test:bench": "vitest run src/area/devx/__tests__/",
     "bench:suite": "tsx src/area/devx/run-benchmarks.ts",
@@ -55,6 +56,7 @@
     "tailwindcss": "^4",
     "tsx": "^4.21.0",
     "typescript": "^5",
+    "undici": "^8.9.0",
     "vitest": "^4.1.2",
     "zod-to-json-schema": "3.24.5"
   }
