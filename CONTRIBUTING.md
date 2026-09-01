@@ -384,6 +384,53 @@ Cost limits and TTLs (Time-To-Live) are enforced programmatically. If an environ
 - **Preview URL is missing**: Vercel manages the web preview natively. Ensure the Vercel GitHub integration is active for the repository.
 - **Stale data**: The environment is seeded once upon provisioning. If you change the seed script, you may need to close and reopen the PR to provision a fresh database.
 
+## CI Path Filtering (Changed-Path Package Matrix)
+
+The unified CI workflow (`.github/workflows/ci.yml`) runs only the checks relevant to the packages affected by a PR. A detection script (`scripts/ci-detect-changes.sh`) diffs changed files against the PR base and builds a JSON matrix of affected packages.
+
+### Path → package mapping
+
+| Changed path pattern | Packages checked |
+|---|---|
+| `web/**` | web (typecheck, lint, unit tests) |
+| `packages/sdk/**` | sdk (build/typecheck, tests) |
+| `packages/prime-agent/**` | prime-agent (ruff, pytest) |
+| `contracts/**` | contracts (cargo test, WASM build) |
+| `pnpm-lock.yaml`, `pnpm-workspace.yaml`, root `package.json`, `scripts/**`, `.github/**` | **ALL** packages |
+| Unknown / unclassified files | **ALL** packages (fail-closed) |
+
+### Local validation
+
+To test the detection script locally before pushing:
+
+```bash
+# Dry-run against a specific commit range
+BASE_SHA=<base> HEAD_SHA=<head> bash scripts/ci-detect-changes.sh
+
+# Run the full test suite
+bash scripts/ci-detect-changes.test.sh
+```
+
+### Design principles
+
+- **Fail-closed**: if the detector cannot confidently determine the scope (invalid SHA, unrecognized path), ALL packages are checked.
+- **No code execution from PRs**: the detector only inspects file paths via `git diff --name-only`.
+- **No secrets required**: works for fork PRs using only the GitHub-provided base/head SHAs.
+
+### Existing per-package workflows
+
+The following specialized workflows continue to run independently with their own path filters:
+
+- `ci-prime-agent.yml` — prime-agent lint + tests
+- `contracts-ci.yml` — contract tests + WASM build
+- `sdk-compatibility.yml` — SDK build + tests across Node versions
+- `sdk-types-ci.yml` — SDK generated-type drift detection
+- `web-migrations-ci.yml` — web database migration validation
+- `web-openapi-ci.yml` — web OpenAPI snapshot check
+- `benchmark-ci.yml` — performance regression gates
+
+The unified `ci.yml` workflow is an **additional** PR gate, not a replacement.
+
 ## Pull Request Workflow
 
 1. Create a branch from the latest `main`
